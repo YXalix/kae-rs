@@ -1,0 +1,5 @@
+# Rust build artifacts
+/target
+
+# Local ZCode session data
+/.zcode

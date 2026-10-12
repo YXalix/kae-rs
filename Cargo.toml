@@ -1,0 +1,34 @@
+[package]
+name = "kae"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Rust bindings for Kunpeng KAE2 hardware LZ4 (synchronous drop-in, runtime dlopen of the patched liblz4, zero build-time dependencies); bundles the kae-bench benchmark tool"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["lz4", "compression", "hardware-acceleration", "ffi"]
+categories = ["compression", "api-bindings", "hardware-support"]
+
+# AgentENV zfile integration: this crate has no build-time dependency on any
+# KAE headers or libraries, so it can be introduced as an optional feature;
+# at runtime KaeLz4::open() probes for hardware and falls back to the system
+# liblz4 when absent.
+
+# The library's unit tests run under cargo test; excluding the lib (and the
+# bin, which has no tests) from cargo bench makes `cargo bench -- <args>`
+# reach the throughput harness alone, as documented.
+[lib]
+bench = false
+
+[[bin]]
+name = "kae-bench"
+path = "src/bin/kae-bench.rs"
+bench = false
+
+# Additional bench entry point: cargo bench -- --data mixed --ops compress
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+lto = true
