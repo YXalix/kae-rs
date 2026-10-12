@@ -21,8 +21,8 @@ machine).
 Related probes:
 
 - `kae::hw_available()` — `true` when the patched library is findable **and**
-  a `/dev/uacce*` device exists. A `false` from this does not mean `open()`
-  fails; the software fallback remains.
+  a ZIP engine device node (`/dev/hisi_zip-*`) exists. A `false` from this
+  does not mean `open()` fails; the software fallback remains.
 - `kae::hw_lib_path()` — the resolved patched-library path (`KAE_HW_LZ4_LIB`
   wins, then the built-in candidates), `None` if absent.
 - `KaeLz4::backend()` — which backend actually came up (`Backend::Hw` means

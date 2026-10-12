@@ -86,7 +86,8 @@ pub(crate) fn existing_preload_paths() -> Vec<String> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
     /// KAE patched liblz4: compression on hardware (the patched library
-    /// silently falls back to software when /dev/uacce is absent).
+    /// silently falls back to software when the uacce device nodes are
+    /// absent).
     Hw,
     /// System liblz4: pure software.
     Sw,
@@ -125,24 +126,39 @@ impl std::fmt::Display for KaeError {
 
 impl std::error::Error for KaeError {}
 
-/// Whether this machine has KAE ZIP hardware: /dev/uacce* exists and the
-/// patched liblz4 is on a default path. A false result does not imply that
-/// [`KaeLz4::open`] fails (the software fallback remains).
+/// Whether this machine can compress on KAE hardware: the ZIP engine has a
+/// device node (the driver registers it as `hisi_zip-*` under
+/// /sys/class/uacce, with the matching `/dev/hisi_zip-*` character device)
+/// and the patched liblz4 is on a default path. A false result does not
+/// imply that [`KaeLz4::open`] fails (the software fallback remains).
 pub fn hw_available() -> bool {
-    hw_lib_path().is_some() && !uacce_devices().is_empty()
+    hw_lib_path().is_some() && uacce_devices().iter().any(|n| n.starts_with("hisi_zip"))
 }
 
-/// The /dev/uacce* device names present on this machine (empty without KAE
-/// hardware).
+/// The uacce device names present on this machine (e.g. `hisi_sec2-0`,
+/// `hisi_zip-4`; empty without the accelerator driver). The driver lists the
+/// engines under /sys/class/uacce and each entry is exposed as the matching
+/// `/dev/<name>` character device; an entry without its /dev node (a
+/// restricted /dev, e.g. inside a container) does not count — the engine
+/// could not be opened without it.
 pub(crate) fn uacce_devices() -> Vec<String> {
-    std::fs::read_dir("/dev")
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().starts_with("uacce"))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
+    use std::os::unix::fs::FileTypeExt;
+
+    let Ok(entries) = std::fs::read_dir("/sys/class/uacce") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            Path::new("/dev")
+                .join(name)
+                .metadata()
+                .is_ok_and(|m| m.file_type().is_char_device())
         })
-        .unwrap_or_default()
+        .collect();
+    names.sort();
+    names
 }
 
 /// Path of the patched liblz4: the `KAE_HW_LZ4_LIB` environment variable

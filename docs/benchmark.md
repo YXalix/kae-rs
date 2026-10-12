@@ -54,11 +54,11 @@ datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`, and
 
 ## What it does, in order
 
-1. **Environment report** — host, kernel, CPU model, `/dev/uacce*`
-   inventory, the software and hardware library paths, and the preload
-   chain. Warns when no uacce device is present (the patched library then
-   compresses in software internally, and "hw" rows may be software in
-   fact).
+1. **Environment report** — host, kernel, CPU model, the uacce device
+   inventory (`/dev/hisi_zip-*` and siblings), the software and hardware
+   library paths, and the preload chain. Warns when no uacce device is
+   present (the patched library then compresses in software internally, and
+   "hw" rows may be software in fact).
 2. **Data generation** — writes the synthetic datasets (or stages the
    `--input` file). All datasets are deterministic: a fixed-seed
    xorshift64*, 4K-page-interleaved layout, so numbers are comparable

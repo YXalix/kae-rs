@@ -433,7 +433,7 @@ fn env_report(cfg: &Config) {
             }
         );
         if uacce.is_empty() {
-            println!("!! warning: no /dev/uacce* found; the patched library may silently fall back to software compression — hw rows may in fact be software.");
+            println!("!! warning: no /dev/hisi_zip-* device found; the patched library may silently fall back to software compression — hw rows may in fact be software.");
         }
     }
     println!();

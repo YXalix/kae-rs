@@ -10,9 +10,9 @@
 use kae::{hw_available, Backend, KaeLz4};
 
 fn main() -> Result<(), kae::KaeError> {
-    // Probe: true when the patched library is findable AND a /dev/uacce*
-    // device exists; false does not prevent open() — the software fallback
-    // remains.
+    // Probe: true when the patched library is findable AND a ZIP engine
+    // device node (/dev/hisi_zip-*) exists; false does not prevent open() —
+    // the software fallback remains.
     println!("hw_available: {}", hw_available());
 
     // "Accelerate if present": hardware first, system liblz4 as fallback.

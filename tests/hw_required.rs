@@ -1,15 +1,16 @@
-//! Hardware-required tests: a real KAE machine (/dev/uacce* + the patched
-//! liblz4 on a default probe path). Marked `#[ignore]` so the default suite
-//! stays green on hardware-less dev machines; on the target machine run:
-//! `cargo test -- --ignored` (or `--include-ignored` for both suites).
+//! Hardware-required tests: a real KAE machine (/dev/hisi_zip-* uacce nodes
+//! + the patched liblz4 on a default probe path). Marked `#[ignore]` so the
+//! default suite stays green on hardware-less dev machines; on the target
+//! machine run: `cargo test -- --ignored` (or `--include-ignored` for both
+//! suites).
 
 use kae::{AsyncBatch, Backend, KaeLz4};
 
 fn require_hw() {
     assert!(
         kae::hw_available(),
-        "needs a KAE machine (/dev/uacce* and the patched liblz4); \
-         run on the target machine with: cargo test -- --ignored"
+        "needs a KAE machine (/dev/hisi_zip-* uacce nodes and the patched \
+         liblz4); run on the target machine with: cargo test -- --ignored"
     );
 }
 

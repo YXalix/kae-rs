@@ -46,10 +46,10 @@ assert_eq!(&restored[..n], &block[..]);
   absent, with **no** silent fallback — fits an adoption policy of "enable
   acceleration only when hardware is present, otherwise keep the current
   path".
-- `kae::hw_available()`: `/dev/uacce*` exists and the patched library is in
-  place (note: without uacce devices the patched library silently falls back
-  to software compression, so `Backend::Hw` only means "the patched library
-  was loaded").
+- `kae::hw_available()`: a ZIP engine device node (`/dev/hisi_zip-*`) exists
+  and the patched library is in place (note: without uacce devices the
+  patched library silently falls back to software compression, so
+  `Backend::Hw` only means "the patched library was loaded").
 - When a plain open fails, dependencies are preloaded RTLD_GLOBAL in
   libwd → libwd_comp → libkaelz4 order and the open is retried (`note()`
   returns the diagnostics), working around missing rpaths.

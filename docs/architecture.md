@@ -16,7 +16,8 @@ libkaelz4.so.2.2.0
   ▼
 libwd (libwd_comp)                      (Huawei's warpdrive user-space driver)
   ▼
-/dev/uacce* ZIP engine                  (Kunpeng KAE2 hardware accelerator)
+/dev/hisi_zip-*                         (uacce device node of the ZIP engine,
+                                         Kunpeng KAE2 hardware accelerator)
 ```
 
 Key properties:
@@ -33,10 +34,10 @@ Key properties:
   KAE headers are needed; `cargo build` works on any Linux box. The hardware
   surface appears only at runtime, through `dlopen`.
 - **`Backend::Hw` means "the patched library was loaded"**, no more. Without
-  `/dev/uacce*` devices the patched library silently falls back to software
+  uacce device nodes the patched library silently falls back to software
   internally, at hardware-API speed. Use `kae::hw_available()` (patched
-  library present AND a `/dev/uacce*` device exists) when the distinction
-  matters.
+  library present AND a `/dev/hisi_zip-*` device node exists) when the
+  distinction matters.
 
 ## Runtime loading model
 

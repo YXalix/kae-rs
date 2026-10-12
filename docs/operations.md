@@ -45,15 +45,17 @@ Condensed install order for a KAELz4 machine (root; full detail in the
    sh build.sh lz4      # liblz4.so.1.9.4, libkaelz4.so.2.x -> /usr/local/kaelz4/lib
    ```
 
-   Driver check: `/sys/class/uacce/` lists `hisi_zip-*` entries and
-   `lsmod | grep hisi_qm` shows the `hisi_qm` and `uacce` modules.
+   Driver check: `/sys/class/uacce/` lists `hisi_zip-*` entries,
+   `lsmod | grep hisi_qm` shows the `hisi_qm` and `uacce` modules, and each
+   entry has its `/dev/<name>` character device (`/dev/hisi_zip-4`,
+   `/dev/hisi_zip-5`, ...).
    `sh build.sh all` installs every module in one shot (requires OpenSSL
    1.1.1x); RPM packages exist for openEuler 22.03 SP1–SP4 and EulerOS
    V2.0 SP12.
 5. Verify exactly what this crate probes:
 
    ```bash
-   ls /dev/uacce*
+   ls /dev/hisi_zip-*
    ls /usr/local/kaelz4/lib/         # liblz4.so.1.9.4 + libkaelz4.so.2.x
    ./target/release/kae-bench --probe
    ```
@@ -86,7 +88,7 @@ The crate probes these paths at runtime (first existing entry wins):
 /usr/local/lib/libwd.so.2               # preload candidates (dependency
 /usr/local/lib/libwd_comp.so.2          #   chain, only existing entries
 /usr/local/kaelz4/lib/libkaelz4.so.2.2.0#   are preloaded RTLD_GLOBAL)
-/dev/uacce*                             # hardware devices (ZIP engine)
+/dev/hisi_zip-*                        # uacce devices of the ZIP engine
 ```
 
 Direct `dlopen` of the patched library is tried first; if it fails —
@@ -121,7 +123,7 @@ the process; later changes (env or `configure()`) have no effect there.
 ## Health checks
 
 ```bash
-ls /dev/uacce*                          # hardware present?
+ls /dev/hisi_zip-*                      # hardware present?
 ./target/release/kae-bench --probe      # libraries load? symbols resolve? async surface?
 ./target/release/kae-bench --data mixed --blocks 4096 --ops compress   # quick sanity scan
 ```
@@ -132,7 +134,7 @@ first on any unfamiliar machine; it exercises the same preload-retry logic
 as the real paths.
 
 Also worth remembering: `Backend::Hw` means the patched library loaded —
-not that the ZIP engine answered. With no `/dev/uacce*` devices the patched
+not that the ZIP engine answered. With no uacce device nodes the patched
 library silently compresses in software internally, at hardware-API speed.
 The bench prints a warning in exactly this situation.
 
@@ -143,7 +145,8 @@ The bench prints a warning in exactly this situation.
 | `KaeError::Open` on `open_hw`/`open()` | The patched library is missing (check `hw_lib_path()`, `KAE_HW_LZ4_LIB`) or its dependencies do not resolve. The error text contains the first direct error and what the preload retry tried. Check that `libwd.so.2` / `libwd_comp.so.2` / `libkaelz4.so.2.2.0` exist at the paths above. |
 | `KaeError::Symbol` from `AsyncBatch::open` | The loaded library has no async surface — you pointed at a stock liblz4 (which must be rejected: async is an explicit hardware choice) or an incompletely patched one. Run `--probe` and check the `SYMBOL ... LZ4_compress_async` line. |
 | `KaeError::Async` "already initialized" | `AsyncBatch::configure()` ran after the process's first `AsyncBatch::open`. Move it before all opens. |
-| `hw` rows show ~same speed (and ~same CPU) as `sw` | No `/dev/uacce*` device: the patched library is silently taking its internal software fallback. Check the driver (`ls /dev/uacce*`); the bench prints an explicit warning. |
+| `hw` rows show ~same speed (and ~same CPU) as `sw` | No `/dev/hisi_zip-*` device: the patched library is silently taking its internal software fallback. Check the driver (`/sys/class/uacce/` and `ls /dev/hisi_zip-*`); the bench prints an explicit warning. |
+| `/sys/class/uacce/` lists entries but `/dev/hisi_*` is empty | The device nodes were not created — a container with a restricted `/dev`, or `devtmpfs` not managing `/dev`. Create them from the sysfs registrations (root): `for d in /sys/class/uacce/*; do n=$(basename "$d"); IFS=: read -r maj min < "$d/dev"; [ -e "/dev/$n" ] \|\| mknod "/dev/$n" c "$maj" "$min"; done` |
 | hw throughput fine but CPU saving smaller than expected | Look at `cpu s/GB`, not only GB/s, and prefer `--input` with the real workload; small blocks and the synchronous per-block call pattern cap the offload — compare against `hwasync` to see what segment-level batching buys. |
 | `RESULT status=ASYNC_FAIL ... TASK_QUEUE_FULL` | The KAE task queue was full with nothing in flight from this batch — another process is hogging the queue. Retry when the co-tenant finishes, or lower concurrency. |
 | `RESULT status=WORKER_ERR` in a cell | The worker subprocess died; the note carries the first words of its stderr. Re-run that single cell (narrow `--blocks/--data/--impl`) to see the full output. |
