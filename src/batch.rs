@@ -15,10 +15,14 @@
 //!   take the software fallback and trigger the callback **synchronously
 //!   inline** on the submitting thread → completion counting must be
 //!   thread-agnostic (atomics + condvar), correct under both trigger styles.
-//! - On completion the adapter fills in `result.status` (0=SUCC) and
-//!   `result.dst_len` and leaves `user_data` alone. This wrapper does not
-//!   rely on user_data: `kaelz4_result` sits at Slot offset 0 and the
-//!   callback recovers the Slot directly from the result pointer.
+//! - `result.dst_len` is dual-role: on submit it carries the per-request dst
+//!   capacity, at completion the adapter overwrites it with the produced
+//!   length (and sets `result.status`, 0=SUCC), leaving `user_data` alone.
+//!   The capacity must clear the engine's worst-case output estimate
+//!   strictly (its overflow guard is a `>=` against src + src/255 + 16).
+//!   This wrapper does not rely on user_data: `kaelz4_result` sits at Slot
+//!   offset 0 and the callback recovers the Slot directly from the result
+//!   pointer.
 //! - `KAELZ4_async_compress_init` is a process-wide one-time initialization
 //!   (starts the thread pool and registers the software fallback);
 //!   `KAELZ4_teardown_async_compress` is a global teardown — this wrapper
@@ -207,6 +211,14 @@ static ASYNC_ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// far beyond enough for the queue to drain before giving up on a block.
 const BACKOFF_CAP_SLACK: u32 = 64;
 
+/// Headroom over `LZ4_compressBound` in each per-block dst stride: the
+/// engine's overflow guard rejects a capacity merely equal to its worst-case
+/// output estimate, and every 64 KiB chunk inside a block contributes its
+/// own token/literal-run allowance to that estimate.
+const ENGINE_CHUNK: usize = 64 * 1024;
+const HEADROOM_PER_CHUNK: usize = 16;
+const HEADROOM_MIN: usize = 8;
+
 /// A `KaeResult` carrying the not-yet-completed sentinel status.
 fn blank_result() -> KaeResult {
     KaeResult {
@@ -330,7 +342,8 @@ impl AsyncBatch {
         }
         let n = src.len() / block;
         let tail = &src[n * block..];
-        let bp = self.fns.bound(block);
+        let chunks = (block + ENGINE_CHUNK - 1) / ENGINE_CHUNK;
+        let bp = self.fns.bound(block) + chunks * HEADROOM_PER_CHUNK + HEADROOM_MIN;
         if self.scratch.len() < n * bp {
             self.scratch.resize(n * bp, 0);
         }
@@ -370,6 +383,9 @@ impl AsyncBatch {
             };
             slot.result = blank_result();
             slot.result.src_size = block;
+            // dst capacity in (the engine reads it from here), produced
+            // length out at completion
+            slot.result.dst_len = bp;
             slot.shared = &shared;
 
             // Queue-full backoff: wait for one in-flight completion, then
