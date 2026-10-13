@@ -885,12 +885,24 @@ mod hw_tests {
         v
     }
 
+    /// A random 4K page tiled to size. Pure noise cannot be compressed: the
+    /// engine then completes the request as negacompress (status 0xd), which
+    /// the pump counts as a hardware error, so the hw workload must compress.
+    fn compressible(n: usize, seed: u64) -> Vec<u8> {
+        let page = seeded(4096, seed);
+        let mut v = vec![0u8; n];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = page[i % page.len()];
+        }
+        v
+    }
+
     fn one_engine_run(alg: RawAlg) -> RawStats {
         let devices = zip_devices();
         assert!(!devices.is_empty(), "needs /dev/hisi_zip-* uacce nodes");
         let mut pump =
             RawPump::open(&devices, 1, 4096, 8, 8, false, alg).expect("open raw queue");
-        pump.load_data(&seeded(4096 * 16, 0xDEAD_BEEF));
+        pump.load_data(&compressible(4096 * 16, 0xDEAD_BEEF));
         let st = pump.run(0.5);
         assert!(st.reqs_done > 0, "engine completed no requests");
         assert_eq!(st.hw_errors, 0, "engine reported hardware errors");
@@ -901,8 +913,7 @@ mod hw_tests {
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_deflate_requests_complete() {
         let st = one_engine_run(RawAlg::Deflate);
-        // incompressible input still produces a deflate stream per request
-        assert!(st.bytes_out > 0);
+        assert!(st.bytes_out > 0, "deflate should produce a stream per request");
     }
 
     #[test]
