@@ -3,6 +3,7 @@
 //! (user+sys time).
 
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -128,5 +129,78 @@ where
         user_s: cpu1.user_s - cpu0.user_s,
         sys_s: cpu1.sys_s - cpu0.sys_s,
         passes,
+    }
+}
+
+/// Multi-threaded counterpart of [`timed_loop`] (the --workers >1 pool
+/// form of the sw/hw benches): `workers` threads each sweep their
+/// interleaved share of
+/// `0..nblocks` (`item % workers == thread`), stopping after at least
+/// `passes_min` full passes and `min_sec` seconds, capped at `passes_max`
+/// full passes. The pass bounds keep their [`timed_loop`] meaning (full
+/// passes over all items) — internally they scale with the pool size, one
+/// sweep per thread being `1/workers` of a pass. Workers beyond `nblocks`
+/// would have empty shares, so the thread count is clamped down to
+/// `nblocks`.
+///
+/// `init` runs on each worker thread and produces that thread's exclusive
+/// scratch state `S` (e.g. its dst buffer), handed to `f` as `&mut S` — the
+/// shared `Fn` closure itself never needs mutable captures.
+pub fn timed_pool_loop<F, G, S>(
+    workers: usize,
+    nblocks: usize,
+    init: G,
+    f: F,
+    min_sec: f64,
+    passes_min: u64,
+    passes_max: u64,
+) -> LoopStats
+where
+    G: Fn(usize) -> S + Sync,
+    F: Fn(usize, usize, &mut S) -> usize + Sync,
+{
+    let workers = workers.min(nblocks);
+    // the bounds arrive in full passes; the shared counter ticks sweeps
+    let passes_min = passes_min.saturating_mul(workers as u64);
+    let passes_max = passes_max.saturating_mul(workers as u64);
+    let cpu0 = cpu_time();
+    let t0 = now_s();
+    let stop = AtomicBool::new(false);
+    let sweeps = AtomicU64::new(0);
+    std::thread::scope(|s| {
+        for t in 0..workers {
+            let init = &init;
+            let f = &f;
+            let stop = &stop;
+            let sweeps = &sweeps;
+            s.spawn(move || {
+                let mut state = init(t);
+                let mut b = t;
+                loop {
+                    while b < nblocks {
+                        // same anti-elision as timed_loop
+                        std::hint::black_box(f(t, b, &mut state));
+                        b += workers;
+                    }
+                    b = t;
+                    let done = sweeps.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done >= passes_max || (done >= passes_min && now_s() - t0 >= min_sec) {
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let wall_s = now_s() - t0;
+    let cpu1 = cpu_time();
+    LoopStats {
+        wall_s,
+        user_s: cpu1.user_s - cpu0.user_s,
+        sys_s: cpu1.sys_s - cpu0.sys_s,
+        passes: sweeps.load(Ordering::Relaxed),
     }
 }

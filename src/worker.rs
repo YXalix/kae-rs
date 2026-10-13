@@ -12,13 +12,19 @@
 //! faster wall clock.
 
 use crate::lz4::PROBE_SYMBOLS;
-use crate::sysres::{timed_loop, LoopStats};
+use crate::sysres::{timed_loop, timed_pool_loop, LoopStats};
 use crate::{AsyncBatch, Backend, KaeLz4};
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub(crate) const IMPL_SW: &str = "sw";
 pub(crate) const IMPL_HW: &str = "hw";
 pub(crate) const IMPL_HWASYNC: &str = "hwasync";
+
+/// Upper bound on --workers, matching the AgentENV zfile WorkerPool cap
+/// (keeps a typo from spawning thousands of threads).
+const POOL_WORKERS_MAX: usize = 256;
 
 /// Worker exit codes: 0 OK, 1 usage/IO, 2 open failure, 4 compression
 /// failure, 5 decompress/verify failure (mirrored in docs/benchmark.md).
@@ -93,6 +99,14 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
                     .parse()
                     .map_err(|e| format!("--passes-max: {e}"))?
             }
+            "--workers" => {
+                a.workers = get(&mut i, args, "--workers")?
+                    .parse()
+                    .map_err(|e| format!("--workers: {e}"))?;
+                if a.workers == 0 {
+                    return Err("--workers must be >= 1".into());
+                }
+            }
             "--probe" => a.probe = true,
             other => return Err(format!("worker: unknown arg {other}")),
         }
@@ -100,6 +114,12 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
     }
     if a.lib.is_empty() {
         return Err("worker: --lib required".into());
+    }
+    if a.workers > POOL_WORKERS_MAX {
+        return Err(format!(
+            "worker: --workers {} out of range (1..={POOL_WORKERS_MAX})",
+            a.workers
+        ));
     }
     // probe mode never passes --impl
     if !a.probe {
@@ -130,6 +150,7 @@ struct WorkerArgs {
     min_sec: f64,
     passes_min: u64,
     passes_max: u64,
+    workers: usize,
     probe: bool,
 }
 
@@ -190,6 +211,9 @@ pub fn run(args: &[String]) -> i32 {
         return bench_async_compress(&a, &data, block, nblocks);
     }
 
+    // --workers >1 turns sw/hw into the threaded block pool form (the
+    // AgentENV zfile WorkerPool shape); the backend label only decides
+    // which library is opened
     let backend = if a.impl_name == IMPL_HW {
         Backend::Hw
     } else {
@@ -210,6 +234,12 @@ pub fn run(args: &[String]) -> i32 {
     let bound = kae.bound(block);
 
     match a.op.as_str() {
+        "compress" if a.workers > 1 => {
+            bench_pool_compress(&a, &kae, &data, block, bound, nblocks, &note)
+        }
+        "decompress" if a.workers > 1 => {
+            bench_pool_decompress(&a, &kae, &data, block, bound, nblocks, &note)
+        }
         "compress" => bench_compress(&a, &kae, &data, block, bound, nblocks, &note),
         "decompress" => bench_decompress(&a, &kae, &data, block, bound, nblocks, &note),
         "verify" => verify_sample(&a, &kae, &data, block),
@@ -282,6 +312,19 @@ fn emit_ok(r: OkResult<'_>) {
 /// n blocks; the accounting matches sync compress (raw input bytes / wall
 /// clock + user+sys).
 fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    // A --workers >1 maps onto the library's internal async thread pool
+    // (KAE_LZ4_ASYNC_THREAD_NUM); 1 leaves the library default or any
+    // externally set env var untouched. Fresh worker process, so the
+    // one-shot engine init has not run yet.
+    if a.workers > 1 {
+        if let Err(e) = AsyncBatch::configure(Some(a.workers), None) {
+            println!(
+                "RESULT status=ASYNC_FAIL impl=hwasync op=compress err={}",
+                flat(&e.to_string())
+            );
+            return EXIT_OPEN_FAIL;
+        }
+    }
     let mut batch = match AsyncBatch::open_path(&a.lib, &split_preload(&a.preload)) {
         Ok(b) => b,
         Err(e) => {
@@ -352,6 +395,11 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
         );
         return EXIT_COMPRESS_FAIL;
     }
+    let async_note = if a.workers > 1 {
+        format!("batch,workers={}", a.workers)
+    } else {
+        "batch".to_string()
+    };
     emit_ok(OkResult {
         impl_name: IMPL_HWASYNC,
         op: "compress",
@@ -363,7 +411,7 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
         in_bytes: in_bytes_one * st.passes,
         out_bytes: out_bytes_warm * st.passes,
         ratio_pct: out_bytes_warm as f64 / in_bytes_one as f64 * 100.0,
-        note: "batch",
+        note: &async_note,
     });
     EXIT_OK
 }
@@ -403,19 +451,18 @@ fn write_sample(
     std::fs::write(path, buf)
 }
 
-fn bench_compress(
+/// The untimed warm-up pass shared by the sync and pool compress benches:
+/// pre-faults pages, totals the compressed output (the ratio source), and
+/// captures the cross-validation sample file. On failure the RESULT line is
+/// printed here and the worker exit code is returned as Err.
+fn warm_up_compress(
     a: &WorkerArgs,
     kae: &KaeLz4,
     data: &[u8],
     block: usize,
-    bound: usize,
     nblocks: usize,
-    note: &str,
-) -> i32 {
-    let mut dst = vec![0u8; bound];
-
-    // one warm-up pass: pre-fault pages, compute the ratio, capture the
-    // cross-validation sample
+) -> Result<u64, i32> {
+    let mut dst = vec![0u8; kae.bound(block)];
     let sample_blocks = (SAMPLE_CAP_BYTES / block).max(1).min(nblocks);
     let mut sample = Vec::with_capacity(SAMPLE_CAP_BYTES + SAMPLE_SLACK_BYTES);
     push_sample_header(&mut sample, block, sample_blocks);
@@ -432,7 +479,7 @@ fn bench_compress(
                     b,
                     flat(&e.to_string())
                 );
-                return EXIT_COMPRESS_FAIL;
+                return Err(EXIT_COMPRESS_FAIL);
             }
         };
         out_bytes_warm += n as u64;
@@ -443,9 +490,26 @@ fn bench_compress(
     if !a.sample_out.is_empty() {
         if let Err(e) = fs::write(&a.sample_out, &sample) {
             eprintln!("worker: write sample: {e}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     }
+    Ok(out_bytes_warm)
+}
+
+fn bench_compress(
+    a: &WorkerArgs,
+    kae: &KaeLz4,
+    data: &[u8],
+    block: usize,
+    bound: usize,
+    nblocks: usize,
+    note: &str,
+) -> i32 {
+    let out_bytes_warm = match warm_up_compress(a, kae, data, block, nblocks) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    let mut dst = vec![0u8; bound];
 
     // timed compress loop; a mid-loop failure fails the cell instead of
     // silently deflating the throughput numbers
@@ -494,15 +558,21 @@ fn bench_compress(
     EXIT_OK
 }
 
-fn bench_decompress(
+/// The untimed preparation shared by the sync and pool decompress benches:
+/// compress all blocks into a contiguous blob (not counted in decompress
+/// timing) and run the single-threaded warm-up self-check (this library
+/// decompresses what it compressed). Returns the blob, the per-block
+/// (offset, len) extents into it, and the uncompressed byte total. On
+/// failure the RESULT line is printed here and the exit code comes back
+/// as Err.
+fn prepare_decompress(
     a: &WorkerArgs,
     kae: &KaeLz4,
     data: &[u8],
     block: usize,
     bound: usize,
     nblocks: usize,
-    note: &str,
-) -> i32 {
+) -> Result<(Vec<u8>, Vec<(usize, usize)>, u64), i32> {
     // compress all blocks first (not counted in decompress timing)
     let mut blob: Vec<u8> = Vec::with_capacity(data.len() + nblocks * BOUND_SLACK_PER_BLOCK);
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks); // (off, len) into the compressed stream
@@ -513,7 +583,7 @@ fn bench_decompress(
             Ok(n) => n,
             Err(e) => {
                 println!("RESULT status=COMPRESS_FAIL impl={} op=decompress data={} block={} at={} err={}", a.impl_name, a.data, block, b, flat(&e.to_string()));
-                return EXIT_COMPRESS_FAIL;
+                return Err(EXIT_COMPRESS_FAIL);
             }
         };
         extents.push((blob.len(), n));
@@ -534,13 +604,31 @@ fn bench_decompress(
                     .map(|e| flat(&e.to_string()))
                     .unwrap_or_else(|| "size_mismatch".into());
                 println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress data={} block={} at={} err={}", a.impl_name, a.data, block, b, err);
-                return EXIT_VERIFY_FAIL;
+                return Err(EXIT_VERIFY_FAIL);
             }
         }
     }
+    Ok((blob, extents, out_bytes))
+}
+
+fn bench_decompress(
+    a: &WorkerArgs,
+    kae: &KaeLz4,
+    data: &[u8],
+    block: usize,
+    bound: usize,
+    nblocks: usize,
+    note: &str,
+) -> i32 {
+    let (blob, extents, out_bytes) = match prepare_decompress(a, kae, data, block, bound, nblocks)
+    {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
 
     // timed decompress loop; throughput counts the decompressed raw bytes;
     // a mid-loop failure fails the cell instead of silently deflating them
+    let mut raw = vec![0u8; block];
     let mut decompress_err: Option<String> = None;
     let st = timed_loop(
         nblocks,
@@ -583,6 +671,185 @@ fn bench_decompress(
         // the ratio is a compression metric; it stays 0 for decompress rows
         ratio_pct: 0.0,
         note,
+    });
+    EXIT_OK
+}
+
+/// The note for pool rows: the lib note (preload diagnostics, usually
+/// empty) plus the requested pool size, so TSV/JSON rows carry the thread
+/// count the numbers were produced with.
+fn pool_note(lib_note: &str, workers: usize) -> String {
+    if lib_note.is_empty() {
+        format!("workers={workers}")
+    } else {
+        format!("{},workers={workers}", flat(lib_note))
+    }
+}
+
+/// Pool compress (--workers >1 on sw/hw): the AgentENV zfile WorkerPool
+/// shape at block granularity — `workers` threads, each compressing its
+/// interleaved share of the file's blocks per sweep
+/// (`block % workers == thread`) into its own dst buffer. Warm-up and
+/// sample capture stay single-threaded (identical to the sync bench); only
+/// the timed loop is pooled.
+fn bench_pool_compress(
+    a: &WorkerArgs,
+    kae: &KaeLz4,
+    data: &[u8],
+    block: usize,
+    bound: usize,
+    nblocks: usize,
+    note: &str,
+) -> i32 {
+    let out_bytes_warm = match warm_up_compress(a, kae, data, block, nblocks) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    let workers = a.workers.min(nblocks);
+    // per-thread counters: thread t is the only writer of counts[t], so the
+    // accounting adds no cross-core traffic to the timed loop
+    let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
+    let failed = AtomicBool::new(false);
+    let first_err: Mutex<Option<String>> = Mutex::new(None);
+    let st = timed_pool_loop(
+        workers,
+        nblocks,
+        // each thread compresses into its own dst, created on the owning
+        // thread (LZ4_compress writes, so buffers must not be shared)
+        |_| vec![0u8; bound],
+        |t, b, dst| {
+            if failed.load(Ordering::Relaxed) {
+                return 0;
+            }
+            match kae.compress(&data[b * block..(b + 1) * block], dst) {
+                Ok(_) => {
+                    counts[t].fetch_add(1, Ordering::Relaxed);
+                    block
+                }
+                Err(e) => {
+                    let mut g = first_err.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e.to_string());
+                    }
+                    failed.store(true, Ordering::Relaxed);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = first_err.into_inner().unwrap() {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl={} op=compress data={} block={} at=timed_pool err={}",
+            a.impl_name,
+            a.data,
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    let blocks_done: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    emit_ok(OkResult {
+        impl_name: &a.impl_name,
+        op: "compress",
+        data: &a.data,
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: blocks_done * block as u64,
+        out_bytes: out_bytes_warm * blocks_done / nblocks as u64,
+        ratio_pct: out_bytes_warm as f64 / ((nblocks as u64) * (block as u64)) as f64 * 100.0,
+        note: &pool_note(note, a.workers),
+    });
+    EXIT_OK
+}
+
+/// Pool decompress (--workers >1 on sw/hw): the same pool shape for
+/// decompression (software code in every backend). Pre-compression and the
+/// warm-up self-check stay single-threaded, identical to the sync bench;
+/// only the timed loop pools.
+fn bench_pool_decompress(
+    a: &WorkerArgs,
+    kae: &KaeLz4,
+    data: &[u8],
+    block: usize,
+    bound: usize,
+    nblocks: usize,
+    note: &str,
+) -> i32 {
+    let (blob, extents, out_bytes) = match prepare_decompress(a, kae, data, block, bound, nblocks)
+    {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let workers = a.workers.min(nblocks);
+    let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
+    let failed = AtomicBool::new(false);
+    let first_err: Mutex<Option<String>> = Mutex::new(None);
+    let st = timed_pool_loop(
+        workers,
+        nblocks,
+        // one scratch buffer per thread, created on the owning thread
+        |_| vec![0u8; block],
+        |t, b, raw| {
+            if failed.load(Ordering::Relaxed) {
+                return 0;
+            }
+            let (off, len) = extents[b];
+            match kae.decompress(&blob[off..off + len], raw) {
+                Ok(n) if n == block => {
+                    counts[t].fetch_add(1, Ordering::Relaxed);
+                    block
+                }
+                Ok(_) => {
+                    let mut g = first_err.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some("size_mismatch".into());
+                    }
+                    failed.store(true, Ordering::Relaxed);
+                    0
+                }
+                Err(e) => {
+                    let mut g = first_err.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e.to_string());
+                    }
+                    failed.store(true, Ordering::Relaxed);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = first_err.into_inner().unwrap() {
+        println!(
+            "RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress data={} block={} at=timed_pool err={}",
+            a.impl_name,
+            a.data,
+            block,
+            flat(&e)
+        );
+        return EXIT_VERIFY_FAIL;
+    }
+    let blocks_done: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    emit_ok(OkResult {
+        impl_name: &a.impl_name,
+        op: "decompress",
+        data: &a.data,
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: blocks_done * block as u64, // decompressed bytes
+        out_bytes,
+        // the ratio is a compression metric; it stays 0 for decompress rows
+        ratio_pct: 0.0,
+        note: &pool_note(note, a.workers),
     });
     EXIT_OK
 }

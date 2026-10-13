@@ -22,6 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BLOCKS: &str = "4096,8192,65536,262144,1048576";
 const OPS: [&str; 2] = ["compress", "decompress"];
+/// Upper bound on --workers, matching the worker-side cap (the AgentENV
+/// zfile WorkerPool cap).
+const WORKERS_MAX: usize = 256;
 
 /// Verdict thresholds (criteria are documented in docs/benchmark.md):
 /// a >=1.1x sync speedup is an outright win, cpu <=50% of software counts as
@@ -54,6 +57,7 @@ struct Config {
     datasets: Vec<String>,
     impls: Vec<String>,
     ops: Vec<String>,
+    workers: usize,
     sw_lib: String,
     hw_lib: String,
     hw_preload: Vec<String>,
@@ -75,7 +79,11 @@ usage: kae-bench [options]
   --size MIB        synthetic dataset size, MiB (default 64)
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
   --data LIST       datasets: zeros,mixed,random (default all; ignored with --input)
-  --impl LIST       implementations: sw,hw,hwasync (default: all present; hwasync = segment-level async batch, compress only)
+  --impl LIST       implementations: sw,hw,hwasync (default: all present; hwasync = segment-level
+                    async batch, compress only)
+  --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
+                    --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's
+                    library thread pool (KAE_LZ4_ASYNC_THREAD_NUM)
   --ops LIST        operations: compress,decompress (default both)
   --sw-lz4-lib P    software liblz4 path (default liblz4.so.1 via loader search)
   --hw-lz4-lib P    KAE patched liblz4 path (default: probe /usr/local/kaelz4/lib/)
@@ -112,6 +120,11 @@ fn parse_impl_list(s: &str) -> Result<Vec<String>, String> {
     Ok(impls)
 }
 
+/// Impls that need the patched liblz4 (skipped entirely when it is absent).
+fn hw_backed(impl_name: &str) -> bool {
+    impl_name == worker::IMPL_HW || impl_name == worker::IMPL_HWASYNC
+}
+
 /// The machine's hostname (the TSV header and the env report carry it).
 fn read_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -135,6 +148,7 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             worker::IMPL_HWASYNC.into(),
         ],
         ops: OPS.iter().map(|s| s.to_string()).collect(),
+        workers: 1,
         sw_lib: "liblz4.so.1".into(),
         hw_lib: String::new(),
         hw_preload: Vec::new(),
@@ -198,6 +212,14 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
                 }
                 if c.ops.is_empty() {
                     return Err("--ops parsed to an empty list".into());
+                }
+            }
+            "--workers" => {
+                c.workers = val(&mut i, "--workers")?
+                    .parse()
+                    .map_err(|e| format!("--workers: {e}"))?;
+                if c.workers == 0 || c.workers > WORKERS_MAX {
+                    return Err(format!("--workers must be 1..={WORKERS_MAX}"));
                 }
             }
             "--sw-lz4-lib" => c.sw_lib = val(&mut i, "--sw-lz4-lib")?,
@@ -324,6 +346,8 @@ fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
         cfg.passes_min.to_string(),
         "--passes-max".into(),
         cfg.passes_max.to_string(),
+        "--workers".into(),
+        cfg.workers.to_string(),
     ];
     if let Some(p) = cell.sample_out {
         args.push("--sample-out".into());
@@ -478,10 +502,16 @@ fn print_table(rows: &[Row]) {
         } else {
             "-".into()
         };
+        // pool rows carry their size in note (workers=N); surface it in the
+        // label so the table is self-describing (TSV/JSON keep the raw name)
+        let impl_disp = match field(&r.note, "workers") {
+            Some(w) => format!("{}×{}", r.impl_name, w),
+            None => r.impl_name.clone(),
+        };
         table.push(vec![
             r.data.clone(),
             r.block.to_string(),
-            r.impl_name.clone(),
+            impl_disp,
             r.op.clone(),
             format!("{:.2}", r.gbps),
             format!("{:.1}", r.ratio_pct),
@@ -506,8 +536,15 @@ fn print_table(rows: &[Row]) {
     }
 }
 
-fn verdict(rows: &[Row]) {
-    println!("== Verdict (compress, preferring input > mixed) ==");
+fn verdict(cfg: &Config, rows: &[Row]) {
+    if cfg.workers > 1 {
+        println!(
+            "== Verdict (compress, sw/hw are {}-thread pools, preferring input > mixed) ==",
+            cfg.workers
+        );
+    } else {
+        println!("== Verdict (compress, preferring input > mixed) ==");
+    }
     let pick = ["input", "mixed"]
         .iter()
         .find(|d| {
@@ -702,18 +739,9 @@ fn scan(exe: &Path, cfg: &Config, data_files: &[(String, PathBuf)], tmp: &Path) 
     let impls: Vec<&String> = cfg
         .impls
         .iter()
-        .filter(|i| {
-            i.as_str() == worker::IMPL_SW
-                || ((i.as_str() == worker::IMPL_HW || i.as_str() == worker::IMPL_HWASYNC)
-                    && !cfg.hw_lib.is_empty())
-        })
+        .filter(|i| !hw_backed(i.as_str()) || !cfg.hw_lib.is_empty())
         .collect();
-    if cfg
-        .impls
-        .iter()
-        .any(|i| i == worker::IMPL_HW || i == worker::IMPL_HWASYNC)
-        && cfg.hw_lib.is_empty()
-    {
+    if cfg.impls.iter().any(|i| hw_backed(i.as_str())) && cfg.hw_lib.is_empty() {
         println!("  (hw lib not found; hw/hwasync combinations skipped)");
     }
     let mut rows: Vec<Row> = Vec::new();
@@ -780,7 +808,7 @@ fn summarize(cfg: &Config, rows: &[Row]) {
     println!("== 4. Summary ==");
     print_table(rows);
     println!();
-    verdict(rows);
+    verdict(cfg, rows);
     if !cfg.tsv.is_empty() {
         write_tsv(&cfg.tsv, cfg, rows);
         println!("TSV:  {}", cfg.tsv);

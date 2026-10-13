@@ -1,8 +1,10 @@
 # Benchmark guide (kae-bench)
 
 `kae-bench` measures the KAE-patched liblz4 against the system liblz4 at
-zfile granularity (LZ4 block format, per-block `LZ4_compress_default`), plus
-the segment-level async batch. The same binary is the `cargo bench` entry
+zfile granularity (LZ4 block format, per-block `LZ4_compress_default`),
+plus the segment-level async batch and the `--workers`-threaded pool form
+of the sw/hw cells (the AgentENV zfile WorkerPool shape).
+The same binary is the `cargo bench` entry
 point — `cargo bench -- <args>` behaves identically. For what the results
 mean about the hardware path — weaknesses and their root causes — see
 [kae-limitations.md](kae-limitations.md).
@@ -25,6 +27,9 @@ Common invocations:
 ./target/release/kae-bench --blocks 4096,65536,1048576 --ops compress
 ./target/release/kae-bench --data mixed --impl sw,hw
 
+# the production-shape comparison: hardware vs an 8-thread software pool
+./target/release/kae-bench --impl sw,hw,hwasync --workers 8
+
 # machine-readable output
 ./target/release/kae-bench --tsv results.tsv --json results.json
 ```
@@ -37,7 +42,8 @@ Common invocations:
 | `--size MIB` | 64 | Synthetic dataset size per dataset |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
 | `--data LIST` | `zeros,mixed,random` | Datasets (ignored with `--input`) |
-| `--impl LIST` | all present | `sw`, `hw`, `hwasync` (hwasync is compress-only) |
+| `--impl LIST` | `sw,hw,hwasync` | `sw`, `hw`, `hwasync` (compress only) |
+| `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`) |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |
 | `--hw-lz4-lib P` | probe | Patched library path |
@@ -51,8 +57,8 @@ Common invocations:
 Flags that libtest appends under `cargo bench` (`--bench`, `--nocapture`,
 …) are accepted and ignored. Invalid list values are rejected up front with
 an error: `--blocks` must parse to block sizes, `--data` must name known
-datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`, and
-`--ops` must be `compress`/`decompress`.
+datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`,
+`--ops` must be `compress`/`decompress`, and `--workers` must be 1–256.
 
 ## What it does, in order
 
@@ -84,6 +90,29 @@ SONAME silently resolves to it — software and hardware numbers would
 pollute each other inside a single process. One subprocess per cell is the
 only reliable isolation, and its cost is negligible at second-scale timing.
 
+### Pool mode (--workers >1)
+
+`--workers N` with N > 1 turns every sw/hw cell into the N-threaded block
+pool — the shape of the AgentENV zfile WorkerPool at block granularity.
+Each worker thread compresses (or decompresses) its interleaved share of
+the file's blocks per pass (`block % workers == thread`) through the block
+API, into its own dst buffer. The library choice is unchanged (`sw` opens
+the system liblz4, `hw` the patched library plus the preload chain); since
+LZ4 blocks are independent, the pool produces the same on-disk format and
+the same per-block output sizes. `--workers 1` (the default) keeps the
+sync drop-in benches.
+
+Accounting stays comparable with the sync rows: warm-up (ratio + sample
+capture) is single-threaded and untimed; the timed loop counts the blocks
+actually processed; wall clock spans pool start to pool join; CPU is the
+process-wide getrusage delta, which covers all pool threads. The pass
+bounds keep their sync meaning (full passes over the file) — internally
+they scale with the pool size — and the `note` field of pool rows records
+the pool size (`workers=N`). For `hwasync`, `--workers` >1 instead
+maps onto the library's internal async thread pool
+(`KAE_LZ4_ASYNC_THREAD_NUM`, set via `AsyncBatch::configure` before the
+open; 1 leaves the library default or any externally set env var alone).
+
 ## Metrics and how to read them
 
 - **`GB/s`** — wall-clock throughput: raw input bytes for compress,
@@ -111,7 +140,11 @@ Timing per cell is adaptive: at least `--passes-min` passes and
 After the table, the bench picks a dataset (preferring `input`, then
 `mixed`, then any dataset with a successful compress row) and, per block
 size, reports the hw/sw speedup and the hw CPU cost as a percentage of sw.
-Then a decision rule, applied at the 4K (zfile) granularity:
+With `--workers` >1 both sides are N-thread pools, so those numbers
+compare equal thread budgets — the production shape a thread-pooled zfile
+would actually run; at the default 1 they answer the single-thread
+drop-in question. Then a decision rule, applied at the 4K (zfile)
+granularity:
 
 - hw throughput ≥ 1.1× sw → **outright win**; the synchronous drop-in is
   worth it.

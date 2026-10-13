@@ -103,7 +103,8 @@ Semantics of the binding:
   via `AsyncBatch::configure(threads, level)` before the first
   `AsyncBatch::open` of the process (the engine init is one-shot and reads
   them there; later calls return `KaeError::Async`).
-- bench: `kae-bench --impl hwasync` (compress only); samples are
+- bench: `kae-bench --impl hwasync` (compress only); `--workers N` with
+  N > 1 sets the library thread pool size for the run; samples are
   cross-validated through the system liblz4 as usual.
 
 ## Runnable examples
@@ -133,12 +134,22 @@ cargo build --release
 ./target/release/kae-bench                # full scan: sw / hw / hwasync (~5 min)
 ./target/release/kae-bench --input /path/to/memory.img \
     --blocks 4096,65536,1048576 --ops compress
+./target/release/kae-bench --impl sw,hw,hwasync --workers 8 \
+    --data mixed --ops compress           # hardware vs an 8-thread software pool
 cargo bench -- --data mixed --ops compress # bench entry point (same logic)
 ```
 
 - Every (dataset × block size × sw/hw × compress/decompress) combination runs
   in a **subprocess**: the patched library and the system library share the
   SONAME liblz4.so.1 and would pollute each other inside one process.
+- `--workers N` with N > 1 turns the sw/hw cells into N-threaded block
+  pools — the AgentENV zfile WorkerPool shape (each thread compresses its
+  interleaved share of the file's blocks) — so `--impl sw,hw --workers 8`
+  measures hardware against equal-budget multi-threaded software
+  compression, not just the single-thread drop-in baseline. Pool rows
+  record their size in the `note` column (`workers=N`); for `hwasync`,
+  `--workers` >1 sets the library's internal async thread pool
+  (`KAE_LZ4_ASYNC_THREAD_NUM`).
 - Metrics: wall-clock GB/s + CPU (user+sys) s/GB — the criterion for a
   hardware offload is usually saved CPU rather than saved time; the closing
   verdict applies these criteria.
