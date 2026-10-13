@@ -49,6 +49,7 @@ mod data;
 mod loader;
 mod lz4;
 pub mod orchestrator;
+mod rebuild;
 mod sysres;
 mod uacce;
 mod worker;

@@ -733,16 +733,17 @@ fn scan(exe: &Path, cfg: &Config, dataset: &str, data_file: &Path, tmp: &Path) -
                     sample_out: sample_out.as_deref(),
                 };
                 let mut row = run_row(exe, cfg, &cell);
-                // raw output is lz77 triples, not a decodable LZ4
-                // stream: there is no cross-validation sample for it
-                if row.status == "OK"
-                    && cell.op == "compress"
-                    && cell.impl_name != worker::IMPL_RAW
-                {
+                // verify whenever the worker wrote a cross-validation
+                // sample (raw lz77 rebuilds one from its triples; raw
+                // deflate and block shapes that are not request multiples
+                // legitimately skip it)
+                if row.status == "OK" && cell.op == "compress" {
                     let sample_path = cell
                         .sample_out
                         .expect("compress cells always get a sample path");
-                    row.verify = run_verify(exe, cfg, cell.data_file, cell.block, sample_path);
+                    if sample_path.exists() {
+                        row.verify = run_verify(exe, cfg, cell.data_file, cell.block, sample_path);
+                    }
                 }
                 let vdisp = if row.verify.is_empty() {
                     "-".into()

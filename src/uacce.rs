@@ -577,6 +577,48 @@ impl Queue {
         }
     }
 
+    /// Run one lz77 request on the next ring slot carrying exactly `input`
+    /// (req_size bytes) and return its sequence triples — the rebuild input
+    /// for the cross-validation sample. Idle queue only, outside the timed
+    /// loop.
+    fn sample_triples(&mut self, input: &[u8], batch: usize) -> Result<Vec<u8>, String> {
+        if self.outstanding != 0 {
+            return Err("queue_busy".into());
+        }
+        if self.alg != RawAlg::Lz77 {
+            return Err("sample_is_lz77_only".into());
+        }
+        if input.len() != self.req_size {
+            return Err(format!("sample_input_{}B_req_{}B", input.len(), self.req_size));
+        }
+        let slot = self.sq_tail as usize % self.src.len();
+        let (sptr, _) = self.src[slot];
+        unsafe { std::slice::from_raw_parts_mut(sptr, self.req_size) }.copy_from_slice(input);
+        let idx = self.sq_tail;
+        self.submit(batch.max(1), 1);
+        let t0 = now_s();
+        while self.outstanding > 0 {
+            self.harvest();
+            if now_s() - t0 > 10.0 {
+                return Err("sample_request_did_not_complete".into());
+            }
+        }
+        let sqe = unsafe { &*(self.sq.add(idx as usize * QM_ZIP_SQE_SIZE) as *const Sqe) };
+        let status = u32::from_le(sqe.dw3) & HZ_STATUS_MASK;
+        if status != 0 {
+            return Err(format!("hw_status_0x{status:x}"));
+        }
+        let lit = u32::from_le(sqe.comp_data_length) as usize;
+        let seqs = u32::from_le(sqe.produced) as usize;
+        let lit_cap = self.req_size + 16;
+        if lit > lit_cap || seqs * 8 > self.ocap - lit_cap {
+            return Err(format!("lz77_output_insanity_lit={lit}_seqs={seqs}"));
+        }
+        let (optr, _) = self.out[slot];
+        let seq_area = unsafe { optr.add(lit_cap) };
+        Ok(unsafe { std::slice::from_raw_parts(seq_area, seqs * 8) }.to_vec())
+    }
+
     fn doorbell(&mut self, cmd: u8, idx: u16, pri: u8) {
         // ring writes must be visible before the doorbell store
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -777,6 +819,13 @@ impl RawPump {
         }
     }
 
+    /// Compress one lz77 request on queue 0 and return its sequence
+    /// triples; `input` must be exactly the request size. For the
+    /// cross-validation sample, after a run has drained.
+    pub fn sample_triples(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+        self.queues[0].sample_triples(input, self.batch)
+    }
+
     fn poll_once(&self, timeout_ms: c_int) {
         let mut fds: Vec<PollFd> = self
             .queues
@@ -922,6 +971,27 @@ mod hw_tests {
     fn hw_lz77_requests_complete() {
         let st = one_engine_run(RawAlg::Lz77);
         assert!(st.bytes_out > 0, "lz77 triples should not be empty");
+    }
+
+    /// The end-to-end output check: compress one request on hardware,
+    /// rebuild the triples into a standard LZ4 block, decode it, and
+    /// require the original bytes back.
+    #[test]
+    #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
+    fn hw_lz77_sample_rebuilds_to_decodable_lz4() {
+        let devices = zip_devices();
+        assert!(!devices.is_empty(), "needs /dev/hisi_zip-* uacce nodes");
+        let req = 4096;
+        let mut pump = RawPump::open(&devices, 1, req, 8, 8, false, RawAlg::Lz77)
+            .expect("open raw queue");
+        pump.run(0.2); // settle the queue the same way a bench run does
+        let data = compressible(req, 0xDEAD_BEEF);
+        let seqs = pump.sample_triples(&data).expect("sample request");
+        let mut block = Vec::new();
+        let n = crate::rebuild::lz77_block(&data, &seqs, &mut block).expect("rebuild");
+        let mut dst = Vec::new();
+        crate::rebuild::test_support::decode(&block[..n], &mut dst).expect("decode");
+        assert_eq!(dst, data, "rebuild output must decode to the input");
     }
 }
 

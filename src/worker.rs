@@ -12,6 +12,7 @@
 //! faster wall clock.
 
 use crate::lz4::PROBE_SYMBOLS;
+use crate::rebuild;
 use crate::sysres::{timed_loop, timed_pool_loop, LoopStats};
 use crate::uacce;
 use crate::{AsyncBatch, Backend, KaeLz4};
@@ -430,16 +431,20 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
 /// is the bench block capped at the engine's 128K lz77 flat limit;
 /// `--workers` maps to hardware queues (one fd each, round-robin over the
 /// devices). Knobs via environment:
-/// `KAE_RAW_DEPTH` in-flight requests per queue (default 64),
+/// `KAE_RAW_DEPTH` in-flight requests per queue (default 8; throughput
+/// saturates at 4),
 /// `KAE_RAW_DB_BATCH` SQEs per doorbell (default = depth),
 /// `KAE_RAW_WAIT` `spin` (default) or `poll` (sleep on the uacce fd),
 /// `KAE_RAW_ALG` `lz77` (default) or `deflate` (the plumbing-check dialect:
 /// no 128K input cap, and completion sanity only).
 ///
-/// The reported ratio counts the engine's lz77 triples output
-/// (literals + 8-byte sequences), i.e. the pre-rebuild size — close to but
-/// not identical with the final LZ4 block size. There is no cross-validation
-/// sample: triples are not a decodable LZ4 stream.
+/// The lz77 triples are rebuilt into standard LZ4 blocks for the sample
+/// file (up to `SAMPLE_CAP_BYTES` of input, one hw request at a time), so
+/// the orchestrator's verify op decodes raw output with the stock library
+/// and `ratio_pct` is the true LZ4 block ratio of the sample blocks. Falls
+/// back to the pre-rebuild engine output ratio when no sample is possible
+/// (deflate dialect, block not a request multiple, manual run without
+/// `--sample-out`); the note field names the fallback.
 fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let devices = uacce::zip_devices();
     if devices.is_empty() {
@@ -453,7 +458,7 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
             .filter(|v| *v > 0)
             .unwrap_or(default)
     };
-    let depth = env_num("KAE_RAW_DEPTH", 64).min(uacce::QM_Q_DEPTH);
+    let depth = env_num("KAE_RAW_DEPTH", 8).min(uacce::QM_Q_DEPTH);
     let batch = env_num("KAE_RAW_DB_BATCH", depth);
     let wait_poll = std::env::var("KAE_RAW_WAIT").map(|v| v == "poll").unwrap_or(false);
     let alg = match std::env::var("KAE_RAW_ALG").as_deref() {
@@ -512,8 +517,34 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
         sys_s: st_raw.sys_s,
         passes: 1,
     };
+    // ratio starts as the pre-rebuild engine output; the sample rebuild
+    // replaces it with the true LZ4 block ratio (and names the fallback in
+    // the note when no sample is possible)
+    let mut ratio_pct = st_raw.bytes_out as f64 / st_raw.bytes_in as f64 * 100.0;
+    let mut sample_note = String::new();
+    if !a.sample_out.is_empty() {
+        if alg != uacce::RawAlg::Lz77 {
+            sample_note = ",sample=skipped:deflate".into();
+        } else if block % req_size != 0 {
+            sample_note = ",sample=skipped:block_not_request_multiple".into();
+        } else {
+            match build_raw_sample(&mut pump, data, block, nblocks, req_size, &a.sample_out) {
+                Ok((packed, count)) => {
+                    sample_note = format!(",pre_ratio={ratio_pct:.1}");
+                    ratio_pct = packed as f64 / (count as u64 * block as u64) as f64 * 100.0;
+                }
+                Err(e) => {
+                    println!(
+                        "RESULT status=COMPRESS_FAIL impl=raw op=compress block={} at=sample err={}",
+                        block, e
+                    );
+                    return EXIT_COMPRESS_FAIL;
+                }
+            }
+        }
+    }
     let note = format!(
-        "raw,alg={},queues={},depth={},db_batch={},wait={},req_size={},nvcsw={},nivcsw={}",
+        "raw,alg={},queues={},depth={},db_batch={},wait={},req_size={},nvcsw={},nivcsw={}{}",
         match alg {
             uacce::RawAlg::Lz77 => "lz77",
             uacce::RawAlg::Deflate => "deflate",
@@ -524,7 +555,8 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
         if wait_poll { "poll" } else { "spin" },
         req_size,
         st_raw.nvcsw,
-        st_raw.nivcsw
+        st_raw.nivcsw,
+        sample_note
     );
     emit_ok(OkResult {
         impl_name: IMPL_RAW,
@@ -535,10 +567,42 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
         st: &st,
         in_bytes: st_raw.bytes_in,
         out_bytes: st_raw.bytes_out,
-        ratio_pct: st_raw.bytes_out as f64 / st_raw.bytes_in as f64 * 100.0,
+        ratio_pct,
         note: &note,
     });
     EXIT_OK
+}
+
+/// Rebuild the first blocks of the workload into standard LZ4 blocks (one
+/// hardware request per `req_size` slice, engine idle after the timed run)
+/// and write the packed sample file. Returns (rebuilt bytes, blocks
+/// covered). `block` must be a `req_size` multiple — the caller checks.
+fn build_raw_sample(
+    pump: &mut uacce::RawPump,
+    data: &[u8],
+    block: usize,
+    nblocks: usize,
+    req_size: usize,
+    path: &str,
+) -> Result<(u64, usize), String> {
+    let count = (SAMPLE_CAP_BYTES / block).max(1).min(nblocks);
+    let per_block = block / req_size;
+    let mut packed: Vec<u8> = Vec::new();
+    let mut lens = Vec::with_capacity(count);
+    let mut stream = Vec::new();
+    for b in 0..count {
+        let base = packed.len();
+        for r in 0..per_block {
+            let off = b * block + r * req_size;
+            let chunk = &data[off..off + req_size];
+            let seqs = pump.sample_triples(chunk)?;
+            let n = rebuild::lz77_block(chunk, &seqs, &mut stream)?;
+            packed.extend_from_slice(&stream[..n]);
+        }
+        lens.push(packed.len() - base);
+    }
+    write_sample(path, block, &lens, &packed, count).map_err(|e| format!("write_sample: {e}"))?;
+    Ok((packed.len() as u64, count))
 }
 
 /// Packed sample file layout: [magic][block][count] + per-block (clen +

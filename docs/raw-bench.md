@@ -31,11 +31,17 @@ the engine itself is the limit and the placement verdict is final.
 - **One thread drives all queues.** The pump is single-threaded; its CPU
   (user+sys, plus `nvcsw`/`nivcsw` in the `note`) is the honest cost of a
   well-formed submit/harvest loop.
-- **No cross-validation sample.** The engine's lz77 output is literals +
-  8-byte sequence triples, not a decodable LZ4 stream; rows report the
-  pre-rebuild size as `ratio_pct` and skip the `VERIFY` step. The
-  plumbing is validated on hardware by the `#[ignore]`d unit tests
-  (`cargo test -- --ignored`, engine requests must complete with status 0).
+- **Standard LZ4 output via the triple rebuild.** The engine's lz77
+  output is literals + 8-byte sequence triples; after the timed run the
+  worker rebuilds the first sample blocks' triples into standard LZ4 block
+  format (`src/rebuild.rs`, same arithmetic as the kaelz4 rebuild) and
+  writes the packed sample file. The orchestrator's verify op decodes it
+  with the system liblz4 exactly like the library-backed cells, and the
+  row's `ratio_pct` is the rebuilt blocks' true LZ4 ratio (the pre-rebuild
+  triples ratio lands in the `note` as `pre_ratio`). Where no sample is
+  possible — the `deflate` dialect, a block that is not a request-size
+  multiple, a manual worker run without `--sample-out` — the ratio falls
+  back to the pre-rebuild engine output and the `note` names it.
 
 ## Running
 
@@ -56,7 +62,7 @@ Knobs (environment variables read by the raw worker):
 
 | var | default | meaning |
 |---|---|---|
-| `KAE_RAW_DEPTH` | 64 | in-flight requests per queue (max 1024, the engine's queue depth) |
+| `KAE_RAW_DEPTH` | 8 | in-flight requests per queue (max 1024, the engine's queue depth; throughput saturates at 4) |
 | `KAE_RAW_DB_BATCH` | = depth | SQEs per doorbell store (1 reproduces the per-request ring) |
 | `KAE_RAW_WAIT` | `spin` | `spin` harvests the CQ in a tight loop; `poll` sleeps on the uacce fd (the IRQ-arm path) |
 | `KAE_RAW_ALG` | `lz77` | `deflate` runs the deflate dialect instead — the plumbing-check algorithm, without the 128K input cap |
@@ -114,12 +120,16 @@ number taken under it is a floor.
 ## Scope and caveats
 
 - Stateless flat requests only, window fixed at 16K for lz77 (kaelz4's
-  defaults); no decompression, no SGL, no checksum, no stream mode.
-- The SS region needs ~`depth × 4 × req_size` bytes per queue; at depth
-  1024 and 64K requests that is ~260 MiB of DMA-coherent memory per
-  queue — lower `KAE_RAW_DEPTH` if allocation fails.
-- The engine's compression ratio at these settings matches the kaelz4
-  path (same engine mode); ratio is not this tool's metric.
+  defaults); the compress op only — raw decompression does not exist (the
+  natural decoder of the rebuilt blocks is the software library).
+- The SS region needs ~`depth × 4 × req_size` bytes per queue; at the
+  default depth 8 and 64K requests that is ~2 MiB. Forcing `KAE_RAW_DEPTH`
+  to 1024 at 64K requests asks for ~260 MiB of DMA-coherent memory per
+  queue and fails in the SS mapping — lower the depth instead.
+- The rebuild is unit-tested against the system liblz4 (`rebuild_decodes_with_system_liblz4`)
+  and against hardware by the `#[ignore]`d test
+  `hw_lz77_sample_rebuilds_to_decodable_lz4` (`cargo test -- --ignored`
+  on the target machine); the bench verify op re-checks every run's sample.
 - `src/uacce.rs` is the module of record for the ABI: every constant is
   copied, not guessed, with its source called out next to the definition
   (uacce UAPI, `hisi_qm.h` ioctls, `uadk/v1/drv/hisi_qm_udrv.{c,h}` for

@@ -82,8 +82,9 @@ uacce device node.
    open, parses its `RESULT` line, and — for compress cells with `OK`
    status — runs a second subprocess that decodes the captured sample with
    the **system** liblz4 and compares block-by-block (`VERIFY`). The `raw`
-   cells skip the sample capture entirely: their output is lz77 triples,
-   not a decodable LZ4 stream (see [raw-bench.md](raw-bench.md)).
+   cells produce the sample by rebuilding their lz77 triples into standard
+   LZ4 blocks inside the worker, so the same verify op applies (see
+   [raw-bench.md](raw-bench.md)).
 4. **Summary** — a results table, a verdict, and the TSV/JSON files.
 
 ### Why subprocess isolation

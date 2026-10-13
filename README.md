@@ -145,9 +145,9 @@ cargo bench -- --ops compress             # bench entry point (same logic)
 - Every (block size × sw/hw × compress/decompress) combination runs
   in a **subprocess**: the patched library and the system library share the
   SONAME liblz4.so.1 and would pollute each other inside one process. The
-  `raw` cells carry no library at all (in-crate uacce engine path) and skip
-  the LZ4 cross-validation sample (their output is engine triples, not a
-  decodable LZ4 stream).
+  `raw` cells carry no library at all (in-crate uacce engine path); their
+  lz77 triples are rebuilt into standard LZ4 blocks in the worker, so the
+  same LZ4 cross-validation sample applies to them.
 - `--workers N` with N > 1 turns the sw/hw cells into N-threaded block
   pools — the AgentENV zfile WorkerPool shape (each thread compresses its
   interleaved share of the file's blocks) — so `--impl sw,hw --workers 8`
@@ -186,7 +186,7 @@ exposes it as a fourth implementation:
 ```bash
 ./target/release/kae-bench --impl raw                          # engine ceiling cells
 ./target/release/kae-bench --impl raw --workers 2              # two hardware queues
-KAE_RAW_DEPTH=1024 KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw
+KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw        # sleep-until-IRQ waiting
 KAE_RAW_ALG=deflate ./target/release/kae-bench --impl raw      # plumbing-check dialect
 ```
 
@@ -195,9 +195,10 @@ here, so the same tool that measures the engine's true ceiling doubles as
 the testbed for the policies the C stack never had (deep pipelining,
 batched doorbells, sleep-until-IRQ). Compress only; QM v3 devices;
 `/dev/hisi_zip-*` required (cells skip with a printed reason otherwise).
-The raw lz77 output is the engine's literal/sequence triples — the
-pre-rebuild form — so raw rows skip the LZ4 cross-validation sample. See
-[docs/raw-bench.md](docs/raw-bench.md) for the full matrix and the
+The raw lz77 output (literal/sequence triples) is rebuilt into standard
+LZ4 blocks for the cross-validation sample, so raw rows report a true LZ4
+ratio and get the same system-liblz4 verify as every other implementation.
+See [docs/raw-bench.md](docs/raw-bench.md) for the full matrix and the
 ceiling-interpretation framework.
 
 ## Operational hard rules
