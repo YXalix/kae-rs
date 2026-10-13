@@ -83,7 +83,6 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
             }
             "--op" => a.op = get(&mut i, args, "--op")?,
             "--impl" => a.impl_name = get(&mut i, args, "--impl")?,
-            "--data" => a.data = get(&mut i, args, "--data")?,
             "--sample-out" => a.sample_out = get(&mut i, args, "--sample-out")?,
             "--sample" => a.sample = get(&mut i, args, "--sample")?,
             "--min-sec" => {
@@ -146,7 +145,6 @@ struct WorkerArgs {
     block: usize,
     op: String,
     impl_name: String,
-    data: String,
     sample_out: String,
     sample: String,
     min_sec: f64,
@@ -293,7 +291,6 @@ fn run_probe(a: &WorkerArgs) -> i32 {
 struct OkResult<'a> {
     impl_name: &'a str,
     op: &'a str,
-    data: &'a str,
     block: usize,
     lib: &'a str,
     blocks: usize,
@@ -316,8 +313,8 @@ fn emit_ok(r: OkResult<'_>) {
         0.0
     };
     println!(
-        "RESULT status=OK impl={} op={} data={} block={} lib={} blocks={} passes={} in_bytes={} out_bytes={} ratio_pct={:.2} wall_s={:.3} gbps={:.2} user_s={:.3} sys_s={:.3} cpu_s_per_gb={:.2} note={}",
-        r.impl_name, r.op, r.data, r.block, r.lib, r.blocks, r.st.passes, r.in_bytes, r.out_bytes,
+        "RESULT status=OK impl={} op={} block={} lib={} blocks={} passes={} in_bytes={} out_bytes={} ratio_pct={:.2} wall_s={:.3} gbps={:.2} user_s={:.3} sys_s={:.3} cpu_s_per_gb={:.2} note={}",
+        r.impl_name, r.op, r.block, r.lib, r.blocks, r.st.passes, r.in_bytes, r.out_bytes,
         r.ratio_pct, r.st.wall_s, gbps, r.st.user_s, r.st.sys_s, cpu_per_gb, flat(r.note),
     );
 }
@@ -362,8 +359,7 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
         Ok(l) => l,
         Err(e) => {
             println!(
-                "RESULT status=ASYNC_FAIL impl=hwasync op=compress data={} block={} err={}",
-                a.data,
+                "RESULT status=ASYNC_FAIL impl=hwasync op=compress block={} err={}",
                 block,
                 flat(&e.to_string())
             );
@@ -402,8 +398,7 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
     );
     if let Some(e) = async_err {
         println!(
-            "RESULT status=ASYNC_FAIL impl=hwasync op=compress data={} block={} err={}",
-            a.data,
+            "RESULT status=ASYNC_FAIL impl=hwasync op=compress block={} err={}",
             block,
             flat(&e)
         );
@@ -417,7 +412,6 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
     emit_ok(OkResult {
         impl_name: IMPL_HWASYNC,
         op: "compress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -496,8 +490,8 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let warm = pump.run(1.0);
     if warm.reqs_done == 0 || warm.hw_errors > 0 {
         println!(
-            "RESULT status=RAW_FAIL impl=raw op=compress data={} block={} reqs={} hw_err={} err=engine_dead",
-            a.data, block, warm.reqs_done, warm.hw_errors
+            "RESULT status=RAW_FAIL impl=raw op=compress block={} reqs={} hw_err={} err=engine_dead",
+            block, warm.reqs_done, warm.hw_errors
         );
         return EXIT_COMPRESS_FAIL;
     }
@@ -505,8 +499,8 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let st_raw = pump.run(a.min_sec);
     if st_raw.reqs_done == 0 || st_raw.hw_errors > 0 {
         println!(
-            "RESULT status=RAW_FAIL impl=raw op=compress data={} block={} reqs={} hw_err={} err=engine_dead",
-            a.data, block, st_raw.reqs_done, st_raw.hw_errors
+            "RESULT status=RAW_FAIL impl=raw op=compress block={} reqs={} hw_err={} err=engine_dead",
+            block, st_raw.reqs_done, st_raw.hw_errors
         );
         return EXIT_COMPRESS_FAIL;
     }
@@ -535,7 +529,6 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     emit_ok(OkResult {
         impl_name: IMPL_RAW,
         op: "compress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -604,9 +597,8 @@ fn warm_up_compress(
             Ok(n) => n,
             Err(e) => {
                 println!(
-                    "RESULT status=COMPRESS_FAIL impl={} op=compress data={} block={} at={} err={}",
+                    "RESULT status=COMPRESS_FAIL impl={} op=compress block={} at={} err={}",
                     a.impl_name,
-                    a.data,
                     block,
                     b,
                     flat(&e.to_string())
@@ -666,9 +658,8 @@ fn bench_compress(
     );
     if let Some(e) = compress_err {
         println!(
-            "RESULT status=COMPRESS_FAIL impl={} op=compress data={} block={} at=timed_loop err={}",
+            "RESULT status=COMPRESS_FAIL impl={} op=compress block={} at=timed_loop err={}",
             a.impl_name,
-            a.data,
             block,
             flat(&e)
         );
@@ -677,7 +668,6 @@ fn bench_compress(
     emit_ok(OkResult {
         impl_name: &a.impl_name,
         op: "compress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -690,13 +680,20 @@ fn bench_compress(
     EXIT_OK
 }
 
+/// What [`prepare_decompress`] hands the timed decompress loops: the
+/// compressed blob, the per-block (offset, len) extents into it, and the
+/// uncompressed byte total.
+struct DecompressInput {
+    blob: Vec<u8>,
+    extents: Vec<(usize, usize)>,
+    out_bytes: u64,
+}
+
 /// The untimed preparation shared by the sync and pool decompress benches:
 /// compress all blocks into a contiguous blob (not counted in decompress
 /// timing) and run the single-threaded warm-up self-check (this library
-/// decompresses what it compressed). Returns the blob, the per-block
-/// (offset, len) extents into it, and the uncompressed byte total. On
-/// failure the RESULT line is printed here and the exit code comes back
-/// as Err.
+/// decompresses what it compressed). On failure the RESULT line is printed
+/// here and the exit code comes back as Err.
 fn prepare_decompress(
     a: &WorkerArgs,
     kae: &KaeLz4,
@@ -704,7 +701,7 @@ fn prepare_decompress(
     block: usize,
     bound: usize,
     nblocks: usize,
-) -> Result<(Vec<u8>, Vec<(usize, usize)>, u64), i32> {
+) -> Result<DecompressInput, i32> {
     // compress all blocks first (not counted in decompress timing)
     let mut blob: Vec<u8> = Vec::with_capacity(data.len() + nblocks * BOUND_SLACK_PER_BLOCK);
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks); // (off, len) into the compressed stream
@@ -714,7 +711,7 @@ fn prepare_decompress(
         let n = match kae.compress(&data[b * block..(b + 1) * block], &mut tmp) {
             Ok(n) => n,
             Err(e) => {
-                println!("RESULT status=COMPRESS_FAIL impl={} op=decompress data={} block={} at={} err={}", a.impl_name, a.data, block, b, flat(&e.to_string()));
+                println!("RESULT status=COMPRESS_FAIL impl={} op=decompress block={} at={} err={}", a.impl_name, block, b, flat(&e.to_string()));
                 return Err(EXIT_COMPRESS_FAIL);
             }
         };
@@ -735,12 +732,16 @@ fn prepare_decompress(
                     .err()
                     .map(|e| flat(&e.to_string()))
                     .unwrap_or_else(|| "size_mismatch".into());
-                println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress data={} block={} at={} err={}", a.impl_name, a.data, block, b, err);
+                println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress block={} at={} err={}", a.impl_name, block, b, err);
                 return Err(EXIT_VERIFY_FAIL);
             }
         }
     }
-    Ok((blob, extents, out_bytes))
+    Ok(DecompressInput {
+        blob,
+        extents,
+        out_bytes,
+    })
 }
 
 fn bench_decompress(
@@ -752,11 +753,12 @@ fn bench_decompress(
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let (blob, extents, out_bytes) = match prepare_decompress(a, kae, data, block, bound, nblocks)
-    {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    let DecompressInput { blob, extents, out_bytes } =
+        match prepare_decompress(a, kae, data, block, bound, nblocks)
+        {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
 
     // timed decompress loop; throughput counts the decompressed raw bytes;
     // a mid-loop failure fails the cell instead of silently deflating them
@@ -786,14 +788,13 @@ fn bench_decompress(
         a.passes_max,
     );
     if let Some(e) = decompress_err {
-        println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress data={} block={} at=timed_loop err={}", a.impl_name, a.data, block, flat(&e));
+        println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress block={} at=timed_loop err={}", a.impl_name, block, flat(&e));
         return EXIT_VERIFY_FAIL;
     }
     let in_bytes = (nblocks as u64) * (block as u64) * st.passes; // decompressed bytes
     emit_ok(OkResult {
         impl_name: &a.impl_name,
         op: "decompress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -874,9 +875,8 @@ fn bench_pool_compress(
     );
     if let Some(e) = first_err.into_inner().unwrap() {
         println!(
-            "RESULT status=COMPRESS_FAIL impl={} op=compress data={} block={} at=timed_pool err={}",
+            "RESULT status=COMPRESS_FAIL impl={} op=compress block={} at=timed_pool err={}",
             a.impl_name,
-            a.data,
             block,
             flat(&e)
         );
@@ -886,7 +886,6 @@ fn bench_pool_compress(
     emit_ok(OkResult {
         impl_name: &a.impl_name,
         op: "compress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -912,11 +911,12 @@ fn bench_pool_decompress(
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let (blob, extents, out_bytes) = match prepare_decompress(a, kae, data, block, bound, nblocks)
-    {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    let DecompressInput { blob, extents, out_bytes } =
+        match prepare_decompress(a, kae, data, block, bound, nblocks)
+        {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
     let workers = a.workers.min(nblocks);
     let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
     let failed = AtomicBool::new(false);
@@ -960,9 +960,8 @@ fn bench_pool_decompress(
     );
     if let Some(e) = first_err.into_inner().unwrap() {
         println!(
-            "RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress data={} block={} at=timed_pool err={}",
+            "RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress block={} at=timed_pool err={}",
             a.impl_name,
-            a.data,
             block,
             flat(&e)
         );
@@ -972,7 +971,6 @@ fn bench_pool_decompress(
     emit_ok(OkResult {
         impl_name: &a.impl_name,
         op: "decompress",
-        data: &a.data,
         block,
         lib: &a.lib,
         blocks: nblocks,
@@ -1045,8 +1043,8 @@ fn verify_sample(a: &WorkerArgs, kae: &KaeLz4, data: &[u8], block: usize) -> i32
     }
     let status = if fail == 0 { "OK" } else { "FAIL" };
     println!(
-        "VERIFY status={status} impl={} data={} block={} blocks={} fail={}",
-        a.impl_name, a.data, block, count, fail
+        "VERIFY status={status} impl={} block={} blocks={} fail={}",
+        a.impl_name, block, count, fail
     );
     if fail == 0 {
         EXIT_OK

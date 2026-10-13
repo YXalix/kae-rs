@@ -16,10 +16,11 @@ relative to those trees; paths like `src/...` refer to this crate.
 
 ## Verdict in one table
 
-Numbers from the default full scan (64 MiB datasets, blocks 4K–1M, host
-with 2× SEC2 + 2× ZIP uacce devices):
+Numbers from full scans (64 MiB inputs: all-zero, mixed, and
+incompressible random data; blocks 4K–1M; host with 2× SEC2 + 2× ZIP
+uacce devices):
 
-| Aspect (zeros, 1M blocks unless noted) | software | hw sync | hw async batch |
+| Aspect (all-zero data, 1M blocks unless noted) | software | hw sync | hw async batch |
 |---|---|---|---|
 | compress throughput   | 15.75 GB/s | 2.91 GB/s | 3.97 GB/s |
 | compress CPU per GB   | 0.06 s     | 0.34 s    | 3.17 s    |
@@ -29,17 +30,18 @@ with 2× SEC2 + 2× ZIP uacce devices):
 
 By the documented bench criteria (`src/orchestrator.rs:26` — speedup
 > 1.1x is an outright win, cpu <= 50% of software counts as offload
-value, large-block fallback needs >= 1.5x), all three synthetic datasets
-print **NO-GO** for the synchronous path.
+value, large-block fallback needs >= 1.5x), every measured data profile
+(all-zero, mixed, incompressible) prints **NO-GO** for the synchronous
+path.
 
 ## What the numbers say
 
 - **Compression loses on every axis.** Sync hardware reaches 0.11x–0.50x
-  of software throughput across all datasets and block sizes, burns 2–8x
+  of software throughput across every data profile and block size, burns 2–8x
   more CPU per GB, and emits more bytes (see ratio below). The async batch
   beats sync hardware but still only reaches 0.25x–0.68x of software.
 - **Decompression is the one win.** Hardware decompress of compressible
-  data runs 2.7x faster than software (16 vs 6 GB/s on zeros, 8K blocks
+  data runs 2.7x faster than software (16 vs 6 GB/s on all-zero data, 8K blocks
   and up) at CPU parity. On random data both sides are memcpy-bound at
   ~20 GB/s. This is a real placement argument for compress-once /
   read-many pipelines — but note the async batch does not cover it (see
@@ -50,10 +52,10 @@ print **NO-GO** for the synchronous path.
 - **The async batch trades CPU for throughput.** Over sync hardware it
   buys 2.7–3.0x at 4K but only ~1.35x at 64K and up — for 12–13 busy
   cores (see next section). Throughput plateaus at ~4 GB/s at 64K+
-  regardless of compressibility (zeros 3.97, mixed 3.76, random 3.07),
-  which points at the submit/complete path saturating before the engine
-  does. The second SEC2 device is left idle.
-- **Ratio regresses.** On zeros-like data the hardware emits ~4x more
+  regardless of compressibility (all-zero 3.97, mixed 3.76,
+  incompressible 3.07), which points at the submit/complete path
+  saturating before the engine does. The second SEC2 device is left idle.
+- **Ratio regresses.** On all-zero data the hardware emits ~4x more
   bytes than software (1.6% vs 0.4% at 64K+; 2.3% at 4K). On mixed data
   it is 21.5% vs 20.5%. Immaterial in absolute terms, relevant when
   network or storage is the bottleneck.
@@ -73,14 +75,14 @@ than software) has a mechanical explanation:
 **Every sync cell in the scan burns exactly one core.** Multiply each
 row's GB/s by its cpu s/GB and the product is the average core count:
 
-| cell                     | GB/s  | cpu s/GB | cores |
+| cell                        | GB/s  | cpu s/GB | cores |
 |---|---|---|---|
-| zeros 1M sw compress     | 15.75 | 0.06     | 0.94  |
-| zeros 1M hw compress     | 2.91  | 0.34     | 0.99  |
-| mixed 4K hw compress     | 1.04  | 0.96     | 1.00  |
-| random 4K hw compress    | 0.98  | 1.02     | 1.00  |
-| zeros 1M hw decompress   | 16.01 | 0.06     | 0.96  |
-| zeros 1M hwasync compress| 3.97  | 3.17     | 12.58 |
+| all-zero 1M sw compress     | 15.75 | 0.06     | 0.94  |
+| all-zero 1M hw compress     | 2.91  | 0.34     | 0.99  |
+| mixed 4K hw compress        | 1.04  | 0.96     | 1.00  |
+| incompressible 4K hw compress | 0.98 | 1.02    | 1.00  |
+| all-zero 1M hw decompress   | 16.01 | 0.06     | 0.96  |
+| all-zero 1M hwasync compress | 3.97 | 3.17     | 12.58 |
 
 The law holds across all 75 measured cells (the 15 `hwasync` decompress
 cells are unsupported): sw and hw sit at 0.90–1.08 cores,
@@ -192,7 +194,7 @@ sharpens the criticism:
    has no wait knob at all; v2's `WD_COMP_EPOLL_EN` defaults off and the
    kaelz4 sync entry dispatches only to v1.
 7. **Single-queue ceiling**: sync plateaus at ~2.9 GB/s and the async
-   pool at ~4 GB/s at 64K+ regardless of dataset — the submit/complete
+   pool at ~4 GB/s at 64K+ regardless of the data — the submit/complete
    path saturates first; the second SEC2 device sits idle in the default
    configuration.
 8. **Silent software fallback** at hardware-API speed when the patched
@@ -224,7 +226,7 @@ sharpens the criticism:
 ## Reproducing
 
 ```bash
-./target/release/kae-bench                  # full scan (~5 min)
+./target/release/kae-bench                  # full scan (~2 min)
 
 # cores per cell = GB/s x cpu s/GB  (≈1.0 for sw/hw, ≈13 for hwasync)
 ./target/release/kae-bench --tsv /tmp/b.tsv --json /tmp/b.json

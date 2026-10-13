@@ -125,7 +125,7 @@ the process; later changes (env or `configure()`) have no effect there.
 ```bash
 ls /dev/hisi_zip-*                      # hardware present?
 ./target/release/kae-bench --probe      # libraries load? symbols resolve? async surface?
-./target/release/kae-bench --data mixed --blocks 4096 --ops compress   # quick sanity scan
+./target/release/kae-bench --blocks 4096 --ops compress   # quick sanity scan
 ```
 
 `--probe` opens each library in its own subprocess and lists every standard
@@ -149,7 +149,7 @@ The bench prints a warning in exactly this situation.
 | `/sys/class/uacce/` lists entries but `/dev/hisi_*` is empty | The device nodes were not created — a container with a restricted `/dev`, or `devtmpfs` not managing `/dev`. Create them from the sysfs registrations (root): `for d in /sys/class/uacce/*; do n=$(basename "$d"); IFS=: read -r maj min < "$d/dev"; [ -e "/dev/$n" ] \|\| mknod "/dev/$n" c "$maj" "$min"; done` |
 | hw throughput fine but CPU saving smaller than expected | Look at `cpu s/GB`, not only GB/s, and prefer `--input` with the real workload; small blocks and the synchronous per-block call pattern cap the offload — compare against `hwasync` to see what segment-level batching buys. |
 | `RESULT status=ASYNC_FAIL ... TASK_QUEUE_FULL` | The KAE task queue was full with nothing in flight from this batch — another process is hogging the queue. Retry when the co-tenant finishes, or lower concurrency. |
-| `RESULT status=WORKER_ERR` in a cell | The worker subprocess died; the note carries the first words of its stderr. Re-run that single cell (narrow `--blocks/--data/--impl`) to see the full output. |
+| `RESULT status=WORKER_ERR` in a cell | The worker subprocess died; the note carries the first words of its stderr. Re-run that single cell (narrow `--blocks/--impl`) to see the full output. |
 | gcc (`cc1`) or `readelf` suddenly broken host-wide | Someone violated a hard rule — the patched library is on the global loader path. Remove `/usr/local/kae*` from `LD_LIBRARY_PATH` / `ld.so.conf.d` / `/usr/local/lib`. |
 | `GLIBC_2.34 not found` when copying the binary to another host | The binary was built on a newer glibc. Build on the target machine (`cargo build --release` needs nothing beyond rustc 1.70+ — the crate has zero dependencies) or verify requirements with `objdump -T kae-bench \| grep GLIBC \| sort -u`. |
 

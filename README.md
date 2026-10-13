@@ -134,15 +134,15 @@ the device are marked `#[ignore]` (`tests/hw_required.rs`) and run only with
 ```bash
 cargo build --release
 ./target/release/kae-bench --probe        # environment & symbol probe (incl. the async surface)
-./target/release/kae-bench                # full scan: sw / hw / hwasync / raw (~5 min)
+./target/release/kae-bench                # full scan: sw / hw / hwasync / raw (~2 min)
 ./target/release/kae-bench --input /path/to/memory.img \
     --blocks 4096,65536,1048576 --ops compress
 ./target/release/kae-bench --impl sw,hw,hwasync --workers 8 \
-    --data mixed --ops compress           # hardware vs an 8-thread software pool
-cargo bench -- --data mixed --ops compress # bench entry point (same logic)
+    --ops compress                        # hardware vs an 8-thread software pool
+cargo bench -- --ops compress             # bench entry point (same logic)
 ```
 
-- Every (dataset × block size × sw/hw × compress/decompress) combination runs
+- Every (block size × sw/hw × compress/decompress) combination runs
   in a **subprocess**: the patched library and the system library share the
   SONAME liblz4.so.1 and would pollute each other inside one process. The
   `raw` cells carry no library at all (in-crate uacce engine path) and skip
@@ -162,8 +162,10 @@ cargo bench -- --data mixed --ops compress # bench entry point (same logic)
 - Cross-validation: hw-compressed samples (first 32 MiB) are decoded and
   compared by the system liblz4, confirming the on-disk format is unchanged
   and the read path can stay in software.
-- Datasets zeros/mixed/random use a 4K-page-interleaved distribution (50%
-  zero + 20% random + 30% text) with fixed seeds for reproducibility; results
+- The synthetic dataset is a 4K-page-interleaved mix (50% zero + 20% random
+  + 30% text pages, fixed seed) approximating a VM memory snapshot's
+  compressibility; `--input` swaps in a real file (a VM memory image, an
+  all-zero or incompressible file for best/worst cases); results
   are written as TSV/JSON (`--tsv/--json`).
 
 Compile on a dev machine and copy to production: the binary's highest glibc

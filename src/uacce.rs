@@ -157,8 +157,9 @@ const HW_RAW_DEFLATE: u32 = 0x01;
 /// 0x42 is the L9 "price" variant; plain L8/LZ4-style runs as 0x43.
 const HW_LZ77_ZSTD: u32 = 0x43;
 // dw7 flags (uadk v1 hisi_zip_udrv.c): stream NEW + stateless + FINISH,
-// BD type 3 — the stateless one-shot shape kaelz4 uses.
-const DW7_ONE_SHOT: u32 = (1 << 2 | 0 << 1 | 1) << 25 | 3 << 28;
+// BD type 3 — the stateless one-shot shape kaelz4 uses. Bit layout of
+// dw7[27:25]: NEW=1, flush=0, FINISH=1.
+const DW7_ONE_SHOT: u32 = (0b101 << 25) | (0b11 << 28);
 // dw9 window-size field (enum wcrypto_comp_win_type, 0-based)
 const WS_16K: u32 = 2;
 const WS_32K: u32 = 4;
@@ -924,7 +925,7 @@ mod tests {
         // v2/v3 encoding: sqn | cmd<<12 | (idx | pri<<16)<<32
         assert_eq!(doorbell_value(7, DOORBELL_CMD_SQ, 0, 0), 7);
         assert_eq!(doorbell_value(7, DOORBELL_CMD_SQ, 63, 0), 7 | (63u64 << 32));
-        assert_eq!(doorbell_value(1024 & 0x3ff, DOORBELL_CMD_CQ, 0, 1), 0 | (1u64 << 12) | (1u64 << 48));
+        assert_eq!(doorbell_value(1024 & 0x3ff, DOORBELL_CMD_CQ, 0, 1), (1u64 << 12) | (1u64 << 48));
         assert_eq!(doorbell_value(3, DOORBELL_CMD_CQ, 1023, 0), 3 | (1u64 << 12) | (1023u64 << 32));
     }
 
@@ -943,7 +944,7 @@ mod tests {
         assert_eq!(dw(13), 65536 + 16); // literals capacity
         assert_eq!(dw(14), out_cap(RawAlg::Lz77, 65536) as u32 - 65552); // seq capacity
         assert_eq!(dw(4), 65536); // input_data_length
-        assert_eq!(dw(7), (1 << 2 | 0 << 1 | 1) << 25 | 3 << 28); // NEW/stateless/FINISH/BD3
+        assert_eq!(dw(7), (0b101 << 25) | (0b11 << 28)); // NEW/stateless/FINISH/BD3
         // source at dwords 18/19
         assert_eq!((dw(19), dw(18)), (0x1234_5678, 0x9abc_def0));
         // literals (cipher_key pair) at the output start: dwords 24/25

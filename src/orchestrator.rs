@@ -1,5 +1,5 @@
 //! Orchestrator: CLI entry point. Environment check -> generate data -> for
-//! every (data, block, impl, op) combination re-execute itself to spawn a
+//! every (block, impl, op) combination re-execute itself to spawn a
 //! worker subprocess -> parse RESULT/VERIFY into a summary table -> verdict.
 //!
 //! Why one subprocess per combination: the KAE patched liblz4 and the system
@@ -54,7 +54,6 @@ struct Config {
     input: String,
     size_mib: usize,
     blocks: Vec<usize>,
-    datasets: Vec<String>,
     impls: Vec<String>,
     ops: Vec<String>,
     workers: usize,
@@ -75,10 +74,9 @@ fn usage() {
         "kae-bench: KAE2 hardware LZ4 vs software LZ4 block compression benchmark (zfile granularity)
 
 usage: kae-bench [options]
-  --input FILE      benchmark against a real file (e.g. an exported VM memory image) instead of synthetic data
+  --input FILE      benchmark against a real file (e.g. an exported VM memory image) instead of the synthetic mixed dataset
   --size MIB        synthetic dataset size, MiB (default 64)
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
-  --data LIST       datasets: zeros,mixed,random (default all; ignored with --input)
   --impl LIST       implementations: sw,hw,hwasync,raw (default: all present;
                     hwasync = segment-level async batch, compress only; raw =
                     the crate's own uacce engine path, compress only, no C
@@ -133,7 +131,7 @@ fn hw_backed(impl_name: &str) -> bool {
 
 /// The raw cells need only the uacce device nodes (no patched library).
 fn raw_available() -> bool {
-    crate::uacce::zip_devices().len() > 0
+    !crate::uacce::zip_devices().is_empty()
 }
 
 /// The machine's hostname (the TSV header and the env report carry it).
@@ -152,7 +150,6 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             .split(',')
             .filter_map(|s| s.parse().ok())
             .collect(),
-        datasets: data::DATASETS.iter().map(|s| s.to_string()).collect(),
         impls: vec![
             worker::IMPL_SW.into(),
             worker::IMPL_HW.into(),
@@ -195,20 +192,6 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
                     .collect();
                 if c.blocks.is_empty() {
                     return Err("--blocks parsed to an empty list".into());
-                }
-            }
-            "--data" => {
-                c.datasets = parse_list(&val(&mut i, "--data")?);
-                for d in &c.datasets {
-                    if !data::DATASETS.contains(&d.as_str()) {
-                        return Err(format!(
-                            "unknown --data {d} (expected one of: {})",
-                            data::DATASETS.join(", ")
-                        ));
-                    }
-                }
-                if c.datasets.is_empty() {
-                    return Err("--data parsed to an empty list".into());
                 }
             }
             "--impl" => c.impls = parse_impl_list(&val(&mut i, "--impl")?)?,
@@ -315,7 +298,7 @@ fn stderr_tail(stderr: &str) -> String {
         .join("_")
 }
 
-/// One (dataset x block x impl x op) benchmark cell.
+/// One (block x impl x op) benchmark cell against the run's single input.
 struct Cell<'a> {
     dataset: &'a str,
     data_file: &'a Path,
@@ -348,8 +331,6 @@ fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
         cell.op.into(),
         "--impl".into(),
         cell.impl_name.into(),
-        "--data".into(),
-        cell.dataset.into(),
         "--min-sec".into(),
         cfg.min_sec.to_string(),
         "--passes-min".into(),
@@ -397,14 +378,7 @@ fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
     row
 }
 
-fn run_verify(
-    exe: &Path,
-    cfg: &Config,
-    dataset: &str,
-    data_file: &Path,
-    block: usize,
-    sample: &Path,
-) -> String {
+fn run_verify(exe: &Path, cfg: &Config, data_file: &Path, block: usize, sample: &Path) -> String {
     let args: Vec<String> = vec![
         "--_worker".into(),
         "--lib".into(),
@@ -417,8 +391,6 @@ fn run_verify(
         "verify".into(),
         "--impl".into(),
         worker::IMPL_SW.into(),
-        "--data".into(),
-        dataset.into(),
         "--sample".into(),
         sample.display().to_string(),
     ];
@@ -549,25 +521,18 @@ fn print_table(rows: &[Row]) {
 fn verdict(cfg: &Config, rows: &[Row]) {
     if cfg.workers > 1 {
         println!(
-            "== Verdict (compress, sw/hw are {}-thread pools, preferring input > mixed) ==",
+            "== Verdict (compress, sw/hw are {}-thread pools) ==",
             cfg.workers
         );
     } else {
-        println!("== Verdict (compress, preferring input > mixed) ==");
+        println!("== Verdict (compress) ==");
     }
-    let pick = ["input", "mixed"]
+    // one benchmark input per run; its row label is "input" or "mixed"
+    let Some(dataset) = rows
         .iter()
-        .find(|d| {
-            rows.iter()
-                .any(|r| &r.data == *d && r.op == "compress" && r.status == "OK")
-        })
-        .map(|s| s.to_string())
-        .or_else(|| {
-            rows.iter()
-                .find(|r| r.op == "compress" && r.status == "OK")
-                .map(|r| r.data.clone())
-        });
-    let Some(dataset) = pick else {
+        .find(|r| r.op == "compress" && r.status == "OK")
+        .map(|r| r.data.as_str())
+    else {
         println!("  no usable compress rows.");
         return;
     };
@@ -698,7 +663,7 @@ fn write_json(path: &str, rows: &[Row]) {
     }
 }
 
-/// A private scratch dir for the synthetic datasets and cross-validation
+/// A private scratch dir for the synthetic dataset and cross-validation
 /// samples, unique per run.
 fn make_tmp_dir() -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir().join(format!(
@@ -713,35 +678,25 @@ fn make_tmp_dir() -> Result<PathBuf, String> {
     Ok(tmp)
 }
 
-/// Section 2: resolve the benchmark inputs — a real file, or one synthetic
-/// dataset file per requested kind (generation failures are skipped with a
-/// note on stderr).
-fn prepare_data(cfg: &Config, tmp: &Path) -> Vec<(String, PathBuf)> {
-    let mut data_files: Vec<(String, PathBuf)> = Vec::new();
+/// Section 2: resolve the benchmark input — a real file via `--input`, or
+/// the generated synthetic mixed dataset.
+fn prepare_data(cfg: &Config, tmp: &Path) -> Result<(String, PathBuf), String> {
     if !cfg.input.is_empty() {
         println!("== 2. Input: {} ==", cfg.input);
-        data_files.push(("input".into(), PathBuf::from(&cfg.input)));
-    } else {
-        println!("== 2. Synthetic data ({} MiB per dataset) ==", cfg.size_mib);
-        for d in &cfg.datasets {
-            let p = tmp.join(format!("{d}.bin"));
-            match data::generate(d, cfg.size_mib, &p) {
-                Ok(()) => {
-                    println!("  generated {} ({})", p.display(), d);
-                    data_files.push((d.clone(), p));
-                }
-                Err(e) => eprintln!("  failed to generate {d}: {e} (skipped)"),
-            }
-        }
+        return Ok(("input".into(), PathBuf::from(&cfg.input)));
     }
-    println!();
-    data_files
+    println!("== 2. Synthetic data ({} MiB, mixed) ==", cfg.size_mib);
+    let p = tmp.join("mixed.bin");
+    data::generate(cfg.size_mib, &p)
+        .map_err(|e| format!("failed to generate {}: {e}", p.display()))?;
+    println!("  generated {}", p.display());
+    Ok(("mixed".into(), p))
 }
 
-/// Section 3: the full (dataset x block x impl x op) scan, one worker
-/// subprocess per cell, plus the stock-liblz4 cross-verification of every
-/// compress cell that produced a sample.
-fn scan(exe: &Path, cfg: &Config, data_files: &[(String, PathBuf)], tmp: &Path) -> Vec<Row> {
+/// Section 3: the full (block x impl x op) scan, one worker subprocess per
+/// cell, plus the stock-liblz4 cross-verification of every compress cell
+/// that produced a sample.
+fn scan(exe: &Path, cfg: &Config, dataset: &str, data_file: &Path, tmp: &Path) -> Vec<Row> {
     println!(
         "== 3. Scan (adaptive timing >= {:.1}s per cell, subprocess isolation of sw/hw) ==",
         cfg.min_sec
@@ -760,61 +715,52 @@ fn scan(exe: &Path, cfg: &Config, data_files: &[(String, PathBuf)], tmp: &Path) 
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut sample_idx = 0usize;
-    for (dataset, data_file) in data_files {
-        for block in &cfg.blocks {
-            for impl_name in &impls {
-                for op in &cfg.ops {
-                    let sample_out = if op == "compress" {
-                        sample_idx += 1;
-                        Some(tmp.join(format!("sample.{sample_idx}.lz4")))
-                    } else {
-                        None
-                    };
-                    let cell = Cell {
-                        dataset,
-                        data_file,
-                        block: *block,
-                        impl_name,
-                        op,
-                        sample_out: sample_out.as_deref(),
-                    };
-                    let mut row = run_row(exe, cfg, &cell);
-                    // raw output is lz77 triples, not a decodable LZ4
-                    // stream: there is no cross-validation sample for it
-                    if row.status == "OK"
-                        && cell.op == "compress"
-                        && cell.impl_name != worker::IMPL_RAW
-                    {
-                        let sample_path = cell
-                            .sample_out
-                            .expect("compress cells always get a sample path");
-                        row.verify = run_verify(
-                            exe,
-                            cfg,
-                            cell.dataset,
-                            cell.data_file,
-                            cell.block,
-                            sample_path,
-                        );
-                    }
-                    let vdisp = if row.verify.is_empty() {
-                        "-".into()
-                    } else {
-                        row.verify.clone()
-                    };
-                    if row.status == "OK" {
-                        println!(
-                            "  {} {} {} {} -> {:.2} GB/s, ratio {:.1}%, cpu {:.2} s/GB, verify {} [{}]",
-                            dataset, block, impl_name, op, row.gbps, row.ratio_pct, row.cpu_per_gb, vdisp, row.status
-                        );
-                    } else {
-                        println!(
-                            "  {} {} {} {} -> [{}] {}",
-                            dataset, block, impl_name, op, row.status, row.note
-                        );
-                    }
-                    rows.push(row);
+    for block in &cfg.blocks {
+        for impl_name in &impls {
+            for op in &cfg.ops {
+                let sample_out = if op == "compress" {
+                    sample_idx += 1;
+                    Some(tmp.join(format!("sample.{sample_idx}.lz4")))
+                } else {
+                    None
+                };
+                let cell = Cell {
+                    dataset,
+                    data_file,
+                    block: *block,
+                    impl_name,
+                    op,
+                    sample_out: sample_out.as_deref(),
+                };
+                let mut row = run_row(exe, cfg, &cell);
+                // raw output is lz77 triples, not a decodable LZ4
+                // stream: there is no cross-validation sample for it
+                if row.status == "OK"
+                    && cell.op == "compress"
+                    && cell.impl_name != worker::IMPL_RAW
+                {
+                    let sample_path = cell
+                        .sample_out
+                        .expect("compress cells always get a sample path");
+                    row.verify = run_verify(exe, cfg, cell.data_file, cell.block, sample_path);
                 }
+                let vdisp = if row.verify.is_empty() {
+                    "-".into()
+                } else {
+                    row.verify.clone()
+                };
+                if row.status == "OK" {
+                    println!(
+                        "  {} {} {} {} -> {:.2} GB/s, ratio {:.1}%, cpu {:.2} s/GB, verify {} [{}]",
+                        dataset, block, impl_name, op, row.gbps, row.ratio_pct, row.cpu_per_gb, vdisp, row.status
+                    );
+                } else {
+                    println!(
+                        "  {} {} {} {} -> [{}] {}",
+                        dataset, block, impl_name, op, row.status, row.note
+                    );
+                }
+                rows.push(row);
             }
         }
     }
@@ -863,15 +809,17 @@ pub fn main() -> i32 {
             return 1;
         }
     };
-    let data_files = prepare_data(&cfg, &tmp);
-    if data_files.is_empty() {
-        eprintln!("no usable datasets");
-        let _ = std::fs::remove_dir_all(&tmp);
-        return 1;
-    }
+    let (dataset, data_file) = match prepare_data(&cfg, &tmp) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return 1;
+        }
+    };
 
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kae-bench"));
-    let rows = scan(&exe, &cfg, &data_files, &tmp);
+    let rows = scan(&exe, &cfg, &dataset, &data_file, &tmp);
     summarize(&cfg, &rows);
     let _ = std::fs::remove_dir_all(&tmp);
     0

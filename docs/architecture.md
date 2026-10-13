@@ -75,7 +75,7 @@ Three deliberate design points:
 | `lz4.rs` | `Lz4Fns`: the three standard block-ABI function pointers plus `PROBE_SYMBOLS` (standard ABI + KAE async surface) used by `kae-bench --probe` |
 | `batch.rs` | `AsyncBatch`: segment-level async compression over `LZ4_compress_async` (see below) |
 | `sysres.rs` | `getrusage`/`clock_gettime` FFI and the adaptive `timed_loop` the bench is built on |
-| `data.rs` | Deterministic synthetic datasets (zeros / mixed / random, 4K-page interleaved, fixed-seed xorshift64*) |
+| `data.rs` | Deterministic synthetic dataset (mixed: 50% zero / 20% random / 30% text, 4K-page interleaved, fixed-seed xorshift64*) |
 | `worker.rs` | `--_worker` subprocess mode: opens exactly one liblz4, runs one cell, prints `RESULT`/`VERIFY`/`PROBE` line-protocol records; captures cross-validation samples |
 | `orchestrator.rs` | Bench CLI: environment report → data generation → one subprocess per cell → summary table → verdict; TSV/JSON writers |
 

@@ -42,7 +42,7 @@ the engine itself is the limit and the placement verdict is final.
 ```bash
 cargo build --release
 ./target/release/kae-bench --impl raw                     # full scan cells
-./target/release/kae-bench --impl raw --data mixed --blocks 4096,65536,1048576
+./target/release/kae-bench --impl raw --blocks 4096,65536,1048576
 ```
 
 Needs a machine with `/dev/hisi_zip-*` uacce nodes; without one the raw
@@ -69,24 +69,24 @@ exact configuration (`alg,queues,depth,db_batch,wait,req_size,nvcsw,nivcsw`).
 
 ```bash
 # plumbing check first: deflate dialect, shallow, short
-KAE_RAW_ALG=deflate KAE_RAW_DEPTH=8 ./target/release/kae-bench --impl raw --blocks 65536 --data zeros --min-sec 2
+KAE_RAW_ALG=deflate KAE_RAW_DEPTH=8 ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2
 
 # the depth ladder: where does throughput stop responding to in-flight depth?
-for k in 1 4 16 64 256 1024; do KAE_RAW_DEPTH=$k ./target/release/kae-bench --impl raw --blocks 65536 --data zeros --tsv /dev/null | grep 'raw zeros'; done
+for k in 1 4 16 64 256 1024; do KAE_RAW_DEPTH=$k ./target/release/kae-bench --impl raw --blocks 65536 --tsv /dev/null | grep 'raw compress'; done
 
 # queue scaling across both ZIP devices (--workers = queues)
-./target/release/kae-bench --impl raw --workers 2 --blocks 65536 --data zeros
+./target/release/kae-bench --impl raw --workers 2 --blocks 65536
 
 # wait-policy comparison: spin CPU vs poll() CPU at the same throughput
-KAE_RAW_WAIT=spin ./target/release/kae-bench --impl raw --blocks 65536 --data zeros
-KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw --blocks 65536 --data zeros
+KAE_RAW_WAIT=spin ./target/release/kae-bench --impl raw --blocks 65536
+KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw --blocks 65536
 
 # doorbell cost: per-request ring vs batched
-KAE_RAW_DB_BATCH=1 ./target/release/kae-bench --impl raw --blocks 65536 --data zeros
+KAE_RAW_DB_BATCH=1 ./target/release/kae-bench --impl raw --blocks 65536
 # (default batches a full depth per doorbell)
 
 # small-block economics
-./target/release/kae-bench --impl raw --blocks 4096,16384,65536,131072 --data mixed
+./target/release/kae-bench --impl raw --blocks 4096,16384,65536,131072
 ```
 
 Repeat the sweep after loading the driver with `perf_mode=1` (see

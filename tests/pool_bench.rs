@@ -86,8 +86,6 @@ fn pool_compress_and_decompress_report_pool_numbers() {
                 op,
                 "--impl",
                 impl_name,
-                "--data",
-                "pool",
                 "--workers",
                 "3",
                 "--min-sec",
@@ -135,8 +133,6 @@ fn workers_default_1_stays_on_the_sync_path() {
         "compress",
         "--impl",
         "sw",
-        "--data",
-        "pool",
         "--min-sec",
         "0.05",
         "--passes-min",
@@ -168,8 +164,6 @@ fn workers_out_of_bounds_is_a_usage_error() {
             "compress",
             "--impl",
             "sw",
-            "--data",
-            "pool",
             "--workers",
             w,
             "--min-sec",
@@ -198,8 +192,6 @@ fn orchestrator_emits_pool_rows_with_cross_validation() {
         "1",
         "--blocks",
         "4096",
-        "--data",
-        "zeros",
         "--impl",
         "sw",
         "--workers",
@@ -219,8 +211,8 @@ fn orchestrator_emits_pool_rows_with_cross_validation() {
     let body = std::fs::read_to_string(&tsv).expect("tsv written");
     let row = body
         .lines()
-        .find(|l| l.starts_with("zeros\t"))
-        .expect("a zeros sw row");
+        .find(|l| l.starts_with("mixed\t"))
+        .expect("a mixed sw row");
     let cols: Vec<&str> = row.split('\t').collect();
     assert_eq!(cols[2], "sw", "the impl column keeps the raw name: {row}");
     assert_eq!(cols[9], "OK", "status column: {row}");

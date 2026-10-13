@@ -14,7 +14,7 @@ mean about the hardware path — weaknesses and their root causes — see
 ```bash
 cargo build --release
 ./target/release/kae-bench --probe     # environment & symbol probe, then exit
-./target/release/kae-bench             # full scan: sw / hw / hwasync (~5 min)
+./target/release/kae-bench             # full scan: sw / hw / hwasync (~2 min)
 ```
 
 Common invocations:
@@ -25,7 +25,7 @@ Common invocations:
 
 # shrink the matrix
 ./target/release/kae-bench --blocks 4096,65536,1048576 --ops compress
-./target/release/kae-bench --data mixed --impl sw,hw
+./target/release/kae-bench --impl sw,hw
 
 # the production-shape comparison: hardware vs an 8-thread software pool
 ./target/release/kae-bench --impl sw,hw,hwasync --workers 8
@@ -39,9 +39,8 @@ Common invocations:
 | Option | Default | Meaning |
 |---|---|---|
 | `--input FILE` | — | Benchmark a real file instead of synthetic data (dataset label becomes `input`) |
-| `--size MIB` | 64 | Synthetic dataset size per dataset |
+| `--size MIB` | 64 | Synthetic dataset size |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
-| `--data LIST` | `zeros,mixed,random` | Datasets (ignored with `--input`) |
 | `--impl LIST` | `sw,hw,hwasync,raw` | `sw`, `hw`, `hwasync` (compress only), `raw` (compress only; the crate's own uacce engine path — see [raw-bench.md](raw-bench.md)) |
 | `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `raw`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
@@ -56,9 +55,9 @@ Common invocations:
 
 Flags that libtest appends under `cargo bench` (`--bench`, `--nocapture`,
 …) are accepted and ignored. Invalid list values are rejected up front with
-an error: `--blocks` must parse to block sizes, `--data` must name known
-datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`/`raw`,
-`--ops` must be `compress`/`decompress`, and `--workers` must be 1–256.
+an error: `--blocks` must parse to block sizes, `--impl` must be
+`sw`/`hw`/`hwasync`/`raw`, `--ops` must be `compress`/`decompress`, and
+`--workers` must be 1–256.
 
 Cells are skipped (with a printed reason) when their backend is absent:
 `hw`/`hwasync` need the patched library, `raw` needs a `/dev/hisi_zip-*`
@@ -71,16 +70,15 @@ uacce device node.
    library paths, and the preload chain. Warns when no uacce device is
    present (the patched library then compresses in software internally, and
    "hw" rows may be software in fact).
-2. **Data generation** — writes the synthetic datasets (or stages the
-   `--input` file). All datasets are deterministic: a fixed-seed
-   xorshift64*, 4K-page-interleaved layout, so numbers are comparable
-   across machines and runs.
-   - `zeros` — all-zero pages (best case for LZ4)
-   - `mixed` — 50% zero + 20% random + 30% text pages, approximating a VM
-     memory snapshot's compressibility profile
-   - `random` — incompressible pages (worst case)
-3. **Scan** — for every (dataset × block size × implementation × operation)
-   cell, re-executes itself as a worker subprocess with exactly one library
+2. **Data generation** — writes the synthetic dataset (or stages the
+   `--input` file). The dataset is deterministic: a fixed-seed xorshift64*,
+   4K-page-interleaved layout of 50% zero + 20% random + 30% text pages,
+   approximating a VM memory snapshot's compressibility profile, so numbers
+   are comparable across machines and runs. Best/worst-case data
+   (all-zero, incompressible) comes from `--input` with a file of your
+   choosing.
+3. **Scan** — for every (block size × implementation × operation) cell,
+   re-executes itself as a worker subprocess with exactly one library
    open, parses its `RESULT` line, and — for compress cells with `OK`
    status — runs a second subprocess that decodes the captured sample with
    the **system** liblz4 and compares block-by-block (`VERIFY`). The `raw`
@@ -143,9 +141,8 @@ Timing per cell is adaptive: at least `--passes-min` passes and
 
 ### The verdict
 
-After the table, the bench picks a dataset (preferring `input`, then
-`mixed`, then any dataset with a successful compress row) and, per block
-size, reports the hw/sw speedup and the hw CPU cost as a percentage of sw.
+After the table, the bench reports, per block size, the hw/sw speedup and
+the hw CPU cost as a percentage of sw.
 With `--workers` >1 both sides are N-thread pools, so those numbers
 compare equal thread budgets — the production shape a thread-pooled zfile
 would actually run; at the default 1 they answer the single-thread
@@ -183,8 +180,8 @@ Workers are not for manual invocation, but their stdout is the debug
 surface when a cell misbehaves:
 
 ```
-RESULT status=OK impl=hw op=compress data=mixed block=4096 lib=... blocks=... passes=... in_bytes=... out_bytes=... ratio_pct=... wall_s=... gbps=... user_s=... sys_s=... cpu_s_per_gb=... note=...
-VERIFY status=OK impl=sw data=mixed block=4096 blocks=... fail=0
+RESULT status=OK impl=hw op=compress block=4096 lib=... blocks=... passes=... in_bytes=... out_bytes=... ratio_pct=... wall_s=... gbps=... user_s=... sys_s=... cpu_s_per_gb=... note=...
+VERIFY status=OK impl=sw block=4096 blocks=... fail=0
 PROBE lib=...  +  SYMBOL <name> found|missing  +  HAS_ASYNC yes|no
 ```
 
