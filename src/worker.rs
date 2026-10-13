@@ -13,6 +13,7 @@
 
 use crate::lz4::PROBE_SYMBOLS;
 use crate::sysres::{timed_loop, timed_pool_loop, LoopStats};
+use crate::uacce;
 use crate::{AsyncBatch, Backend, KaeLz4};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use std::sync::Mutex;
 pub(crate) const IMPL_SW: &str = "sw";
 pub(crate) const IMPL_HW: &str = "hw";
 pub(crate) const IMPL_HWASYNC: &str = "hwasync";
+pub(crate) const IMPL_RAW: &str = "raw";
 
 /// Upper bound on --workers, matching the AgentENV zfile WorkerPool cap
 /// (keeps a typo from spawning thousands of threads).
@@ -112,7 +114,7 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
         }
         i += 1;
     }
-    if a.lib.is_empty() {
+    if a.lib.is_empty() && a.impl_name != IMPL_RAW {
         return Err("worker: --lib required".into());
     }
     if a.workers > POOL_WORKERS_MAX {
@@ -124,11 +126,11 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
     // probe mode never passes --impl
     if !a.probe {
         match a.impl_name.as_str() {
-            IMPL_SW | IMPL_HW | IMPL_HWASYNC => {}
+            IMPL_SW | IMPL_HW | IMPL_HWASYNC | IMPL_RAW => {}
             "" => return Err("worker: --impl required".into()),
             other => {
                 return Err(format!(
-                    "worker: unknown --impl {other} (expected sw|hw|hwasync)"
+                    "worker: unknown --impl {other} (expected sw|hw|hwasync|raw)"
                 ))
             }
         }
@@ -209,6 +211,18 @@ pub fn run(args: &[String]) -> i32 {
             return EXIT_USAGE;
         }
         return bench_async_compress(&a, &data, block, nblocks);
+    }
+
+    // raw uacce engine path (compress only; no C library in the process)
+    if a.impl_name == IMPL_RAW {
+        if a.op != "compress" {
+            println!(
+                "RESULT status=UNSUPPORTED impl=raw op={} note=raw_compress_only",
+                a.op
+            );
+            return EXIT_USAGE;
+        }
+        return bench_raw(&a, &data, block, nblocks);
     }
 
     // --workers >1 turns sw/hw into the threaded block pool form (the
@@ -412,6 +426,124 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
         out_bytes: out_bytes_warm * st.passes,
         ratio_pct: out_bytes_warm as f64 / in_bytes_one as f64 * 100.0,
         note: &async_note,
+    });
+    EXIT_OK
+}
+
+/// `raw`: drive the ZIP engine through the crate's own uacce module — no
+/// libwd, no patched library, and no payload copies in the timed loop (the
+/// workload sits in DMA-visible SS memory once at setup). The request size
+/// is the bench block capped at the engine's 128K lz77 flat limit;
+/// `--workers` maps to hardware queues (one fd each, round-robin over the
+/// devices). Knobs via environment:
+/// `KAE_RAW_DEPTH` in-flight requests per queue (default 64),
+/// `KAE_RAW_DB_BATCH` SQEs per doorbell (default = depth),
+/// `KAE_RAW_WAIT` `spin` (default) or `poll` (sleep on the uacce fd),
+/// `KAE_RAW_ALG` `lz77` (default) or `deflate` (the plumbing-check dialect:
+/// no 128K input cap, and completion sanity only).
+///
+/// The reported ratio counts the engine's lz77 triples output
+/// (literals + 8-byte sequences), i.e. the pre-rebuild size — close to but
+/// not identical with the final LZ4 block size. There is no cross-validation
+/// sample: triples are not a decodable LZ4 stream.
+fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let devices = uacce::zip_devices();
+    if devices.is_empty() {
+        println!("RESULT status=NO_DEVICE impl=raw op=compress note=no_hisi_zip_uacce_node");
+        return EXIT_OPEN_FAIL;
+    }
+    let env_num = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    let depth = env_num("KAE_RAW_DEPTH", 64).min(uacce::QM_Q_DEPTH);
+    let batch = env_num("KAE_RAW_DB_BATCH", depth);
+    let wait_poll = std::env::var("KAE_RAW_WAIT").map(|v| v == "poll").unwrap_or(false);
+    let alg = match std::env::var("KAE_RAW_ALG").as_deref() {
+        Ok("deflate") => uacce::RawAlg::Deflate,
+        _ => uacce::RawAlg::Lz77,
+    };
+    let req_size = match alg {
+        uacce::RawAlg::Lz77 => block.min(uacce::MAX_LZ77_REQ),
+        uacce::RawAlg::Deflate => block,
+    };
+
+    let mut pump = match uacce::RawPump::open(
+        &devices,
+        a.workers.max(1),
+        req_size,
+        depth,
+        batch,
+        wait_poll,
+        alg,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            println!(
+                "RESULT status=OPEN_FAIL impl=raw op=compress err={}",
+                flat(&e)
+            );
+            return EXIT_OPEN_FAIL;
+        }
+    };
+    pump.load_data(data);
+
+    // warm-up: settles queues and pages, totals the triples output for the
+    // ratio; a warm-up without completions means the engine never answered
+    let warm = pump.run(1.0);
+    if warm.reqs_done == 0 || warm.hw_errors > 0 {
+        println!(
+            "RESULT status=RAW_FAIL impl=raw op=compress data={} block={} reqs={} hw_err={} err=engine_dead",
+            a.data, block, warm.reqs_done, warm.hw_errors
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+
+    let st_raw = pump.run(a.min_sec);
+    if st_raw.reqs_done == 0 || st_raw.hw_errors > 0 {
+        println!(
+            "RESULT status=RAW_FAIL impl=raw op=compress data={} block={} reqs={} hw_err={} err=engine_dead",
+            a.data, block, st_raw.reqs_done, st_raw.hw_errors
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    // one continuous run = one pass; CPU covers the whole pump (this
+    // process is single-threaded)
+    let st = LoopStats {
+        wall_s: st_raw.wall_s,
+        user_s: st_raw.user_s,
+        sys_s: st_raw.sys_s,
+        passes: 1,
+    };
+    let note = format!(
+        "raw,alg={},queues={},depth={},db_batch={},wait={},req_size={},nvcsw={},nivcsw={}",
+        match alg {
+            uacce::RawAlg::Lz77 => "lz77",
+            uacce::RawAlg::Deflate => "deflate",
+        },
+        a.workers.max(1),
+        depth,
+        batch,
+        if wait_poll { "poll" } else { "spin" },
+        req_size,
+        st_raw.nvcsw,
+        st_raw.nivcsw
+    );
+    emit_ok(OkResult {
+        impl_name: IMPL_RAW,
+        op: "compress",
+        data: &a.data,
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: st_raw.bytes_in,
+        out_bytes: st_raw.bytes_out,
+        ratio_pct: st_raw.bytes_out as f64 / st_raw.bytes_in as f64 * 100.0,
+        note: &note,
     });
     EXIT_OK
 }

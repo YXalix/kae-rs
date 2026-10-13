@@ -50,6 +50,7 @@ mod loader;
 mod lz4;
 pub mod orchestrator;
 mod sysres;
+mod uacce;
 mod worker;
 
 pub use batch::AsyncBatch;

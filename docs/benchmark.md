@@ -42,8 +42,8 @@ Common invocations:
 | `--size MIB` | 64 | Synthetic dataset size per dataset |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
 | `--data LIST` | `zeros,mixed,random` | Datasets (ignored with `--input`) |
-| `--impl LIST` | `sw,hw,hwasync` | `sw`, `hw`, `hwasync` (compress only) |
-| `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`) |
+| `--impl LIST` | `sw,hw,hwasync,raw` | `sw`, `hw`, `hwasync` (compress only), `raw` (compress only; the crate's own uacce engine path — see [raw-bench.md](raw-bench.md)) |
+| `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `raw`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |
 | `--hw-lz4-lib P` | probe | Patched library path |
@@ -57,8 +57,12 @@ Common invocations:
 Flags that libtest appends under `cargo bench` (`--bench`, `--nocapture`,
 …) are accepted and ignored. Invalid list values are rejected up front with
 an error: `--blocks` must parse to block sizes, `--data` must name known
-datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`,
+datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`/`raw`,
 `--ops` must be `compress`/`decompress`, and `--workers` must be 1–256.
+
+Cells are skipped (with a printed reason) when their backend is absent:
+`hw`/`hwasync` need the patched library, `raw` needs a `/dev/hisi_zip-*`
+uacce device node.
 
 ## What it does, in order
 
@@ -79,7 +83,9 @@ datasets (`zeros,mixed,random`), `--impl` must be `sw`/`hw`/`hwasync`,
    cell, re-executes itself as a worker subprocess with exactly one library
    open, parses its `RESULT` line, and — for compress cells with `OK`
    status — runs a second subprocess that decodes the captured sample with
-   the **system** liblz4 and compares block-by-block (`VERIFY`).
+   the **system** liblz4 and compares block-by-block (`VERIFY`). The `raw`
+   cells skip the sample capture entirely: their output is lz77 triples,
+   not a decodable LZ4 stream (see [raw-bench.md](raw-bench.md)).
 4. **Summary** — a results table, a verdict, and the TSV/JSON files.
 
 ### Why subprocess isolation
@@ -126,7 +132,7 @@ open; 1 leaves the library default or any externally set env var alone).
   read path can stay in software.
 - **`status`** — `OK`, or a failure tag: `OPEN_FAIL` (library could not be
   opened), `COMPRESS_FAIL`, `DECOMPRESS_MISMATCH`, `ASYNC_FAIL`,
-  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync + decompress), `WORKER_ERR`
+  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync/raw + decompress), `WORKER_ERR`
   (the subprocess died; stderr tail is in the note). A failure inside the
   timed loop fails the cell with its error tag — no partial numbers are
   reported. When no patched library is found, `hw`/`hwasync` cells are

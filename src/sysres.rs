@@ -75,6 +75,16 @@ pub fn cpu_time() -> CpuTime {
     }
 }
 
+/// Context-switch counters since process start (getrusage): voluntary +
+/// involuntary. A spinning wait shows ~zero voluntary switches, a sleeping
+/// wait many — the one-number check that a wait-side change actually works.
+pub fn switch_counts() -> (u64, u64) {
+    let mut ru = Rusage::default();
+    let r = unsafe { getrusage(RUSAGE_SELF, &mut ru) };
+    assert_eq!(r, 0, "getrusage(RUSAGE_SELF) failed");
+    (ru.ru_nvcsw as u64, ru.ru_nivcsw as u64)
+}
+
 /// Accumulated timing of one adaptive loop.
 pub struct LoopStats {
     /// Wall-clock seconds the whole loop took.

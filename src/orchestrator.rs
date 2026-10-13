@@ -79,8 +79,10 @@ usage: kae-bench [options]
   --size MIB        synthetic dataset size, MiB (default 64)
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
   --data LIST       datasets: zeros,mixed,random (default all; ignored with --input)
-  --impl LIST       implementations: sw,hw,hwasync (default: all present; hwasync = segment-level
-                    async batch, compress only)
+  --impl LIST       implementations: sw,hw,hwasync,raw (default: all present;
+                    hwasync = segment-level async batch, compress only; raw =
+                    the crate's own uacce engine path, compress only, no C
+                    library in the process)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
                     --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's
                     library thread pool (KAE_LZ4_ASYNC_THREAD_NUM)
@@ -110,8 +112,12 @@ fn parse_impl_list(s: &str) -> Result<Vec<String>, String> {
     let impls = parse_list(s);
     for imp in &impls {
         match imp.as_str() {
-            worker::IMPL_SW | worker::IMPL_HW | worker::IMPL_HWASYNC => {}
-            other => return Err(format!("unknown --impl {other} (expected sw|hw|hwasync)")),
+            worker::IMPL_SW | worker::IMPL_HW | worker::IMPL_HWASYNC | worker::IMPL_RAW => {}
+            other => {
+                return Err(format!(
+                    "unknown --impl {other} (expected sw|hw|hwasync|raw)"
+                ))
+            }
         }
     }
     if impls.is_empty() {
@@ -123,6 +129,11 @@ fn parse_impl_list(s: &str) -> Result<Vec<String>, String> {
 /// Impls that need the patched liblz4 (skipped entirely when it is absent).
 fn hw_backed(impl_name: &str) -> bool {
     impl_name == worker::IMPL_HW || impl_name == worker::IMPL_HWASYNC
+}
+
+/// The raw cells need only the uacce device nodes (no patched library).
+fn raw_available() -> bool {
+    crate::uacce::zip_devices().len() > 0
 }
 
 /// The machine's hostname (the TSV header and the env report carry it).
@@ -146,6 +157,7 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             worker::IMPL_SW.into(),
             worker::IMPL_HW.into(),
             worker::IMPL_HWASYNC.into(),
+            worker::IMPL_RAW.into(),
         ],
         ops: OPS.iter().map(|s| s.to_string()).collect(),
         workers: 1,
@@ -314,20 +326,18 @@ struct Cell<'a> {
 }
 
 fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
-    let lib = if cell.impl_name == worker::IMPL_SW {
-        &cfg.sw_lib
+    // the raw cells carry no library (their engine path is in-crate)
+    let (lib, preload) = if cell.impl_name == worker::IMPL_RAW {
+        (String::new(), String::new())
+    } else if cell.impl_name == worker::IMPL_SW {
+        (cfg.sw_lib.clone(), String::new())
     } else {
-        &cfg.hw_lib
-    };
-    let preload = if cell.impl_name == worker::IMPL_SW {
-        String::new()
-    } else {
-        cfg.hw_preload.join(",")
+        (cfg.hw_lib.clone(), cfg.hw_preload.join(","))
     };
     let mut args: Vec<String> = vec![
         "--_worker".into(),
         "--lib".into(),
-        lib.clone(),
+        lib,
         "--preload".into(),
         preload,
         "--input".into(),
@@ -740,9 +750,13 @@ fn scan(exe: &Path, cfg: &Config, data_files: &[(String, PathBuf)], tmp: &Path) 
         .impls
         .iter()
         .filter(|i| !hw_backed(i.as_str()) || !cfg.hw_lib.is_empty())
+        .filter(|i| i.as_str() != worker::IMPL_RAW || raw_available())
         .collect();
     if cfg.impls.iter().any(|i| hw_backed(i.as_str())) && cfg.hw_lib.is_empty() {
         println!("  (hw lib not found; hw/hwasync combinations skipped)");
+    }
+    if cfg.impls.iter().any(|i| i == worker::IMPL_RAW) && !raw_available() {
+        println!("  (no /dev/hisi_zip-* device; raw combinations skipped)");
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut sample_idx = 0usize;
@@ -765,7 +779,12 @@ fn scan(exe: &Path, cfg: &Config, data_files: &[(String, PathBuf)], tmp: &Path) 
                         sample_out: sample_out.as_deref(),
                     };
                     let mut row = run_row(exe, cfg, &cell);
-                    if row.status == "OK" && cell.op == "compress" {
+                    // raw output is lz77 triples, not a decodable LZ4
+                    // stream: there is no cross-validation sample for it
+                    if row.status == "OK"
+                        && cell.op == "compress"
+                        && cell.impl_name != worker::IMPL_RAW
+                    {
                         let sample_path = cell
                             .sample_out
                             .expect("compress cells always get a sample path");
