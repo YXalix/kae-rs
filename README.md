@@ -18,6 +18,9 @@ well so the drop-in stays complete.
   AgentENV integration shape
 - [docs/benchmark.md](docs/benchmark.md) — kae-bench options, methodology,
   metrics, verdict criteria, output formats
+- [docs/kae-limitations.md](docs/kae-limitations.md) — measured weaknesses
+  of the hardware path, the spin-wait root cause behind the CPU numbers,
+  and what would have to change
 - [docs/operations.md](docs/operations.md) — KAE 2.x stack installation,
   deployment layout, hard rules, health checks, troubleshooting, upstream
   references

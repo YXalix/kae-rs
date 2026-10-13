@@ -3,7 +3,9 @@
 `kae-bench` measures the KAE-patched liblz4 against the system liblz4 at
 zfile granularity (LZ4 block format, per-block `LZ4_compress_default`), plus
 the segment-level async batch. The same binary is the `cargo bench` entry
-point — `cargo bench -- <args>` behaves identically.
+point — `cargo bench -- <args>` behaves identically. For what the results
+mean about the hardware path — weaknesses and their root causes — see
+[kae-limitations.md](kae-limitations.md).
 
 ## Running
 
