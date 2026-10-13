@@ -3,3 +3,6 @@
 
 # Local ZCode session data
 /.zcode
+
+# default bench TSV output
+/kae_bench_results.tsv
