@@ -73,6 +73,9 @@ exact configuration (`alg,queues,depth,db_batch,wait,req_size,nvcsw,nivcsw`).
 
 ## Suggested sweep
 
+The concrete on-target runbook — per-experiment commands, one TSV per
+run, and the send-back checklist — is [raw-sweep.md](raw-sweep.md).
+
 ```bash
 # plumbing check first: deflate dialect, shallow, short
 KAE_RAW_ALG=deflate KAE_RAW_DEPTH=8 ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2
