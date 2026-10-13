@@ -885,11 +885,12 @@ mod hw_tests {
         v
     }
 
-    /// A random 4K page tiled to size. Pure noise cannot be compressed: the
-    /// engine then completes the request as negacompress (status 0xd), which
-    /// the pump counts as a hardware error, so the hw workload must compress.
+    /// A random 256-byte page tiled to size. Each stateless request only
+    /// matches against its own bytes, so the page must stay far below the
+    /// request size — a request of pure noise completes as negacompress
+    /// (status 0xd), which the pump counts as a hardware error.
     fn compressible(n: usize, seed: u64) -> Vec<u8> {
-        let page = seeded(4096, seed);
+        let page = seeded(256, seed);
         let mut v = vec![0u8; n];
         for (i, b) in v.iter_mut().enumerate() {
             *b = page[i % page.len()];
