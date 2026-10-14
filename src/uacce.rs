@@ -1040,11 +1040,55 @@ mod hw_tests {
         }
     }
 
+    /// Walk a standard LZ4 block and print its sequences — the answer key
+    /// when compared against the raw hardware triples.
+    fn dump_block_sequences(b: &[u8]) {
+        let mut s = 0usize;
+        let mut seq = 0;
+        while s < b.len() {
+            let token = b[s];
+            s += 1;
+            let mut lit = (token >> 4) as usize;
+            if lit == 15 {
+                loop {
+                    let x = b[s];
+                    s += 1;
+                    lit += x as usize;
+                    if x != 255 {
+                        break;
+                    }
+                }
+            }
+            s += lit;
+            if s >= b.len() {
+                println!("  seq {seq}: tail literals {lit}B");
+                break;
+            }
+            let off = u16::from_le_bytes(b[s..s + 2].try_into().unwrap()) as usize;
+            s += 2;
+            let mut ml = (token & 15) as usize + 4;
+            if token & 15 == 15 {
+                loop {
+                    let x = b[s];
+                    s += 1;
+                    ml += x as usize;
+                    if x != 255 {
+                        break;
+                    }
+                }
+            }
+            println!("  seq {seq}: lit={lit} off={off} ml={ml}");
+            seq += 1;
+        }
+    }
+
     /// The end-to-end output check: compress one request on hardware,
     /// rebuild the triples into a standard LZ4 block, decode it, and
     /// require the original bytes back. The output slot is cleared first
     /// and the triples are dumped (run with --nocapture) so a failing
-    /// rebuild can be compared against the input's parse structure.
+    /// rebuild can be compared against the input's parse structure. The
+    /// installed KAE liblz4 compresses the same input through the vendor's
+    /// own rebuild — its block is the answer key for the triple encoding.
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_sample_rebuilds_to_decodable_lz4() {
@@ -1077,7 +1121,17 @@ mod hw_tests {
             req,
             lz77_lit_area(req),
         );
+        println!("seqs hex: {}", hex(&sample.seqs));
         println!("after_seqs: {}", hex(&sample.after_seqs));
+        // what the engine copied into the literals area vs the input
+        let (optr, _) = pump.queues[0].out[slot];
+        let lit_bytes = unsafe { std::slice::from_raw_parts(optr, sample.lit.min(ocap)) }.to_vec();
+        println!(
+            "lit area == input[..lit]? {} first_mismatch={:?} tail={}",
+            lit_bytes == data[..lit_bytes.len()],
+            lit_bytes.iter().zip(data.iter()).position(|(a, b)| a != b),
+            hex(&lit_bytes[lit_bytes.len().saturating_sub(8)..]),
+        );
         let mut ip = 0usize;
         let mut pending = 0usize;
         for (i, t) in sample.seqs.chunks_exact(8).enumerate() {
@@ -1095,6 +1149,38 @@ mod hw_tests {
             ip += lit + ml;
         }
         println!("triples end: ip={ip} pending={pending} input={}B", data.len());
+
+        // control: pure noise through the same path
+        let rnd = seeded(req, 0x1234_5678);
+        match pump.sample_triples(&rnd) {
+            Ok(rs) => {
+                println!("random sample: lit={} seqs={}", rs.lit, rs.seqs.len() / 8);
+                println!("random seqs hex: {}", hex(&rs.seqs));
+            }
+            Err(e) => println!("random sample failed: {e}"),
+        }
+
+        // the vendor's own answer: same input through the installed KAE
+        // liblz4 (its rebuilt LZ4 block encodes the same firmware parse)
+        match crate::open_lib("liblz4.so.1", &[]) {
+            Ok((lib, note)) => {
+                println!("oracle lib: {note}");
+                if let Ok(fns) = crate::lz4::Lz4Fns::load(&lib) {
+                    let bound = unsafe { (fns.bound)(req as i32) } as usize;
+                    let mut dst = vec![0u8; bound];
+                    let n = unsafe {
+                        (fns.compress)(data.as_ptr(), dst.as_mut_ptr(), req as i32, bound as i32)
+                    };
+                    println!("oracle block: {n}B");
+                    if n > 0 {
+                        println!("oracle hex: {}", hex(&dst[..n as usize]));
+                        dump_block_sequences(&dst[..n as usize]);
+                    }
+                }
+            }
+            Err(e) => println!("oracle unavailable: {e}"),
+        }
+
         let (optr, _) = pump.queues[0].out[slot];
         dump_spans(optr, ocap);
 
