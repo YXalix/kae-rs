@@ -166,7 +166,7 @@ const WS_16K: u32 = 2;
 const WS_32K: u32 = 4;
 const WINDOWS_SIZE_SHIFT: u32 = 12;
 const HZ_STATUS_MASK: u32 = 0xff;
-/// lz77 flat geometry: literals capacity = input + 16 (uadk v1)
+/// lz77 flat geometry: literals area slack (uadk v1 ZSTD_LIT_RSV_SIZE)
 const ZSTD_LIT_RSV: u32 = 16;
 /// LZ4 block parsing restriction: a match may not start within the last
 /// 12 bytes of the block. The engine does not enforce this itself, so the
@@ -198,13 +198,22 @@ fn doorbell_value(sqn: u16, cmd: u8, idx: u16, pri: u8) -> u64 {
         | (((idx as u64) | ((pri as u64) << QM_DB_PRI_SHIFT)) << QM_DB_IDX_SHIFT)
 }
 
+/// The literals-area size and the sequence-triples offset within one lz77
+/// output buffer: uadk v1 sizes both off the programmed parse length
+/// (`dw13 = in_size + ZSTD_LIT_RSV`, triples at `dst + in_size +
+/// ZSTD_LIT_RSV`, fill_zip_buffer_size_zstd / fill_zip_addr_lz77_zstd),
+/// and kaelz4 hands the chip `src_size - MFLIMIT` as that in_size.
+fn lz77_lit_area(req_size: usize) -> usize {
+    req_size.saturating_sub(MFLIMIT) + ZSTD_LIT_RSV as usize
+}
+
 /// Fill one lz77 flat SQE (pure, unit-tested; the literals land at the
 /// output start, the 8-byte sequence triples after the literal area). The
 /// engine parses `in_len - MFLIMIT` bytes; the last 12 bytes of the input
 /// belong to the rebuild's tail literal run.
 fn fill_lz77_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap: usize) {
     *sqe = unsafe { std::mem::zeroed() };
-    let lit = in_len as u32 + ZSTD_LIT_RSV;
+    let lit = lz77_lit_area(in_len) as u32;
     sqe.dw9 = HW_LZ77_ZSTD | (WS_16K << WINDOWS_SIZE_SHIFT);
     sqe.dw13 = lit;
     sqe.dest_avail_out = ocap as u32 - lit;
@@ -619,8 +628,8 @@ impl Queue {
         }
         let lit = u32::from_le(sqe.comp_data_length) as usize;
         let ntriples = u32::from_le(sqe.produced) as usize;
-        let lit_cap = self.req_size + 16;
-        if lit > lit_cap || ntriples * 8 > self.ocap - lit_cap {
+        let lit_cap = lz77_lit_area(self.req_size);
+        if lit > lit_cap || ntriples * 8 + 32 > self.ocap - lit_cap {
             return Err(format!("lz77_output_insanity_lit={lit}_seqs={ntriples}"));
         }
         let (optr, _) = self.out[slot];
@@ -628,6 +637,10 @@ impl Queue {
         let ck = u32::from_le(sqe.checksum);
         Ok(Lz77Sample {
             seqs: unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) }.to_vec(),
+            // the overflow report and freq-block head right behind the
+            // triples — dump material when the rebuild cross-check fails
+            after_seqs: unsafe { std::slice::from_raw_parts(seq_area.add(ntriples * 8), 32) }
+                .to_vec(),
             lit,
             ll_overflow_cnt: ck >> 24,
             ll_overflow_pos: ck & 0xff_ffff,
@@ -716,8 +729,8 @@ impl Queue {
                 let seqs = u32::from_le(sqe.produced) as u64;
                 match self.alg {
                     RawAlg::Lz77 => {
-                        let lit_cap = (self.req_size + 16) as u64;
-                        let seq_cap = (self.ocap - self.req_size - 16) as u64;
+                        let lit_cap = lz77_lit_area(self.req_size) as u64;
+                        let seq_cap = (self.ocap as u64).saturating_sub(lit_cap);
                         if lit > lit_cap || seqs * 8 > seq_cap {
                             self.stats.hw_errors += 1;
                             if self.stats.hw_errors <= 8 {
@@ -778,6 +791,9 @@ pub(crate) struct RawStats {
 pub struct Lz77Sample {
     /// `triples * 8` bytes from the sequence area
     pub seqs: Vec<u8>,
+    /// 32 bytes right behind the triples (overflow report + freq head)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub after_seqs: Vec<u8>,
     /// literal byte count (comp_data_length)
     pub lit: usize,
     /// literal-length overflow report (dw31): count and position
@@ -1000,9 +1016,35 @@ mod hw_tests {
         assert!(st.bytes_out > 0, "lz77 triples should not be empty");
     }
 
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Print every nonzero span of the request's output buffer so the
+    /// dump shows where the engine actually put literals and triples.
+    fn dump_spans(optr: *mut u8, len: usize) {
+        let buf = unsafe { std::slice::from_raw_parts(optr, len) };
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, b) in buf.iter().enumerate() {
+            match spans.last_mut() {
+                Some(s) if *b != 0 && s.0 + s.1 == i => s.1 += 1,
+                _ if *b != 0 => spans.push((i, 1)),
+                _ => {}
+            }
+        }
+        for (start, l) in spans.iter().take(32) {
+            println!("  out[{start}..{}] nonzero ({l}B)", start + l);
+        }
+        if spans.len() > 32 {
+            println!("  ... {} more spans", spans.len() - 32);
+        }
+    }
+
     /// The end-to-end output check: compress one request on hardware,
     /// rebuild the triples into a standard LZ4 block, decode it, and
-    /// require the original bytes back.
+    /// require the original bytes back. The output slot is cleared first
+    /// and the triples are dumped (run with --nocapture) so a failing
+    /// rebuild can be compared against the input's parse structure.
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_sample_rebuilds_to_decodable_lz4() {
@@ -1013,7 +1055,49 @@ mod hw_tests {
             .expect("open raw queue");
         pump.run(0.2); // settle the queue the same way a bench run does
         let data = compressible(req, 0xDEAD_BEEF);
+        // the sample reuses the next ring slot's output buffer; clear it so
+        // the dump only shows what this request wrote
+        let (slot, ocap) = {
+            let q = &pump.queues[0];
+            let slot = q.sq_tail as usize % q.src.len();
+            let (optr, _) = q.out[slot];
+            unsafe { std::ptr::write_bytes(optr, 0, q.ocap) };
+            (slot, q.ocap)
+        };
         let sample = pump.sample_triples(&data).expect("sample request");
+
+        println!(
+            "lz77 sample: lit={} seqs={} ll_overflow_cnt={} ll_overflow_pos={} \
+             (parse {}/{}B, seq area at out+{})",
+            sample.lit,
+            sample.seqs.len() / 8,
+            sample.ll_overflow_cnt,
+            sample.ll_overflow_pos,
+            req - MFLIMIT,
+            req,
+            lz77_lit_area(req),
+        );
+        println!("after_seqs: {}", hex(&sample.after_seqs));
+        let mut ip = 0usize;
+        let mut pending = 0usize;
+        for (i, t) in sample.seqs.chunks_exact(8).enumerate() {
+            let ll = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+            let off = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize + 1;
+            let mb = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
+            if mb == 0 {
+                pending += ll + 3;
+                println!("[{i:2}] ll={ll:5} off={off:5} mb=    0  ip={ip} pending={pending}");
+                continue;
+            }
+            let lit = ll + pending;
+            let ml = mb - 1 + 4;
+            println!("[{i:2}] ll={ll:5} off={off:5} mb={mb:5}  ip={ip} -> {}", ip + lit + ml);
+            ip += lit + ml;
+        }
+        println!("triples end: ip={ip} pending={pending} input={}B", data.len());
+        let (optr, _) = pump.queues[0].out[slot];
+        dump_spans(optr, ocap);
+
         let mut block = Vec::new();
         let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block)
             .map_err(|e| {
@@ -1060,8 +1144,11 @@ mod tests {
         let dw = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         assert_eq!(dw(9) & 0xff, HW_LZ77_ZSTD); // algorithm
         assert_eq!(dw(9) >> WINDOWS_SIZE_SHIFT & 0xf, WS_16K);
-        assert_eq!(dw(13), 65536 + 16); // literals capacity
-        assert_eq!(dw(14), out_cap(RawAlg::Lz77, 65536) as u32 - 65552); // seq capacity
+        assert_eq!(dw(13), 65536 - MFLIMIT as u32 + 16); // literals capacity
+        assert_eq!(
+            dw(14),
+            out_cap(RawAlg::Lz77, 65536) as u32 - (65536 - MFLIMIT as u32 + 16)
+        ); // seq capacity
         assert_eq!(dw(4), 65536 - MFLIMIT as u32); // parse length: tail reserved
         assert_eq!(dw(7), (0b101 << 25) | (0b11 << 28)); // NEW/stateless/FINISH/BD3
         // source at dwords 18/19
@@ -1069,7 +1156,7 @@ mod tests {
         // literals (cipher_key pair) at the output start: dwords 24/25
         assert_eq!((dw(25), dw(24)), (0xfeed_0000, 0x0000_1000));
         // sequences after the literal area: dest pair at dwords 20/21
-        let seq = 0xfeed_0000_0000_1000u64 + 65552;
+        let seq = 0xfeed_0000_0000_1000u64 + 65536 - MFLIMIT as u64 + 16;
         assert_eq!((dw(21), dw(20)), ((seq >> 32) as u32, seq as u32));
     }
 
