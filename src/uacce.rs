@@ -149,7 +149,8 @@ struct Sqe {
     _ctx_dw1: u32,
     _ctx_dw2: u32,
     _isize: u32,
-    _checksum: u32,
+    /// completion: [31:24] literal-length overflow count, [23:0] position
+    checksum: u32,
 }
 
 /// Algorithm codes in dw9[7:0] (enum hw_comp_alg_type).
@@ -167,6 +168,12 @@ const WINDOWS_SIZE_SHIFT: u32 = 12;
 const HZ_STATUS_MASK: u32 = 0xff;
 /// lz77 flat geometry: literals capacity = input + 16 (uadk v1)
 const ZSTD_LIT_RSV: u32 = 16;
+/// LZ4 block parsing restriction: a match may not start within the last
+/// 12 bytes of the block. The engine does not enforce this itself, so the
+/// request programs `in_len - MFLIMIT` as the parse length and the rebuild
+/// emits the reserved tail as the final literal run — the same contract
+/// kaelz4 sends the chip under.
+const MFLIMIT: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RawAlg {
@@ -192,14 +199,16 @@ fn doorbell_value(sqn: u16, cmd: u8, idx: u16, pri: u8) -> u64 {
 }
 
 /// Fill one lz77 flat SQE (pure, unit-tested; the literals land at the
-/// output start, the 8-byte sequence triples after the literal area).
+/// output start, the 8-byte sequence triples after the literal area). The
+/// engine parses `in_len - MFLIMIT` bytes; the last 12 bytes of the input
+/// belong to the rebuild's tail literal run.
 fn fill_lz77_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap: usize) {
     *sqe = unsafe { std::mem::zeroed() };
     let lit = in_len as u32 + ZSTD_LIT_RSV;
     sqe.dw9 = HW_LZ77_ZSTD | (WS_16K << WINDOWS_SIZE_SHIFT);
     sqe.dw13 = lit;
     sqe.dest_avail_out = ocap as u32 - lit;
-    sqe.input_data_length = in_len as u32;
+    sqe.input_data_length = in_len.saturating_sub(MFLIMIT) as u32;
     sqe.source_addr_l = src_dma as u32;
     sqe.source_addr_h = (src_dma >> 32) as u32;
     sqe.cipher_key_addr_l = out_dma as u32;
@@ -581,7 +590,7 @@ impl Queue {
     /// (req_size bytes) and return its sequence triples — the rebuild input
     /// for the cross-validation sample. Idle queue only, outside the timed
     /// loop.
-    fn sample_triples(&mut self, input: &[u8], batch: usize) -> Result<Vec<u8>, String> {
+    fn sample_triples(&mut self, input: &[u8], batch: usize) -> Result<Lz77Sample, String> {
         if self.outstanding != 0 {
             return Err("queue_busy".into());
         }
@@ -609,14 +618,20 @@ impl Queue {
             return Err(format!("hw_status_0x{status:x}"));
         }
         let lit = u32::from_le(sqe.comp_data_length) as usize;
-        let seqs = u32::from_le(sqe.produced) as usize;
+        let ntriples = u32::from_le(sqe.produced) as usize;
         let lit_cap = self.req_size + 16;
-        if lit > lit_cap || seqs * 8 > self.ocap - lit_cap {
-            return Err(format!("lz77_output_insanity_lit={lit}_seqs={seqs}"));
+        if lit > lit_cap || ntriples * 8 > self.ocap - lit_cap {
+            return Err(format!("lz77_output_insanity_lit={lit}_seqs={ntriples}"));
         }
         let (optr, _) = self.out[slot];
         let seq_area = unsafe { optr.add(lit_cap) };
-        Ok(unsafe { std::slice::from_raw_parts(seq_area, seqs * 8) }.to_vec())
+        let ck = u32::from_le(sqe.checksum);
+        Ok(Lz77Sample {
+            seqs: unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) }.to_vec(),
+            lit,
+            ll_overflow_cnt: ck >> 24,
+            ll_overflow_pos: ck & 0xff_ffff,
+        })
     }
 
     fn doorbell(&mut self, cmd: u8, idx: u16, pri: u8) {
@@ -758,6 +773,18 @@ pub(crate) struct RawStats {
     pub nivcsw: u64,
 }
 
+/// One completed lz77 sample request: the sequence triples plus the
+/// completion fields the rebuild cross-check reports on failure.
+pub struct Lz77Sample {
+    /// `triples * 8` bytes from the sequence area
+    pub seqs: Vec<u8>,
+    /// literal byte count (comp_data_length)
+    pub lit: usize,
+    /// literal-length overflow report (dw31): count and position
+    pub ll_overflow_cnt: u32,
+    pub ll_overflow_pos: u32,
+}
+
 /// A pool of raw hardware queues driven from one thread: submit everything,
 /// harvest everything, repeat. `run` reports engine-side throughput with
 /// zero payload copies in the loop (the workload sits in DMA-visible SS
@@ -822,7 +849,7 @@ impl RawPump {
     /// Compress one lz77 request on queue 0 and return its sequence
     /// triples; `input` must be exactly the request size. For the
     /// cross-validation sample, after a run has drained.
-    pub fn sample_triples(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn sample_triples(&mut self, input: &[u8]) -> Result<Lz77Sample, String> {
         self.queues[0].sample_triples(input, self.batch)
     }
 
@@ -986,9 +1013,19 @@ mod hw_tests {
             .expect("open raw queue");
         pump.run(0.2); // settle the queue the same way a bench run does
         let data = compressible(req, 0xDEAD_BEEF);
-        let seqs = pump.sample_triples(&data).expect("sample request");
+        let sample = pump.sample_triples(&data).expect("sample request");
         let mut block = Vec::new();
-        let n = crate::rebuild::lz77_block(&data, &seqs, &mut block).expect("rebuild");
+        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block)
+            .map_err(|e| {
+                format!(
+                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={})",
+                    sample.lit,
+                    sample.seqs.len() / 8,
+                    sample.ll_overflow_cnt,
+                    sample.ll_overflow_pos
+                )
+            })
+            .expect("rebuild");
         let mut dst = Vec::new();
         crate::rebuild::test_support::decode(&block[..n], &mut dst).expect("decode");
         assert_eq!(dst, data, "rebuild output must decode to the input");
@@ -1025,7 +1062,7 @@ mod tests {
         assert_eq!(dw(9) >> WINDOWS_SIZE_SHIFT & 0xf, WS_16K);
         assert_eq!(dw(13), 65536 + 16); // literals capacity
         assert_eq!(dw(14), out_cap(RawAlg::Lz77, 65536) as u32 - 65552); // seq capacity
-        assert_eq!(dw(4), 65536); // input_data_length
+        assert_eq!(dw(4), 65536 - MFLIMIT as u32); // parse length: tail reserved
         assert_eq!(dw(7), (0b101 << 25) | (0b11 << 28)); // NEW/stateless/FINISH/BD3
         // source at dwords 18/19
         assert_eq!((dw(19), dw(18)), (0x1234_5678, 0x9abc_def0));

@@ -595,8 +595,16 @@ fn build_raw_sample(
         for r in 0..per_block {
             let off = b * block + r * req_size;
             let chunk = &data[off..off + req_size];
-            let seqs = pump.sample_triples(chunk)?;
-            let n = rebuild::lz77_block(chunk, &seqs, &mut stream)?;
+            let sample = pump.sample_triples(chunk)?;
+            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream).map_err(|e| {
+                format!(
+                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={})",
+                    sample.lit,
+                    sample.seqs.len() / 8,
+                    sample.ll_overflow_cnt,
+                    sample.ll_overflow_pos
+                )
+            })?;
             packed.extend_from_slice(&stream[..n]);
         }
         lens.push(packed.len() - base);

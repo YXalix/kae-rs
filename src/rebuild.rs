@@ -14,7 +14,9 @@
 //! literals, 2-byte offset, match-length extension) and ends the block
 //! with the unmatched input tail as the final literal run — the same
 //! arithmetic as the kaelz4 rebuild, so the output decodes with the
-//! stock liblz4.
+//! stock liblz4. The engine never parses the last 12 bytes of the input
+//! (the request programs `in_len - 12`; see uacce::MFLIMIT), so the tail
+//! run is always at least 12 bytes and the last-match restriction holds.
 
 /// LZ4 block-format constants.
 const RUN_MASK: usize = 15;
