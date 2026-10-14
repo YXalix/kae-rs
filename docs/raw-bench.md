@@ -32,7 +32,9 @@ the engine itself is the limit and the placement verdict is final.
   (user+sys, plus `nvcsw`/`nivcsw` in the `note`) is the honest cost of a
   well-formed submit/harvest loop.
 - **Standard LZ4 output via the triple rebuild.** The engine's lz77
-  output is literals + 8-byte sequence triples; after the timed run the
+  output is literals + 8-byte sequence triples in the HW_LZ77_ZSTD layout
+  (`[u32 offBase][u16 litLength][u16 mlBase]`, zstd offset/repeat-code
+  semantics, decoded in `src/rebuild.rs`); after the timed run the
   worker rebuilds the first sample blocks' triples into standard LZ4 block
   format (`src/rebuild.rs`, same arithmetic as the kaelz4 rebuild) and
   writes the packed sample file. The orchestrator's verify op decodes it

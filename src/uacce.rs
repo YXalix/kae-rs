@@ -1134,19 +1134,24 @@ mod hw_tests {
         );
         let mut ip = 0usize;
         let mut pending = 0usize;
+        let mut rep = [1usize, 4, 8];
         for (i, t) in sample.seqs.chunks_exact(8).enumerate() {
-            let ll = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
-            let off = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize + 1;
+            let ob = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+            let lit_len = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
             let mb = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
             if mb == 0 {
-                pending += ll + 3;
-                println!("[{i:2}] ll={ll:5} off={off:5} mb=    0  ip={ip} pending={pending}");
+                pending += lit_len + 3;
+                println!("[{i:2}] ob={ob:5} lit={lit_len:5} mb=    0  ip={ip} pending={pending}");
                 continue;
             }
-            let lit = ll + pending;
-            let ml = mb - 1 + 4;
-            println!("[{i:2}] ll={ll:5} off={off:5} mb={mb:5}  ip={ip} -> {}", ip + lit + ml);
-            ip += lit + ml;
+            let off = crate::rebuild::resolve_offset(ob, lit_len, &mut rep).expect("offset");
+            let ml = mb + 3;
+            println!(
+                "[{i:2}] ob={ob:5} lit={lit_len:5} mb={mb:5} off={off:5}  ip={ip} -> {}",
+                ip + lit_len + pending + ml
+            );
+            ip += lit_len + pending + ml;
+            pending = 0;
         }
         println!("triples end: ip={ip} pending={pending} input={}B", data.len());
 
