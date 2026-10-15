@@ -1,5 +1,5 @@
-//! Raw uacce driver for the KAE2 ZIP engine: the seed of the native
-//! (C-stack-free) hardware backend. It speaks the queue ABI directly —
+//! The native backend's uacce driver for the KAE2 ZIP engine: the
+//! C-stack-free hardware path. It speaks the queue ABI directly —
 //! open, ioctl, mmap, SQE fill, doorbell store, CQE harvest — with no
 //! libwd, no libkaelz4 and no patched liblz4 in the process.
 //!
@@ -8,6 +8,11 @@
 //! question the libkaelz4-backed cells cannot answer: their sync path is
 //! one request in flight plus a 100%-core spin, and their async pool adds
 //! twelve spinning harvesters on top (see docs/kae-limitations.md).
+//!
+//! Views (docs/native-bench.md): the pump's GB/s is the lz77 ceiling view
+//! — a format no software implementation produces — while the triples
+//! rebuild into standard LZ4 blocks (src/rebuild.rs), the LZ4 view that
+//! kae-vs-sw comparisons (throughput, CPU) are read on.
 //!
 //! Provenance of every constant — do not guess, re-verify against:
 //! - UACCE UAPI ioctls and region pgoffs:
@@ -28,8 +33,8 @@
 //! Only QM v3 devices are supported (api `hisi_qm_v3`, the KAE2/SEC2
 //! generation) with the v3 SQE layout, in two stateless flat dialects:
 //! lz77 (the kaelz4 production mode: literals + 8-byte sequence triples +
-//! freq block) and raw_deflate (validated end to end by inflating one
-//! output in the unit tests on hardware).
+//! freq block) and deflate (algorithm code HW_RAW_DEFLATE, validated end
+//! to end by inflating one output in the unit tests on hardware).
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -176,18 +181,18 @@ const ZSTD_LIT_RSV: u32 = 16;
 const MFLIMIT: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RawAlg {
+pub(crate) enum NativeAlg {
     Lz77,
     Deflate,
 }
 
 /// Worst-case output capacity per algorithm (input-size dependent only).
-pub(crate) fn out_cap(alg: RawAlg, req_size: usize) -> usize {
+pub(crate) fn out_cap(alg: NativeAlg, req_size: usize) -> usize {
     match alg {
         // literals (block+16) + 8B triples (~2.7x block for 3-byte-period
         // worst case) + freq block + slack
-        RawAlg::Lz77 => req_size + 16 + 2 * req_size + 8192,
-        RawAlg::Deflate => req_size + req_size / 8 + 8192,
+        NativeAlg::Lz77 => req_size + 16 + 2 * req_size + 8192,
+        NativeAlg::Deflate => req_size + req_size / 8 + 8192,
     }
 }
 
@@ -229,7 +234,8 @@ fn fill_lz77_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap:
     sqe.tag_l = 0; // ring index, set by the submit path
 }
 
-/// Fill one raw-deflate flat SQE (32K window, the deflate standard).
+/// Fill one deflate flat SQE (32K window; headerless deflate, the
+/// HW_RAW_DEFLATE code — no zlib wrapper).
 fn fill_deflate_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap: usize) {
     *sqe = unsafe { std::mem::zeroed() };
     sqe.dw9 = HW_RAW_DEFLATE | (WS_32K << WINDOWS_SIZE_SHIFT);
@@ -403,7 +409,7 @@ impl Drop for SsRegion {
 
 // ---------- one hardware queue ----------
 
-/// Per-queue accounting, aggregated into [`RawStats`].
+/// Per-queue accounting, aggregated into [`NativeStats`].
 #[derive(Default)]
 struct QueueStats {
     doorbells: u64,
@@ -434,19 +440,19 @@ struct Queue {
     outstanding: usize,
     unbelled: usize,
     c_flag: u8,
-    alg: RawAlg,
+    alg: NativeAlg,
     req_size: usize,
     ocap: usize,
     stats: QueueStats,
 }
 
-// The queue owns raw mappings and is used from a single thread (the bench
+// The queue owns its mappings and is used from a single thread (the bench
 // worker that opened it); moving it between threads is fine because every
 // access goes through &mut self.
 unsafe impl Send for Queue {}
 
 impl Queue {
-    fn open(dev: &str, req_size: usize, depth: usize, wait_poll: bool, alg: RawAlg) -> Result<Queue, String> {
+    fn open(dev: &str, req_size: usize, depth: usize, wait_poll: bool, alg: NativeAlg) -> Result<Queue, String> {
         let name = dev.rsplit('/').next().unwrap_or(dev);
         if let Some(api) = sysfs_str(name, "api") {
             if !api.contains("hisi_qm_v3") {
@@ -603,7 +609,7 @@ impl Queue {
         if self.outstanding != 0 {
             return Err("queue_busy".into());
         }
-        if self.alg != RawAlg::Lz77 {
+        if self.alg != NativeAlg::Lz77 {
             return Err("sample_is_lz77_only".into());
         }
         if input.len() != self.req_size {
@@ -637,10 +643,6 @@ impl Queue {
         let ck = u32::from_le(sqe.checksum);
         Ok(Lz77Sample {
             seqs: unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) }.to_vec(),
-            // the overflow report and freq-block head right behind the
-            // triples — dump material when the rebuild cross-check fails
-            after_seqs: unsafe { std::slice::from_raw_parts(seq_area.add(ntriples * 8), 32) }
-                .to_vec(),
             lit,
             ll_overflow_cnt: ck >> 24,
             ll_overflow_pos: ck & 0xff_ffff,
@@ -670,7 +672,7 @@ impl Queue {
             if ds == 1 {
                 self.stats.hw_errors += 1;
                 if self.stats.hw_errors <= 8 {
-                    eprintln!("rawzip: device status register reports a hardware error");
+                    eprintln!("native: device status register reports a hardware error");
                 }
             }
         }
@@ -682,8 +684,8 @@ impl Queue {
             let (_optr, odma) = self.out[slot];
             let sqe = unsafe { &mut *(self.sq.add(i as usize * QM_ZIP_SQE_SIZE) as *mut Sqe) };
             match self.alg {
-                RawAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, self.req_size, self.ocap),
-                RawAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, self.req_size, self.ocap),
+                NativeAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, self.req_size, self.ocap),
+                NativeAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, self.req_size, self.ocap),
             }
             sqe.tag_l = i as u32;
             self.sq_tail = (i + 1) % QM_Q_DEPTH as u16;
@@ -722,24 +724,24 @@ impl Queue {
             if status != 0 {
                 self.stats.hw_errors += 1;
                 if self.stats.hw_errors <= 8 {
-                    eprintln!("rawzip: hw status 0x{status:x} (ring idx {sq_head})");
+                    eprintln!("native: hw status 0x{status:x} (ring idx {sq_head})");
                 }
             } else {
                 let lit = u32::from_le(sqe.comp_data_length) as u64;
                 let seqs = u32::from_le(sqe.produced) as u64;
                 match self.alg {
-                    RawAlg::Lz77 => {
+                    NativeAlg::Lz77 => {
                         let lit_cap = lz77_lit_area(self.req_size) as u64;
                         let seq_cap = (self.ocap as u64).saturating_sub(lit_cap);
                         if lit > lit_cap || seqs * 8 > seq_cap {
                             self.stats.hw_errors += 1;
                             if self.stats.hw_errors <= 8 {
-                                eprintln!("rawzip: lz77 output insanity lit={lit} seqs={seqs}");
+                                eprintln!("native: lz77 output insanity lit={lit} seqs={seqs}");
                             }
                         }
                         self.stats.bytes_out += lit + seqs * 8;
                     }
-                    RawAlg::Deflate => self.stats.bytes_out += seqs,
+                    NativeAlg::Deflate => self.stats.bytes_out += seqs,
                 }
             }
             if self.cq_head as usize == QM_Q_DEPTH - 1 {
@@ -772,8 +774,8 @@ impl Drop for Queue {
 
 // ---------- the pump ----------
 
-/// Aggregated pump result of one [`RawPump::run`].
-pub(crate) struct RawStats {
+/// Aggregated pump result of one [`NativePump::run`].
+pub(crate) struct NativeStats {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub reqs_done: u64,
@@ -787,31 +789,28 @@ pub(crate) struct RawStats {
 }
 
 /// One completed lz77 sample request: the sequence triples plus the
-/// completion fields the rebuild cross-check reports on failure.
+/// completion fields the rebuild reports on failure.
 pub struct Lz77Sample {
     /// `triples * 8` bytes from the sequence area
     pub seqs: Vec<u8>,
-    /// 32 bytes right behind the triples (overflow report + freq head)
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub after_seqs: Vec<u8>,
     /// literal byte count (comp_data_length)
     pub lit: usize,
-    /// literal-length overflow report (dw31): count and position
+    /// literal-length overflow report (checksum dw): count and position
     pub ll_overflow_cnt: u32,
     pub ll_overflow_pos: u32,
 }
 
-/// A pool of raw hardware queues driven from one thread: submit everything,
+/// A pool of hardware queues driven from one thread: submit everything,
 /// harvest everything, repeat. `run` reports engine-side throughput with
 /// zero payload copies in the loop (the workload sits in DMA-visible SS
 /// memory once at setup).
-pub(crate) struct RawPump {
+pub(crate) struct NativePump {
     queues: Vec<Queue>,
     batch: usize,
     wait_poll: bool,
 }
 
-impl RawPump {
+impl NativePump {
     /// Open `queues` hardware queues round-robin over `devices`.
     pub fn open(
         devices: &[String],
@@ -820,12 +819,12 @@ impl RawPump {
         depth: usize,
         batch: usize,
         wait_poll: bool,
-        alg: RawAlg,
-    ) -> Result<RawPump, String> {
+        alg: NativeAlg,
+    ) -> Result<NativePump, String> {
         if devices.is_empty() {
             return Err("no /dev/hisi_zip-* devices".into());
         }
-        if alg == RawAlg::Lz77 && req_size > MAX_LZ77_REQ {
+        if alg == NativeAlg::Lz77 && req_size > MAX_LZ77_REQ {
             return Err(format!("lz77 flat input cap is {MAX_LZ77_REQ}B"));
         }
         if queues == 0 || depth == 0 || depth > QM_Q_DEPTH {
@@ -837,13 +836,13 @@ impl RawPump {
                 Ok(queue) => qs.push(queue),
                 Err(e) => {
                     if q > 0 {
-                        eprintln!("rawzip: opened {q} of {queues} queues before: {e}");
+                        eprintln!("native: opened {q} of {queues} queues before: {e}");
                     }
                     return Err(e);
                 }
             }
         }
-        Ok(RawPump {
+        Ok(NativePump {
             queues: qs,
             batch: batch.max(1),
             wait_poll,
@@ -885,7 +884,7 @@ impl RawPump {
     /// Prime the queues, run the submit/harvest loop for `seconds`, drain,
     /// and return the aggregated stats (wall/CPU deltas cover the whole
     /// call; the process is single-threaded).
-    pub fn run(&mut self, seconds: f64) -> RawStats {
+    pub fn run(&mut self, seconds: f64) -> NativeStats {
         let cpu0: CpuTime = cpu_time();
         let (nvcsw0, nivcsw0) = switch_counts();
         let t0 = now_s();
@@ -933,7 +932,7 @@ impl RawPump {
         let wall_s = now_s() - t0;
         let cpu1 = cpu_time();
         let (nvcsw1, nivcsw1) = switch_counts();
-        let mut st = RawStats {
+        let mut st = NativeStats {
             bytes_in: 0,
             bytes_out: 0,
             reqs_done: 0,
@@ -958,7 +957,7 @@ impl RawPump {
 
 /// Hardware smoke tests: real /dev/hisi_zip-* nodes required, so they are
 /// `#[ignore]`d like tests/hw_required.rs; on the target machine run
-/// `cargo test -- --ignored`. These validate the raw pump's engine dialog
+/// `cargo test -- --ignored`. These validate the native pump's engine dialog
 /// (open, SQE, doorbell, completions with status 0) in both dialects —
 /// the counterpart of the C tool's zlib round-trip check.
 #[cfg(test)]
@@ -990,11 +989,11 @@ mod hw_tests {
         v
     }
 
-    fn one_engine_run(alg: RawAlg) -> RawStats {
+    fn one_engine_run(alg: NativeAlg) -> NativeStats {
         let devices = zip_devices();
         assert!(!devices.is_empty(), "needs /dev/hisi_zip-* uacce nodes");
         let mut pump =
-            RawPump::open(&devices, 1, 4096, 8, 8, false, alg).expect("open raw queue");
+            NativePump::open(&devices, 1, 4096, 8, 8, false, alg).expect("open native queue");
         pump.load_data(&compressible(4096 * 16, 0xDEAD_BEEF));
         let st = pump.run(0.5);
         assert!(st.reqs_done > 0, "engine completed no requests");
@@ -1005,202 +1004,35 @@ mod hw_tests {
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_deflate_requests_complete() {
-        let st = one_engine_run(RawAlg::Deflate);
+        let st = one_engine_run(NativeAlg::Deflate);
         assert!(st.bytes_out > 0, "deflate should produce a stream per request");
     }
 
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_requests_complete() {
-        let st = one_engine_run(RawAlg::Lz77);
+        let st = one_engine_run(NativeAlg::Lz77);
         assert!(st.bytes_out > 0, "lz77 triples should not be empty");
-    }
-
-    fn hex(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
-    }
-
-    /// Print every nonzero span of the request's output buffer so the
-    /// dump shows where the engine actually put literals and triples.
-    fn dump_spans(optr: *mut u8, len: usize) {
-        let buf = unsafe { std::slice::from_raw_parts(optr, len) };
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (i, b) in buf.iter().enumerate() {
-            match spans.last_mut() {
-                Some(s) if *b != 0 && s.0 + s.1 == i => s.1 += 1,
-                _ if *b != 0 => spans.push((i, 1)),
-                _ => {}
-            }
-        }
-        for (start, l) in spans.iter().take(32) {
-            println!("  out[{start}..{}] nonzero ({l}B)", start + l);
-        }
-        if spans.len() > 32 {
-            println!("  ... {} more spans", spans.len() - 32);
-        }
-    }
-
-    /// Walk a standard LZ4 block and print its sequences — the answer key
-    /// when compared against the raw hardware triples.
-    fn dump_block_sequences(b: &[u8]) {
-        let mut s = 0usize;
-        let mut seq = 0;
-        while s < b.len() {
-            let token = b[s];
-            s += 1;
-            let mut lit = (token >> 4) as usize;
-            if lit == 15 {
-                loop {
-                    let x = b[s];
-                    s += 1;
-                    lit += x as usize;
-                    if x != 255 {
-                        break;
-                    }
-                }
-            }
-            s += lit;
-            if s >= b.len() {
-                println!("  seq {seq}: tail literals {lit}B");
-                break;
-            }
-            let off = u16::from_le_bytes(b[s..s + 2].try_into().unwrap()) as usize;
-            s += 2;
-            let mut ml = (token & 15) as usize + 4;
-            if token & 15 == 15 {
-                loop {
-                    let x = b[s];
-                    s += 1;
-                    ml += x as usize;
-                    if x != 255 {
-                        break;
-                    }
-                }
-            }
-            println!("  seq {seq}: lit={lit} off={off} ml={ml}");
-            seq += 1;
-        }
     }
 
     /// The end-to-end output check: compress one request on hardware,
     /// rebuild the triples into a standard LZ4 block, decode it, and
-    /// require the original bytes back. The output slot is cleared first
-    /// and the triples are dumped (run with --nocapture) so a failing
-    /// rebuild can be compared against the input's parse structure. The
-    /// installed KAE liblz4 compresses the same input through the vendor's
-    /// own rebuild — its block is the answer key for the triple encoding.
+    /// require the original bytes back. The triple layout this exercises
+    /// is pinned offline by the rebuild module's known-answer tests.
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_sample_rebuilds_to_decodable_lz4() {
         let devices = zip_devices();
         assert!(!devices.is_empty(), "needs /dev/hisi_zip-* uacce nodes");
         let req = 4096;
-        let mut pump = RawPump::open(&devices, 1, req, 8, 8, false, RawAlg::Lz77)
-            .expect("open raw queue");
+        let mut pump = NativePump::open(&devices, 1, req, 8, 8, false, NativeAlg::Lz77)
+            .expect("open native queue");
         pump.run(0.2); // settle the queue the same way a bench run does
         let data = compressible(req, 0xDEAD_BEEF);
-        // the sample reuses the next ring slot's output buffer; clear it so
-        // the dump only shows what this request wrote
-        let (slot, ocap) = {
-            let q = &pump.queues[0];
-            let slot = q.sq_tail as usize % q.src.len();
-            let (optr, _) = q.out[slot];
-            unsafe { std::ptr::write_bytes(optr, 0, q.ocap) };
-            (slot, q.ocap)
-        };
         let sample = pump.sample_triples(&data).expect("sample request");
 
-        println!(
-            "lz77 sample: lit={} seqs={} ll_overflow_cnt={} ll_overflow_pos={} \
-             (parse {}/{}B, seq area at out+{})",
-            sample.lit,
-            sample.seqs.len() / 8,
-            sample.ll_overflow_cnt,
-            sample.ll_overflow_pos,
-            req - MFLIMIT,
-            req,
-            lz77_lit_area(req),
-        );
-        println!("seqs hex: {}", hex(&sample.seqs));
-        println!("after_seqs: {}", hex(&sample.after_seqs));
-        // what the engine copied into the literals area vs the input
-        let (optr, _) = pump.queues[0].out[slot];
-        let lit_bytes = unsafe { std::slice::from_raw_parts(optr, sample.lit.min(ocap)) }.to_vec();
-        println!(
-            "lit area == input[..lit]? {} first_mismatch={:?} tail={}",
-            lit_bytes == data[..lit_bytes.len()],
-            lit_bytes.iter().zip(data.iter()).position(|(a, b)| a != b),
-            hex(&lit_bytes[lit_bytes.len().saturating_sub(8)..]),
-        );
-        let mut ip = 0usize;
-        let mut pending = 0usize;
-        let mut rep = [1usize, 4, 8];
-        for (i, t) in sample.seqs.chunks_exact(8).enumerate() {
-            let ob = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
-            let lit_len = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
-            let mb = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
-            if mb == 0 {
-                pending += lit_len + 3;
-                println!("[{i:2}] ob={ob:5} lit={lit_len:5} mb=    0  ip={ip} pending={pending}");
-                continue;
-            }
-            let off = crate::rebuild::resolve_offset(ob, lit_len, &mut rep).expect("offset");
-            let ml = mb + 3;
-            println!(
-                "[{i:2}] ob={ob:5} lit={lit_len:5} mb={mb:5} off={off:5}  ip={ip} -> {}",
-                ip + lit_len + pending + ml
-            );
-            ip += lit_len + pending + ml;
-            pending = 0;
-        }
-        println!("triples end: ip={ip} pending={pending} input={}B", data.len());
-
-        // control: pure noise through the same path
-        let rnd = seeded(req, 0x1234_5678);
-        match pump.sample_triples(&rnd) {
-            Ok(rs) => {
-                println!("random sample: lit={} seqs={}", rs.lit, rs.seqs.len() / 8);
-                println!("random seqs hex: {}", hex(&rs.seqs));
-            }
-            Err(e) => println!("random sample failed: {e}"),
-        }
-
-        // the vendor's own answer: same input through the installed KAE
-        // liblz4 (its rebuilt LZ4 block encodes the same firmware parse)
-        match crate::open_lib("liblz4.so.1", &[]) {
-            Ok((lib, note)) => {
-                println!("oracle lib: {note}");
-                if let Ok(fns) = crate::lz4::Lz4Fns::load(&lib) {
-                    let bound = unsafe { (fns.bound)(req as i32) } as usize;
-                    let mut dst = vec![0u8; bound];
-                    let n = unsafe {
-                        (fns.compress)(data.as_ptr(), dst.as_mut_ptr(), req as i32, bound as i32)
-                    };
-                    println!("oracle block: {n}B");
-                    if n > 0 {
-                        println!("oracle hex: {}", hex(&dst[..n as usize]));
-                        dump_block_sequences(&dst[..n as usize]);
-                    }
-                }
-            }
-            Err(e) => println!("oracle unavailable: {e}"),
-        }
-
-        let (optr, _) = pump.queues[0].out[slot];
-        dump_spans(optr, ocap);
-
         let mut block = Vec::new();
-        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block)
-            .map_err(|e| {
-                format!(
-                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={})",
-                    sample.lit,
-                    sample.seqs.len() / 8,
-                    sample.ll_overflow_cnt,
-                    sample.ll_overflow_pos
-                )
-            })
-            .expect("rebuild");
+        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block).expect("rebuild");
         let mut dst = Vec::new();
         crate::rebuild::test_support::decode(&block[..n], &mut dst).expect("decode");
         assert_eq!(dst, data, "rebuild output must decode to the input");
@@ -1231,14 +1063,14 @@ mod tests {
 
     #[test]
     fn lz77_sqe_known_answer() {
-        let b = sqe_bytes(|s| fill_lz77_sqe(s, 0x1234_5678_9abc_def0, 0xfeed_0000_0000_1000, 65536, out_cap(RawAlg::Lz77, 65536)));
+        let b = sqe_bytes(|s| fill_lz77_sqe(s, 0x1234_5678_9abc_def0, 0xfeed_0000_0000_1000, 65536, out_cap(NativeAlg::Lz77, 65536)));
         let dw = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         assert_eq!(dw(9) & 0xff, HW_LZ77_ZSTD); // algorithm
         assert_eq!(dw(9) >> WINDOWS_SIZE_SHIFT & 0xf, WS_16K);
         assert_eq!(dw(13), 65536 - MFLIMIT as u32 + 16); // literals capacity
         assert_eq!(
             dw(14),
-            out_cap(RawAlg::Lz77, 65536) as u32 - (65536 - MFLIMIT as u32 + 16)
+            out_cap(NativeAlg::Lz77, 65536) as u32 - (65536 - MFLIMIT as u32 + 16)
         ); // seq capacity
         assert_eq!(dw(4), 65536 - MFLIMIT as u32); // parse length: tail reserved
         assert_eq!(dw(7), (0b101 << 25) | (0b11 << 28)); // NEW/stateless/FINISH/BD3
@@ -1253,7 +1085,7 @@ mod tests {
 
     #[test]
     fn deflate_sqe_known_answer() {
-        let cap = out_cap(RawAlg::Deflate, 65536);
+        let cap = out_cap(NativeAlg::Deflate, 65536);
         let b = sqe_bytes(|s| fill_deflate_sqe(s, 0x1000, 0x2000, 65536, cap));
         let dw = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         assert_eq!(dw(9) & 0xff, HW_RAW_DEFLATE);
@@ -1318,9 +1150,9 @@ mod tests {
             outstanding: 0,
             unbelled: 0,
             c_flag: 0,
-            alg: RawAlg::Lz77,
+            alg: NativeAlg::Lz77,
             req_size: 4096,
-            ocap: out_cap(RawAlg::Lz77, 4096),
+            ocap: out_cap(NativeAlg::Lz77, 4096),
             stats: QueueStats::default(),
         };
 

@@ -77,8 +77,8 @@ usage: kae-bench [options]
   --input FILE      benchmark against a real file (e.g. an exported VM memory image) instead of the synthetic mixed dataset
   --size MIB        synthetic dataset size, MiB (default 64)
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
-  --impl LIST       implementations: sw,hw,hwasync,raw (default: all present;
-                    hwasync = segment-level async batch, compress only; raw =
+  --impl LIST       implementations: sw,hw,hwasync,native (default: all present;
+                    hwasync = segment-level async batch, compress only; native =
                     the crate's own uacce engine path, compress only, no C
                     library in the process)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
@@ -110,10 +110,10 @@ fn parse_impl_list(s: &str) -> Result<Vec<String>, String> {
     let impls = parse_list(s);
     for imp in &impls {
         match imp.as_str() {
-            worker::IMPL_SW | worker::IMPL_HW | worker::IMPL_HWASYNC | worker::IMPL_RAW => {}
+            worker::IMPL_SW | worker::IMPL_HW | worker::IMPL_HWASYNC | worker::IMPL_NATIVE => {}
             other => {
                 return Err(format!(
-                    "unknown --impl {other} (expected sw|hw|hwasync|raw)"
+                    "unknown --impl {other} (expected sw|hw|hwasync|native)"
                 ))
             }
         }
@@ -129,8 +129,8 @@ fn hw_backed(impl_name: &str) -> bool {
     impl_name == worker::IMPL_HW || impl_name == worker::IMPL_HWASYNC
 }
 
-/// The raw cells need only the uacce device nodes (no patched library).
-fn raw_available() -> bool {
+/// The native cells need only the uacce device nodes (no patched library).
+fn native_available() -> bool {
     !crate::uacce::zip_devices().is_empty()
 }
 
@@ -154,7 +154,7 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             worker::IMPL_SW.into(),
             worker::IMPL_HW.into(),
             worker::IMPL_HWASYNC.into(),
-            worker::IMPL_RAW.into(),
+            worker::IMPL_NATIVE.into(),
         ],
         ops: OPS.iter().map(|s| s.to_string()).collect(),
         workers: 1,
@@ -309,8 +309,8 @@ struct Cell<'a> {
 }
 
 fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
-    // the raw cells carry no library (their engine path is in-crate)
-    let (lib, preload) = if cell.impl_name == worker::IMPL_RAW {
+    // the native cells carry no library (their engine path is in-crate)
+    let (lib, preload) = if cell.impl_name == worker::IMPL_NATIVE {
         (String::new(), String::new())
     } else if cell.impl_name == worker::IMPL_SW {
         (cfg.sw_lib.clone(), String::new())
@@ -485,7 +485,7 @@ fn print_table(rows: &[Row]) {
             "-".into()
         };
         // pool rows carry their size in note (workers=N); surface it in the
-        // label so the table is self-describing (TSV/JSON keep the raw name)
+        // label so the table is self-describing (TSV/JSON keep the impl name)
         let impl_disp = match field(&r.note, "workers") {
             Some(w) => format!("{}×{}", r.impl_name, w),
             None => r.impl_name.clone(),
@@ -705,13 +705,13 @@ fn scan(exe: &Path, cfg: &Config, dataset: &str, data_file: &Path, tmp: &Path) -
         .impls
         .iter()
         .filter(|i| !hw_backed(i.as_str()) || !cfg.hw_lib.is_empty())
-        .filter(|i| i.as_str() != worker::IMPL_RAW || raw_available())
+        .filter(|i| i.as_str() != worker::IMPL_NATIVE || native_available())
         .collect();
     if cfg.impls.iter().any(|i| hw_backed(i.as_str())) && cfg.hw_lib.is_empty() {
         println!("  (hw lib not found; hw/hwasync combinations skipped)");
     }
-    if cfg.impls.iter().any(|i| i == worker::IMPL_RAW) && !raw_available() {
-        println!("  (no /dev/hisi_zip-* device; raw combinations skipped)");
+    if cfg.impls.iter().any(|i| i == worker::IMPL_NATIVE) && !native_available() {
+        println!("  (no /dev/hisi_zip-* device; native combinations skipped)");
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut sample_idx = 0usize;
@@ -734,9 +734,9 @@ fn scan(exe: &Path, cfg: &Config, dataset: &str, data_file: &Path, tmp: &Path) -
                 };
                 let mut row = run_row(exe, cfg, &cell);
                 // verify whenever the worker wrote a cross-validation
-                // sample (raw lz77 rebuilds one from its triples; raw
-                // deflate and block shapes that are not request multiples
-                // legitimately skip it)
+                // sample (native lz77 rebuilds one from its triples; the
+                // deflate dialect and block shapes that are not request
+                // multiples legitimately skip it)
                 if row.status == "OK" && cell.op == "compress" {
                     let sample_path = cell
                         .sample_out

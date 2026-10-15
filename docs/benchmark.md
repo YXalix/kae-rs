@@ -41,8 +41,8 @@ Common invocations:
 | `--input FILE` | — | Benchmark a real file instead of synthetic data (dataset label becomes `input`) |
 | `--size MIB` | 64 | Synthetic dataset size |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
-| `--impl LIST` | `sw,hw,hwasync,raw` | `sw`, `hw`, `hwasync` (compress only), `raw` (compress only; the crate's own uacce engine path — see [raw-bench.md](raw-bench.md)) |
-| `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `raw`, N is the number of hardware queues |
+| `--impl LIST` | `sw,hw,hwasync,native` | `sw`, `hw`, `hwasync` (compress only), `native` (compress only; the crate's own uacce engine path — see [native-bench.md](native-bench.md)) |
+| `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `native`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |
 | `--hw-lz4-lib P` | probe | Patched library path |
@@ -56,12 +56,12 @@ Common invocations:
 Flags that libtest appends under `cargo bench` (`--bench`, `--nocapture`,
 …) are accepted and ignored. Invalid list values are rejected up front with
 an error: `--blocks` must parse to block sizes, `--impl` must be
-`sw`/`hw`/`hwasync`/`raw`, `--ops` must be `compress`/`decompress`, and
+`sw`/`hw`/`hwasync`/`native`, `--ops` must be `compress`/`decompress`, and
 `--workers` must be 1–256.
 
 Cells are skipped (with a printed reason) when their backend is absent:
-`hw`/`hwasync` need the patched library, `raw` needs a `/dev/hisi_zip-*`
-uacce device node.
+`hw`/`hwasync` need the patched library, `native` needs a
+`/dev/hisi_zip-*` uacce device node.
 
 ## What it does, in order
 
@@ -81,10 +81,10 @@ uacce device node.
    re-executes itself as a worker subprocess with exactly one library
    open, parses its `RESULT` line, and — for compress cells with `OK`
    status — runs a second subprocess that decodes the captured sample with
-   the **system** liblz4 and compares block-by-block (`VERIFY`). The `raw`
-   cells produce the sample by rebuilding their lz77 triples into standard
-   LZ4 blocks inside the worker, so the same verify op applies (see
-   [raw-bench.md](raw-bench.md)).
+   the **system** liblz4 and compares block-by-block (`VERIFY`). The
+   `native` cells produce the sample by rebuilding their lz77 triples into
+   standard LZ4 blocks inside the worker, so the same verify op applies
+   (see [native-bench.md](native-bench.md)).
 4. **Summary** — a results table, a verdict, and the TSV/JSON files.
 
 ### Why subprocess isolation
@@ -120,8 +120,8 @@ open; 1 leaves the library default or any externally set env var alone).
 
 ## Metrics and how to read them
 
-- **`GB/s`** — wall-clock throughput: raw input bytes for compress,
-  decompressed raw bytes for decompress.
+- **`GB/s`** — wall-clock throughput: uncompressed input bytes for
+  compress, decompressed bytes for decompress.
 - **`ratio%`** — compressed size / input size (compress only).
 - **`cpu s/GB`** — `getrusage` user+sys seconds per GB processed. This is
   the number that usually decides hardware offload adoption: the win is
@@ -129,9 +129,17 @@ open; 1 leaves the library default or any externally set env var alone).
 - **`verify`** — for hw compress rows: the sample decoded cleanly with the
   system liblz4 (`OK`), proving the on-disk format is unchanged and the
   read path can stay in software.
+
+Native rows carry both views at once (see
+[native-bench.md](native-bench.md)): the `GB/s` times the engine's lz77
+parse — the hardware ceiling, a format no software implementation
+produces — while `ratio_pct` and `verify` describe the rebuilt standard
+LZ4 blocks, the view that kae-vs-sw comparisons are read on.
+
 - **`status`** — `OK`, or a failure tag: `OPEN_FAIL` (library could not be
   opened), `COMPRESS_FAIL`, `DECOMPRESS_MISMATCH`, `ASYNC_FAIL`,
-  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync/raw + decompress), `WORKER_ERR`
+  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync/native + decompress),
+  `WORKER_ERR`
   (the subprocess died; stderr tail is in the note). A failure inside the
   timed loop fails the cell with its error tag — no partial numbers are
   reported. When no patched library is found, `hw`/`hwasync` cells are
@@ -160,6 +168,13 @@ granularity:
 
 The printed criteria line repeats the thresholds; `cpu s/GB` is user+sys,
 excluding wait time.
+
+The verdict is read on the **LZ4 view**: `sw` and `hw` produce standard
+LZ4 blocks end to end, so their throughput and CPU are the kae-vs-sw
+comparison. `native` rows are not a verdict input — they are the hardware
+ceiling reference in the lz77 view (see
+[native-bench.md](native-bench.md)); read them against the plateau the
+sw/hw rows show, through their LZ4 ratio and CPU.
 
 ## Output files
 

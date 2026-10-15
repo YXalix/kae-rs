@@ -21,9 +21,10 @@ well so the drop-in stays complete.
 - [docs/kae-limitations.md](docs/kae-limitations.md) — measured weaknesses
   of the hardware path, the spin-wait root cause behind the CPU numbers,
   and what would have to change
-- [docs/raw-bench.md](docs/raw-bench.md) — the raw uacce engine path
-  (`src/uacce.rs`, `--impl raw`): the crate's own ZIP-engine driver, no C
-  library in the process; measures the hardware ceiling behind the C stack
+- [docs/native-bench.md](docs/native-bench.md) — the native uacce engine
+  path (`src/uacce.rs`, `--impl native`): the crate's own ZIP-engine
+  driver, no C library in the process; its LZ4 view is the kae-vs-sw
+  comparison currency, its lz77 view measures the hardware ceiling
 - [docs/operations.md](docs/operations.md) — KAE 2.x stack installation,
   deployment layout, hard rules, health checks, troubleshooting, upstream
   references
@@ -134,7 +135,7 @@ the device are marked `#[ignore]` (`tests/hw_required.rs`) and run only with
 ```bash
 cargo build --release
 ./target/release/kae-bench --probe        # environment & symbol probe (incl. the async surface)
-./target/release/kae-bench                # full scan: sw / hw / hwasync / raw (~2 min)
+./target/release/kae-bench                # full scan: sw / hw / hwasync / native (~2 min)
 ./target/release/kae-bench --input /path/to/memory.img \
     --blocks 4096,65536,1048576 --ops compress
 ./target/release/kae-bench --impl sw,hw,hwasync --workers 8 \
@@ -145,9 +146,9 @@ cargo bench -- --ops compress             # bench entry point (same logic)
 - Every (block size × sw/hw × compress/decompress) combination runs
   in a **subprocess**: the patched library and the system library share the
   SONAME liblz4.so.1 and would pollute each other inside one process. The
-  `raw` cells carry no library at all (in-crate uacce engine path); their
-  lz77 triples are rebuilt into standard LZ4 blocks in the worker, so the
-  same LZ4 cross-validation sample applies to them.
+  `native` cells carry no library at all (in-crate uacce engine path);
+  their lz77 triples are rebuilt into standard LZ4 blocks in the worker,
+  so the same LZ4 cross-validation sample applies to them.
 - `--workers N` with N > 1 turns the sw/hw cells into N-threaded block
   pools — the AgentENV zfile WorkerPool shape (each thread compresses its
   interleaved share of the file's blocks) — so `--impl sw,hw --workers 8`
@@ -174,7 +175,7 @@ symbol is GLIBC_2.34 (fine on Debian 12); verify with
 just `cargo build --release` on the target machine (rustc 1.70+ suffices,
 zero dependencies).
 
-## Raw uacce engine path (the native backend seed)
+## Native uacce engine path
 
 `src/uacce.rs` drives the ZIP engine directly over the uacce queue ABI —
 ioctl setup, mmap'd SQ/CQ rings, doorbell stores, CQE harvest, DMA from
@@ -184,22 +185,32 @@ no patched liblz4 in the process**, and still zero crate dependencies
 exposes it as a fourth implementation:
 
 ```bash
-./target/release/kae-bench --impl raw                          # engine ceiling cells
-./target/release/kae-bench --impl raw --workers 2              # two hardware queues
-KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw        # sleep-until-IRQ waiting
-KAE_RAW_ALG=deflate ./target/release/kae-bench --impl raw      # plumbing-check dialect
+./target/release/kae-bench --impl native                       # engine ceiling cells
+./target/release/kae-bench --impl native --workers 2           # two hardware queues
+KAE_NATIVE_WAIT=poll ./target/release/kae-bench --impl native  # sleep-until-IRQ waiting
+KAE_NATIVE_ALG=deflate ./target/release/kae-bench --impl native # plumbing-check dialect
 ```
+
+Two views, two questions — keep them apart when reading numbers:
+
+- **The LZ4 view is the kae-vs-sw comparison currency.** The engine's
+  lz77 parse is rebuilt into standard LZ4 blocks, so a native row's
+  `ratio_pct` is a true LZ4 ratio and its sample verifies with the system
+  liblz4 like every other implementation. Comparing kae against sw means
+  throughput (GB/s) and CPU (cpu s/GB) on LZ4 — that is the adoption
+  verdict.
+- **The lz77 view is the hardware ceiling only.** The timed loop times
+  the engine's lz77 parse alone, which no software implementation
+  produces; its GB/s answers "how fast is the hardware with the C stack
+  removed", not "how fast is an LZ4 compressor".
 
 In-flight depth, doorbell batching and spin-vs-poll waiting are all knobs
 here, so the same tool that measures the engine's true ceiling doubles as
 the testbed for the policies the C stack never had (deep pipelining,
 batched doorbells, sleep-until-IRQ). Compress only; QM v3 devices;
 `/dev/hisi_zip-*` required (cells skip with a printed reason otherwise).
-The raw lz77 output (literal/sequence triples) is rebuilt into standard
-LZ4 blocks for the cross-validation sample, so raw rows report a true LZ4
-ratio and get the same system-liblz4 verify as every other implementation.
-See [docs/raw-bench.md](docs/raw-bench.md) for the full matrix and the
-ceiling-interpretation framework.
+See [docs/native-bench.md](docs/native-bench.md) for the full matrix, the
+two-view reading rules, and the ceiling-interpretation framework.
 
 ## Operational hard rules
 

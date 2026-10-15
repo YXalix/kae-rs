@@ -5,8 +5,8 @@
 //! protocol records to stdout for the parent to parse and aggregate. Not
 //! for manual invocation.
 //!
-//! Throughput accounting: compress is "raw input bytes / wall clock",
-//! decompress is "decompressed raw bytes / wall clock"; CPU cost is
+//! Throughput accounting: compress is "uncompressed input bytes / wall clock",
+//! decompress is "decompressed bytes / wall clock"; CPU cost is
 //! getrusage(user+sys) normalized per GB of input — the criterion for a
 //! hardware offload is a significant drop in CPU/GB, not necessarily a
 //! faster wall clock.
@@ -23,7 +23,7 @@ use std::sync::Mutex;
 pub(crate) const IMPL_SW: &str = "sw";
 pub(crate) const IMPL_HW: &str = "hw";
 pub(crate) const IMPL_HWASYNC: &str = "hwasync";
-pub(crate) const IMPL_RAW: &str = "raw";
+pub(crate) const IMPL_NATIVE: &str = "native";
 
 /// Upper bound on --workers, matching the AgentENV zfile WorkerPool cap
 /// (keeps a typo from spawning thousands of threads).
@@ -114,7 +114,7 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
         }
         i += 1;
     }
-    if a.lib.is_empty() && a.impl_name != IMPL_RAW {
+    if a.lib.is_empty() && a.impl_name != IMPL_NATIVE {
         return Err("worker: --lib required".into());
     }
     if a.workers > POOL_WORKERS_MAX {
@@ -126,11 +126,11 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
     // probe mode never passes --impl
     if !a.probe {
         match a.impl_name.as_str() {
-            IMPL_SW | IMPL_HW | IMPL_HWASYNC | IMPL_RAW => {}
+            IMPL_SW | IMPL_HW | IMPL_HWASYNC | IMPL_NATIVE => {}
             "" => return Err("worker: --impl required".into()),
             other => {
                 return Err(format!(
-                    "worker: unknown --impl {other} (expected sw|hw|hwasync|raw)"
+                    "worker: unknown --impl {other} (expected sw|hw|hwasync|native)"
                 ))
             }
         }
@@ -158,7 +158,7 @@ struct WorkerArgs {
 /// Open for probe mode: the bare `Lib` is needed to call has_symbol, which
 /// KaeLz4 does not expose; the direct-open-then-preload-retry logic itself
 /// is the shared `open_lib`.
-fn open_raw(lib: &str, preload: &str) -> Result<crate::loader::Lib, String> {
+fn open_bare(lib: &str, preload: &str) -> Result<crate::loader::Lib, String> {
     crate::open_lib(lib, &split_preload(preload))
         .map(|(l, _)| l)
         .map_err(|e| e.to_string())
@@ -212,16 +212,16 @@ pub fn run(args: &[String]) -> i32 {
         return bench_async_compress(&a, &data, block, nblocks);
     }
 
-    // raw uacce engine path (compress only; no C library in the process)
-    if a.impl_name == IMPL_RAW {
+    // native uacce engine path (compress only; no C library in the process)
+    if a.impl_name == IMPL_NATIVE {
         if a.op != "compress" {
             println!(
-                "RESULT status=UNSUPPORTED impl=raw op={} note=raw_compress_only",
+                "RESULT status=UNSUPPORTED impl=native op={} note=native_compress_only",
                 a.op
             );
             return EXIT_USAGE;
         }
-        return bench_raw(&a, &data, block, nblocks);
+        return bench_native(&a, &data, block, nblocks);
     }
 
     // --workers >1 turns sw/hw into the threaded block pool form (the
@@ -266,7 +266,7 @@ pub fn run(args: &[String]) -> i32 {
 /// `--probe`: report symbol availability of one library through the
 /// PROBE/SYMBOL/HAS_ASYNC line protocol.
 fn run_probe(a: &WorkerArgs) -> i32 {
-    match open_raw(&a.lib, &a.preload) {
+    match open_bare(&a.lib, &a.preload) {
         Ok(lib) => {
             println!("PROBE lib={}", a.lib);
             let mut async_any = false;
@@ -321,7 +321,7 @@ fn emit_ok(r: OkResult<'_>) {
 }
 
 /// hwasync: one compress_segment = a batch submission of the whole segment's
-/// n blocks; the accounting matches sync compress (raw input bytes / wall
+/// n blocks; the accounting matches sync compress (uncompressed input bytes / wall
 /// clock + user+sys).
 fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     // A --workers >1 maps onto the library's internal async thread pool
@@ -425,30 +425,30 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
     EXIT_OK
 }
 
-/// `raw`: drive the ZIP engine through the crate's own uacce module — no
+/// `native`: drive the ZIP engine through the crate's own uacce module — no
 /// libwd, no patched library, and no payload copies in the timed loop (the
 /// workload sits in DMA-visible SS memory once at setup). The request size
 /// is the bench block capped at the engine's 128K lz77 flat limit;
 /// `--workers` maps to hardware queues (one fd each, round-robin over the
 /// devices). Knobs via environment:
-/// `KAE_RAW_DEPTH` in-flight requests per queue (default 8; throughput
+/// `KAE_NATIVE_DEPTH` in-flight requests per queue (default 8; throughput
 /// saturates at 4),
-/// `KAE_RAW_DB_BATCH` SQEs per doorbell (default = depth),
-/// `KAE_RAW_WAIT` `spin` (default) or `poll` (sleep on the uacce fd),
-/// `KAE_RAW_ALG` `lz77` (default) or `deflate` (the plumbing-check dialect:
+/// `KAE_NATIVE_DB_BATCH` SQEs per doorbell (default = depth),
+/// `KAE_NATIVE_WAIT` `spin` (default) or `poll` (sleep on the uacce fd),
+/// `KAE_NATIVE_ALG` `lz77` (default) or `deflate` (the plumbing-check dialect:
 /// no 128K input cap, and completion sanity only).
 ///
 /// The lz77 triples are rebuilt into standard LZ4 blocks for the sample
 /// file (up to `SAMPLE_CAP_BYTES` of input, one hw request at a time), so
-/// the orchestrator's verify op decodes raw output with the stock library
+/// the orchestrator's verify op decodes native output with the stock library
 /// and `ratio_pct` is the true LZ4 block ratio of the sample blocks. Falls
 /// back to the pre-rebuild engine output ratio when no sample is possible
 /// (deflate dialect, block not a request multiple, manual run without
 /// `--sample-out`); the note field names the fallback.
-fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let devices = uacce::zip_devices();
     if devices.is_empty() {
-        println!("RESULT status=NO_DEVICE impl=raw op=compress note=no_hisi_zip_uacce_node");
+        println!("RESULT status=NO_DEVICE impl=native op=compress note=no_hisi_zip_uacce_node");
         return EXIT_OPEN_FAIL;
     }
     let env_num = |name: &str, default: usize| -> usize {
@@ -458,19 +458,19 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
             .filter(|v| *v > 0)
             .unwrap_or(default)
     };
-    let depth = env_num("KAE_RAW_DEPTH", 8).min(uacce::QM_Q_DEPTH);
-    let batch = env_num("KAE_RAW_DB_BATCH", depth);
-    let wait_poll = std::env::var("KAE_RAW_WAIT").map(|v| v == "poll").unwrap_or(false);
-    let alg = match std::env::var("KAE_RAW_ALG").as_deref() {
-        Ok("deflate") => uacce::RawAlg::Deflate,
-        _ => uacce::RawAlg::Lz77,
+    let depth = env_num("KAE_NATIVE_DEPTH", 8).min(uacce::QM_Q_DEPTH);
+    let batch = env_num("KAE_NATIVE_DB_BATCH", depth);
+    let wait_poll = std::env::var("KAE_NATIVE_WAIT").map(|v| v == "poll").unwrap_or(false);
+    let alg = match std::env::var("KAE_NATIVE_ALG").as_deref() {
+        Ok("deflate") => uacce::NativeAlg::Deflate,
+        _ => uacce::NativeAlg::Lz77,
     };
     let req_size = match alg {
-        uacce::RawAlg::Lz77 => block.min(uacce::MAX_LZ77_REQ),
-        uacce::RawAlg::Deflate => block,
+        uacce::NativeAlg::Lz77 => block.min(uacce::MAX_LZ77_REQ),
+        uacce::NativeAlg::Deflate => block,
     };
 
-    let mut pump = match uacce::RawPump::open(
+    let mut pump = match uacce::NativePump::open(
         &devices,
         a.workers.max(1),
         req_size,
@@ -482,7 +482,7 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
         Ok(p) => p,
         Err(e) => {
             println!(
-                "RESULT status=OPEN_FAIL impl=raw op=compress err={}",
+                "RESULT status=OPEN_FAIL impl=native op=compress err={}",
                 flat(&e)
             );
             return EXIT_OPEN_FAIL;
@@ -495,47 +495,47 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let warm = pump.run(1.0);
     if warm.reqs_done == 0 || warm.hw_errors > 0 {
         println!(
-            "RESULT status=RAW_FAIL impl=raw op=compress block={} reqs={} hw_err={} err=engine_dead",
+            "RESULT status=NATIVE_FAIL impl=native op=compress block={} reqs={} hw_err={} err=engine_dead",
             block, warm.reqs_done, warm.hw_errors
         );
         return EXIT_COMPRESS_FAIL;
     }
 
-    let st_raw = pump.run(a.min_sec);
-    if st_raw.reqs_done == 0 || st_raw.hw_errors > 0 {
+    let st_native = pump.run(a.min_sec);
+    if st_native.reqs_done == 0 || st_native.hw_errors > 0 {
         println!(
-            "RESULT status=RAW_FAIL impl=raw op=compress block={} reqs={} hw_err={} err=engine_dead",
-            block, st_raw.reqs_done, st_raw.hw_errors
+            "RESULT status=NATIVE_FAIL impl=native op=compress block={} reqs={} hw_err={} err=engine_dead",
+            block, st_native.reqs_done, st_native.hw_errors
         );
         return EXIT_COMPRESS_FAIL;
     }
     // one continuous run = one pass; CPU covers the whole pump (this
     // process is single-threaded)
     let st = LoopStats {
-        wall_s: st_raw.wall_s,
-        user_s: st_raw.user_s,
-        sys_s: st_raw.sys_s,
+        wall_s: st_native.wall_s,
+        user_s: st_native.user_s,
+        sys_s: st_native.sys_s,
         passes: 1,
     };
     // ratio starts as the pre-rebuild engine output; the sample rebuild
     // replaces it with the true LZ4 block ratio (and names the fallback in
     // the note when no sample is possible)
-    let mut ratio_pct = st_raw.bytes_out as f64 / st_raw.bytes_in as f64 * 100.0;
+    let mut ratio_pct = st_native.bytes_out as f64 / st_native.bytes_in as f64 * 100.0;
     let mut sample_note = String::new();
     if !a.sample_out.is_empty() {
-        if alg != uacce::RawAlg::Lz77 {
+        if alg != uacce::NativeAlg::Lz77 {
             sample_note = ",sample=skipped:deflate".into();
         } else if block % req_size != 0 {
             sample_note = ",sample=skipped:block_not_request_multiple".into();
         } else {
-            match build_raw_sample(&mut pump, data, block, nblocks, req_size, &a.sample_out) {
+            match build_native_sample(&mut pump, data, block, nblocks, req_size, &a.sample_out) {
                 Ok((packed, count)) => {
                     sample_note = format!(",pre_ratio={ratio_pct:.1}");
                     ratio_pct = packed as f64 / (count as u64 * block as u64) as f64 * 100.0;
                 }
                 Err(e) => {
                     println!(
-                        "RESULT status=COMPRESS_FAIL impl=raw op=compress block={} at=sample err={}",
+                        "RESULT status=COMPRESS_FAIL impl=native op=compress block={} at=sample err={}",
                         block, e
                     );
                     return EXIT_COMPRESS_FAIL;
@@ -544,29 +544,29 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
         }
     }
     let note = format!(
-        "raw,alg={},queues={},depth={},db_batch={},wait={},req_size={},nvcsw={},nivcsw={}{}",
+        "native,alg={},queues={},depth={},db_batch={},wait={},req_size={},nvcsw={},nivcsw={}{}",
         match alg {
-            uacce::RawAlg::Lz77 => "lz77",
-            uacce::RawAlg::Deflate => "deflate",
+            uacce::NativeAlg::Lz77 => "lz77",
+            uacce::NativeAlg::Deflate => "deflate",
         },
         a.workers.max(1),
         depth,
         batch,
         if wait_poll { "poll" } else { "spin" },
         req_size,
-        st_raw.nvcsw,
-        st_raw.nivcsw,
+        st_native.nvcsw,
+        st_native.nivcsw,
         sample_note
     );
     emit_ok(OkResult {
-        impl_name: IMPL_RAW,
+        impl_name: IMPL_NATIVE,
         op: "compress",
         block,
         lib: &a.lib,
         blocks: nblocks,
         st: &st,
-        in_bytes: st_raw.bytes_in,
-        out_bytes: st_raw.bytes_out,
+        in_bytes: st_native.bytes_in,
+        out_bytes: st_native.bytes_out,
         ratio_pct,
         note: &note,
     });
@@ -577,8 +577,8 @@ fn bench_raw(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
 /// hardware request per `req_size` slice, engine idle after the timed run)
 /// and write the packed sample file. Returns (rebuilt bytes, blocks
 /// covered). `block` must be a `req_size` multiple — the caller checks.
-fn build_raw_sample(
-    pump: &mut uacce::RawPump,
+fn build_native_sample(
+    pump: &mut uacce::NativePump,
     data: &[u8],
     block: usize,
     nblocks: usize,
@@ -793,12 +793,12 @@ fn prepare_decompress(
     }
 
     // warm-up + self-check (this library decompresses what it compressed)
-    let mut raw = vec![0u8; block];
+    let mut plain = vec![0u8; block];
     for b in 0..nblocks {
         let (off, len) = extents[b];
         let expect = &data[b * block..(b + 1) * block];
-        match kae.decompress(&blob[off..off + len], &mut raw) {
-            Ok(n) if n == block && raw.as_slice() == expect => {}
+        match kae.decompress(&blob[off..off + len], &mut plain) {
+            Ok(n) if n == block && plain.as_slice() == expect => {}
             other => {
                 let err = other
                     .err()
@@ -832,9 +832,9 @@ fn bench_decompress(
             Err(code) => return code,
         };
 
-    // timed decompress loop; throughput counts the decompressed raw bytes;
+    // timed decompress loop; throughput counts the decompressed bytes;
     // a mid-loop failure fails the cell instead of silently deflating them
-    let mut raw = vec![0u8; block];
+    let mut plain = vec![0u8; block];
     let mut decompress_err: Option<String> = None;
     let st = timed_loop(
         nblocks,
@@ -843,7 +843,7 @@ fn bench_decompress(
                 return 0;
             }
             let (off, len) = extents[b];
-            match kae.decompress(&blob[off..off + len], &mut raw) {
+            match kae.decompress(&blob[off..off + len], &mut plain) {
                 Ok(n) if n == block => n,
                 Ok(_) => {
                     decompress_err = Some("size_mismatch".into());
@@ -998,12 +998,12 @@ fn bench_pool_decompress(
         nblocks,
         // one scratch buffer per thread, created on the owning thread
         |_| vec![0u8; block],
-        |t, b, raw| {
+        |t, b, plain| {
             if failed.load(Ordering::Relaxed) {
                 return 0;
             }
             let (off, len) = extents[b];
-            match kae.decompress(&blob[off..off + len], raw) {
+            match kae.decompress(&blob[off..off + len], plain) {
                 Ok(n) if n == block => {
                     counts[t].fetch_add(1, Ordering::Relaxed);
                     block
@@ -1090,7 +1090,7 @@ fn verify_sample(a: &WorkerArgs, kae: &KaeLz4, data: &[u8], block: usize) -> i32
         return EXIT_USAGE;
     }
     let mut off = 12;
-    let mut raw = vec![0u8; block];
+    let mut plain = vec![0u8; block];
     let mut fail = 0usize;
     for i in 0..count {
         if off + 4 > sample.len() {
@@ -1105,8 +1105,8 @@ fn verify_sample(a: &WorkerArgs, kae: &KaeLz4, data: &[u8], block: usize) -> i32
         }
         let expect = &data[i * block..(i + 1) * block];
         let ok = kae
-            .decompress(&sample[off..off + clen], &mut raw)
-            .map(|n| n == block && raw.as_slice() == expect)
+            .decompress(&sample[off..off + clen], &mut plain)
+            .map(|n| n == block && plain.as_slice() == expect)
             .unwrap_or(false);
         if !ok {
             fail += 1;

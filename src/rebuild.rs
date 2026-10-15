@@ -121,11 +121,7 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
 /// is `offset + 3` and shifts the history down; offBase 1..3 are repeat
 /// codes over the recent offsets, where a zero-length literal run swaps
 /// entries instead of only rotating them (zstd's offset update rules).
-pub(crate) fn resolve_offset(
-    off_base: usize,
-    lit_len: usize,
-    rep: &mut [usize; 3],
-) -> Result<usize, String> {
+fn resolve_offset(off_base: usize, lit_len: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
     if off_base == 0 {
         return Err("triple offBase is 0".into());
     }

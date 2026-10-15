@@ -1,12 +1,17 @@
-# The raw sweep runbook: what to run on the target machine
+# The native sweep runbook: what to run on the target machine
 
-The raw cells exist to answer one verdict question (see
-[raw-bench.md](raw-bench.md)): **is the ZIP engine faster than the ~4 GB/s
-plateau the C userspace stack achieves, or is the engine itself the
-ceiling?** This page is the concrete on-machine procedure — one command
-per experiment, one TSV per run, roughly fifteen minutes end to end.
-Run it from a checkout of 9018b49 ("raw: rebuild the lz77 triples into
-standard LZ4 for the sample verify") or later.
+The native cells exist to answer one verdict question (see
+[native-bench.md](native-bench.md)): **is the ZIP engine faster than the
+~4 GB/s plateau the C userspace stack achieves, or is the engine itself
+the ceiling?** This page is the concrete on-machine procedure — one
+command per experiment, one TSV per run, roughly fifteen minutes end to
+end. Run it from a checkout of 9018b49 ("raw: rebuild the lz77 triples
+into standard LZ4 for the sample verify") or later.
+
+Keep the two views straight while sweeping: the native GB/s numbers
+below are the **lz77 ceiling view**; the kae-vs-sw adoption comparison
+(throughput + CPU on the same LZ4 format) is read from the E1 anchor's
+sw/hw rows against the native rows' LZ4 ratio and CPU.
 
 ## Preconditions
 
@@ -35,14 +40,14 @@ low-throughput mode, so all of them are floors (see
 ## The experiments
 
 Each run fully rewrites its `--tsv` file, so every command names its
-own. No extra flags are needed beyond what is shown: every raw row's
+own. No extra flags are needed beyond what is shown: every native row's
 `note` field carries the exact configuration
 (`alg,queues,depth,db_batch,wait,req_size,nvcsw,nivcsw[,pre_ratio]`).
 
 ### E0 — plumbing check (seconds)
 
 ```bash
-KAE_RAW_ALG=deflate ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2 --tsv /dev/null
+KAE_NATIVE_ALG=deflate ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv /dev/null
 ```
 
 Confirms the uacce dialog (open, SQE, doorbell, CQE) works on this
@@ -55,7 +60,7 @@ running. `NO_DEVICE`/`OPEN_FAIL` here stops the sweep.
 ./target/release/kae-bench --tsv e1-base.tsv
 ```
 
-The anchor: sw, hw, hwasync and raw on the same synthetic input, same
+The anchor: sw, hw, hwasync and native on the same synthetic input, same
 driver mode. The 2.91 GB/s sync and ~4 GB/s async figures in
 [kae-limitations.md](kae-limitations.md) predate the one-input bench —
 re-anchor before comparing anything against them.
@@ -64,7 +69,7 @@ re-anchor before comparing anything against them.
 
 ```bash
 for k in 1 4 16 64 256; do
-  KAE_RAW_DEPTH=$k ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2 --tsv e2-depth-$k.tsv
+  KAE_NATIVE_DEPTH=$k ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e2-depth-$k.tsv
 done
 ```
 
@@ -74,14 +79,14 @@ artifact and the native backend is worth finishing; saturation at or
 below it means the engine (or its current `perf_mode` — see the last
 section) is the ceiling. Depth 1024 is skipped deliberately: at 64K
 requests it asks for ~260 MiB of DMA-coherent SS memory per queue and
-fails in the mapping ([raw-bench.md](raw-bench.md)).
+fails in the mapping ([native-bench.md](native-bench.md)).
 
 ### E3 — queue scaling
 
 ```bash
-./target/release/kae-bench --impl raw --workers 2 --blocks 65536 --min-sec 2 --tsv e3-queues2.tsv
+./target/release/kae-bench --impl native --workers 2 --blocks 65536 --min-sec 2 --tsv e3-queues2.tsv
 # with two or more devices, also:
-./target/release/kae-bench --impl raw --workers 4 --blocks 65536 --min-sec 2 --tsv e3-queues4.tsv
+./target/release/kae-bench --impl native --workers 4 --blocks 65536 --min-sec 2 --tsv e3-queues4.tsv
 ```
 
 Whether the second device's queues add throughput on top of E2's
@@ -90,9 +95,9 @@ saturation point — the difference between one engine and two.
 ### E4 — wait policy: spin vs poll
 
 ```bash
-KAE_RAW_WAIT=poll ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2 --tsv e4-poll-d8.tsv
+KAE_NATIVE_WAIT=poll ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e4-poll-d8.tsv
 # repeat at the depth K where E2 saturated:
-KAE_RAW_WAIT=poll KAE_RAW_DEPTH=<K> ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2 --tsv e4-poll-dbest.tsv
+KAE_NATIVE_WAIT=poll KAE_NATIVE_DEPTH=<K> ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e4-poll-dbest.tsv
 ```
 
 Same throughput at a fraction of the pump CPU (`cpu_s_per_gb`, and
@@ -102,7 +107,7 @@ end to end.
 ### E5 — the doorbell tax
 
 ```bash
-KAE_RAW_DB_BATCH=1 ./target/release/kae-bench --impl raw --blocks 65536 --min-sec 2 --tsv e5-db1.tsv
+KAE_NATIVE_DB_BATCH=1 ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e5-db1.tsv
 ```
 
 Per-request doorbell stores against E2's default full-depth batching —
@@ -111,7 +116,7 @@ the MMIO cost the C stack pays on every single request.
 ## Sending the results back
 
 ```bash
-tar czf kae-raw-data.tgz rev.txt machine.txt \
+tar czf kae-native-data.tgz rev.txt machine.txt \
   e1-base.tsv e2-depth-*.tsv e3-*.tsv e4-*.tsv e5-db1.tsv
 ```
 
