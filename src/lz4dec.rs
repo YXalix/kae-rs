@@ -144,17 +144,17 @@ mod tests {
     /// `lz77_block`, the block back through here.
     #[test]
     fn decodes_rebuild_output() {
-        let triple = |off_base: u32, lit_len: u16, ml_base: u16| -> [u8; 8] {
+        let triple = |off_base: u16, lit_len: u32, ml_base: u16| -> [u8; 8] {
             let mut t = [0u8; 8];
-            t[0..4].copy_from_slice(&off_base.to_le_bytes());
-            t[4..6].copy_from_slice(&lit_len.to_le_bytes());
+            t[0..4].copy_from_slice(&lit_len.to_le_bytes());
+            t[4..6].copy_from_slice(&off_base.to_le_bytes());
             t[6..8].copy_from_slice(&ml_base.to_le_bytes());
             t
         };
         let input = b"abcdabcdabcd";
-        let seqs = [triple(0, 5, 0), triple(8 + 3, 0, 1)].concat();
+        let seqs = [triple(0, 5, 0), triple(7, 0, 1)].concat(); // offset 8 = offBase 7
         let mut block = Vec::new();
-        let n = rebuild::lz77_block(input, &seqs, &mut block, &mut rebuild::RepRegister::fresh()).expect("rebuild");
+        let n = rebuild::lz77_block(input, &seqs, &mut block).expect("rebuild");
         decode(&block[..n], input);
     }
 }

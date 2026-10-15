@@ -21,7 +21,10 @@
 //! - doorbell encoding, CQE layout, queue geometry:
 //!   uadk/v1/drv/hisi_qm_udrv.{c,h}
 //! - ZIP v3 SQE layout, algorithm codes, stream flags, lz77 flat-buffer
-//!   geometry: uadk/v1/drv/hisi_zip_udrv.{c,h}
+//!   geometry: uadk/v1/drv/hisi_zip_udrv.{c,h} plus the KAE uadk patch
+//!   scripts/patches/0007-uadk-support-lz77-only-for-kaelz4.patch (the
+//!   0x40/0x41 no-repeat algorithm codes) and KAELz4's session defaults
+//!   (src/v1/kaelz4_init.c, src/v1/kaelz4_ctx.c)
 //!
 //! Doorbell semantics: the ring index is advanced BEFORE ringing, and the
 //! doorbell carries the advanced index — "hardware may fetch every SQE up
@@ -32,9 +35,10 @@
 //!
 //! Only QM v3 devices are supported (api `hisi_qm_v3`, the KAE2/SEC2
 //! generation) with the v3 SQE layout, in two stateless flat dialects:
-//! lz77 (the kaelz4 production mode: literals + 8-byte sequence triples +
-//! freq block) and deflate (algorithm code HW_RAW_DEFLATE, validated end
-//! to end by inflating one output in the unit tests on hardware).
+//! lz77 (the kaelz4 production mode: the LZ77_ONLY algorithm 0x40, output
+//! as literals + 8-byte sequence triples) and deflate (algorithm code
+//! HW_RAW_DEFLATE, validated end to end by inflating one output in the
+//! unit tests on hardware).
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -160,8 +164,13 @@ struct Sqe {
 
 /// Algorithm codes in dw9[7:0] (enum hw_comp_alg_type).
 const HW_RAW_DEFLATE: u32 = 0x01;
-/// 0x42 is the L9 "price" variant; plain L8/LZ4-style runs as 0x43.
-const HW_LZ77_ZSTD: u32 = 0x43;
+/// The kaelz4 production path requests the LZ77_ONLY dialect at comp
+/// level 8, which the driver programs as 0x40: no repeat codes, every
+/// triple offset explicit. Sources: uadk patch
+/// scripts/patches/0007-uadk-support-lz77-only-for-kaelz4.patch and
+/// KAELz4/src/v1/kaelz4_init.c. The 0x42/0x43 LZ77_ZSTD flavors are a
+/// different dialect kaelz4 does not use.
+const HW_LZ77_ZSTD_NOREPCODE: u32 = 0x40;
 // dw7 flags (uadk v1 hisi_zip_udrv.c): stream NEW + stateless + FINISH,
 // BD type 3 — the stateless one-shot shape kaelz4 uses. Bit layout of
 // dw7[27:25]: NEW=1, flush=0, FINISH=1.
@@ -214,12 +223,14 @@ fn lz77_lit_area(req_size: usize) -> usize {
 
 /// Fill one lz77 flat SQE (pure, unit-tested; the literals land at the
 /// output start, the 8-byte sequence triples after the literal area). The
-/// engine parses `in_len - MFLIMIT` bytes; the last 12 bytes of the input
-/// belong to the rebuild's tail literal run.
+/// dialect is the one kaelz4's LZ4_compress_default drives: LZ77_ONLY at
+/// comp level 8, so the triples carry explicit offsets only. The engine
+/// parses `in_len - MFLIMIT` bytes; the last 12 bytes of the input belong
+/// to the rebuild's tail literal run.
 fn fill_lz77_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap: usize) {
     *sqe = unsafe { std::mem::zeroed() };
     let lit = lz77_lit_area(in_len) as u32;
-    sqe.dw9 = HW_LZ77_ZSTD | (WS_16K << WINDOWS_SIZE_SHIFT);
+    sqe.dw9 = HW_LZ77_ZSTD_NOREPCODE | (WS_16K << WINDOWS_SIZE_SHIFT);
     sqe.dw13 = lit;
     sqe.dest_avail_out = ocap as u32 - lit;
     sqe.input_data_length = in_len.saturating_sub(MFLIMIT) as u32;
@@ -1024,9 +1035,7 @@ mod hw_tests {
         let sample = pump.sample_triples(&data).expect("sample request");
 
         let mut block = Vec::new();
-        let mut rep = crate::rebuild::RepRegister::fresh();
-        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block, &mut rep)
-            .expect("rebuild");
+        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block).expect("rebuild");
         let mut dst = vec![0u8; data.len()];
         let decoded =
             crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
@@ -1057,12 +1066,11 @@ mod hw_tests {
         let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         let mut problems = Vec::new();
-        let mut rep = crate::rebuild::RepRegister::fresh();
         for first_page in [9, 18] {
             let chunk = &data[first_page * 4096..first_page * 4096 + req];
-            // sample the same request twice: if the engine is stateful the
-            // second parse differs and the vendor comparison needs that
-            // history accounted for
+            // sample the same request twice: the LZ77_ONLY parse is a pure
+            // function of the input, so a difference here means queue
+            // state the vendor comparison has to account for
             let sample = pump.sample_triples(chunk).expect("sample request");
             let resample = pump.sample_triples(chunk).expect("resample request");
             eprintln!(
@@ -1079,20 +1087,11 @@ mod hw_tests {
                 hx(&sample.lits)
             );
             eprintln!("native: run 1 triples:");
-            // traces advance copies; the register itself is consumed once,
-            // by the rebuild below
-            let mut trace_rep = rep;
-            for line in
-                crate::rebuild::trace_triples(chunk.len(), &sample.seqs, &mut trace_rep).lines()
-            {
+            for line in crate::rebuild::trace_triples(chunk.len(), &sample.seqs).lines() {
                 eprintln!("native: {line}");
             }
             eprintln!("native: run 2 triples:");
-            let mut resample_rep = trace_rep;
-            for line in
-                crate::rebuild::trace_triples(chunk.len(), &resample.seqs, &mut resample_rep)
-                    .lines()
-            {
+            for line in crate::rebuild::trace_triples(chunk.len(), &resample.seqs).lines() {
                 eprintln!("native: {line}");
             }
             if sample.seqs == resample.seqs {
@@ -1100,8 +1099,7 @@ mod hw_tests {
             }
 
             let mut block = Vec::new();
-            let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block, &mut rep)
-                .expect("rebuild");
+            let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block).expect("rebuild");
             let mut dst = vec![0u8; chunk.len()];
             match crate::lz4dec::decode_block(&block[..n], &mut dst) {
                 Ok(m) if &dst[..m] == chunk => {
@@ -1226,7 +1224,7 @@ mod tests {
     fn lz77_sqe_known_answer() {
         let b = sqe_bytes(|s| fill_lz77_sqe(s, 0x1234_5678_9abc_def0, 0xfeed_0000_0000_1000, 65536, out_cap(NativeAlg::Lz77, 65536)));
         let dw = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-        assert_eq!(dw(9) & 0xff, HW_LZ77_ZSTD); // algorithm
+        assert_eq!(dw(9) & 0xff, HW_LZ77_ZSTD_NOREPCODE); // algorithm
         assert_eq!(dw(9) >> WINDOWS_SIZE_SHIFT & 0xf, WS_16K);
         assert_eq!(dw(13), 65536 - MFLIMIT as u32 + 16); // literals capacity
         assert_eq!(

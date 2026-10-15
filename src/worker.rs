@@ -737,7 +737,6 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     let mut blob: Vec<u8> = Vec::with_capacity(data.len());
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
     let mut stream = Vec::new();
-    let mut rep = rebuild::RepRegister::fresh();
     for b in 0..nblocks {
         let base = blob.len();
         for r in 0..per_block {
@@ -753,7 +752,7 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
                     return EXIT_COMPRESS_FAIL;
                 }
             };
-            let n = match rebuild::lz77_block(&data[off..off + req_size], &sample.seqs, &mut stream, &mut rep)
+            let n = match rebuild::lz77_block(&data[off..off + req_size], &sample.seqs, &mut stream)
             {
                 Ok(n) => n,
                 Err(e) => {
@@ -868,14 +867,13 @@ fn build_native_sample(
     let mut packed: Vec<u8> = Vec::new();
     let mut lens = Vec::with_capacity(count);
     let mut stream = Vec::new();
-    let mut rep = rebuild::RepRegister::fresh();
     for b in 0..count {
         let base = packed.len();
         for r in 0..per_block {
             let off = b * block + r * req_size;
             let chunk = &data[off..off + req_size];
             let sample = pump.sample_triples(chunk)?;
-            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream, &mut rep)
+            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream)
                 .map_err(|e| rebuild_fail_detail(&sample, &e))?;
             if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
                 dump_rebuild_check(b * per_block + r, off, &sample, chunk, &stream[..n], &e);
