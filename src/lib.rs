@@ -46,6 +46,7 @@ mod batch;
 mod data;
 mod loader;
 mod lz4;
+mod lz4dec;
 pub mod orchestrator;
 mod rebuild;
 mod sysres;

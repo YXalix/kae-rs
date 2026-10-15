@@ -91,8 +91,9 @@ usage: kae-bench [options]
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
   --impl LIST       implementations: sw,hw,hwasync,native (default: all present;
                     hwasync = segment-level async batch, compress only; native =
-                    the crate's own uacce engine path, compress only, no C
-                    library in the process)
+                    the crate's own uacce engine path (compress: the raw lz77
+                    pump; decompress: in-crate software decode of the rebuilt
+                    blocks), no C library in the process)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
                     --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's
                     library thread pool (KAE_LZ4_ASYNC_THREAD_NUM)
@@ -384,6 +385,27 @@ fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0);
             row.note = field(&line, "note").unwrap_or_default();
+            // failure lines carry at=/err= instead of note=; keep the cause
+            // in the row (table, TSV, JSON) instead of dropping it
+            if row.status != "OK" && row.note.is_empty() {
+                row.note = ["at", "err"]
+                    .iter()
+                    .filter_map(|k| field(&line, k))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            // the worker's stderr (hw status reports, diagnostics) is part
+            // of the failure evidence
+            if row.status != "OK" {
+                let tail = stderr_tail(&stderr);
+                if !tail.is_empty() {
+                    row.note = if row.note.is_empty() {
+                        tail
+                    } else {
+                        format!("{} ({tail})", row.note)
+                    };
+                }
+            }
         }
         None => {
             row.status = "WORKER_ERR".into();

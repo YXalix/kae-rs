@@ -154,64 +154,6 @@ fn push_extension(out: &mut Vec<u8>, mut n: usize) {
     out.push(n as u8);
 }
 
-/// Test-only pure-Rust LZ4 block decoder (the unit tests round-trip the
-/// rebuild through it without any library dependency).
-#[cfg(test)]
-pub(crate) mod test_support {
-    /// Decode one LZ4 block into `dst`; mirrors what
-    /// `LZ4_decompress_safe` accepts, including a trailing empty token.
-    pub(crate) fn decode(src: &[u8], dst: &mut Vec<u8>) -> Result<(), String> {
-        let mut s = 0usize;
-        while s < src.len() {
-            let token = src[s];
-            s += 1;
-            let mut lit = (token >> 4) as usize;
-            if lit == 15 {
-                loop {
-                    let b = *src.get(s).ok_or("truncated literal extension")?;
-                    s += 1;
-                    lit += b as usize;
-                    if b != 255 {
-                        break;
-                    }
-                }
-            }
-            if s + lit > src.len() {
-                return Err("truncated literals".into());
-            }
-            dst.extend_from_slice(&src[s..s + lit]);
-            s += lit;
-            if s == src.len() {
-                return Ok(()); // final literal run: end of block
-            }
-            if s + 2 > src.len() {
-                return Err("truncated offset".into());
-            }
-            let off = u16::from_le_bytes(src[s..s + 2].try_into().unwrap()) as usize;
-            s += 2;
-            if off == 0 || off > dst.len() {
-                return Err(format!("bad offset {off} at {}B output", dst.len()));
-            }
-            let mut ml = (token & 15) as usize + 4;
-            if token & 15 == 15 {
-                loop {
-                    let b = *src.get(s).ok_or("truncated match extension")?;
-                    s += 1;
-                    ml += b as usize;
-                    if b != 255 {
-                        break;
-                    }
-                }
-            }
-            let start = dst.len() - off;
-            for i in 0..ml {
-                let b = dst[start + i];
-                dst.push(b);
-            }
-        }
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -234,9 +176,10 @@ mod tests {
 
     fn roundtrip(input: &[u8], seqs: &[u8]) {
         let block = rebuild(input, seqs);
-        let mut dst = Vec::new();
-        test_support::decode(&block, &mut dst).expect("decode");
-        assert_eq!(dst, input);
+        let mut dst = vec![0u8; input.len()];
+        let n = crate::lz4dec::decode_block(&block, &mut dst).expect("decode");
+        assert_eq!(n, input.len());
+        assert_eq!(&dst[..n], input);
     }
 
     #[test]

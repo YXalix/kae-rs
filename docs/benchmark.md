@@ -41,7 +41,7 @@ Common invocations:
 | `--input FILE` | — | Benchmark a real file instead of synthetic data (dataset label becomes `input`) |
 | `--size MIB` | 64 | Synthetic dataset size |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
-| `--impl LIST` | `sw,hw,hwasync,native` | `sw`, `hw`, `hwasync` (compress only), `native` (compress only; the crate's own uacce engine path — see [native-bench.md](native-bench.md)) |
+| `--impl LIST` | `sw,hw,hwasync,native` | `sw`, `hw`, `hwasync` (compress only), `native` (the crate's own uacce engine path; its decompress cell decodes in software, in-crate — see [native-bench.md](native-bench.md)) |
 | `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `native`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |
@@ -134,16 +134,23 @@ Native rows carry both views at once (see
 [native-bench.md](native-bench.md)): the `GB/s` times the engine's lz77
 parse — the hardware ceiling, a format no software implementation
 produces — while `ratio_pct` and `verify` describe the rebuilt standard
-LZ4 blocks, the view that kae-vs-sw comparisons are read on.
+LZ4 blocks, the view that kae-vs-sw comparisons are read on. When the
+sample rebuild fails, the timed engine numbers stand: the row keeps
+`OK`, `ratio_pct` falls back to the pre-rebuild engine output and the
+note records `sample=failed:<cause>` (and no verify runs). The native
+decompress row is in-crate software decode of those rebuilt blocks —
+liblz4's job in the other implementations, just without the C library.
 
 - **`status`** — `OK`, or a failure tag: `OPEN_FAIL` (library could not be
   opened), `COMPRESS_FAIL`, `DECOMPRESS_MISMATCH`, `ASYNC_FAIL`,
-  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync/native + decompress),
+  `INPUT_SMALL`, `UNSUPPORTED` (e.g. hwasync + decompress),
   `WORKER_ERR`
   (the subprocess died; stderr tail is in the note). A failure inside the
   timed loop fails the cell with its error tag — no partial numbers are
   reported. When no patched library is found, `hw`/`hwasync` cells are
-  skipped entirely and the environment report says so.
+  skipped entirely and the environment report says so. Failed rows keep
+  their diagnostics in `note`: the worker's `at=`/`err=` fields, plus the
+  first words of its stderr.
 
 Timing per cell is adaptive: at least `--passes-min` passes and
 `--min-sec` seconds, capped at `--passes-max`.

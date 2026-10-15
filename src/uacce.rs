@@ -1020,9 +1020,11 @@ mod hw_tests {
 
         let mut block = Vec::new();
         let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block).expect("rebuild");
-        let mut dst = Vec::new();
-        crate::rebuild::test_support::decode(&block[..n], &mut dst).expect("decode");
-        assert_eq!(dst, data, "rebuild output must decode to the input");
+        let mut dst = vec![0u8; data.len()];
+        let decoded =
+            crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
+        assert_eq!(decoded, data.len());
+        assert_eq!(&dst[..decoded], &data[..], "rebuild output must decode to the input");
     }
 }
 

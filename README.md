@@ -207,8 +207,12 @@ Two views, two questions — keep them apart when reading numbers:
 In-flight depth, doorbell batching and spin-vs-poll waiting are all knobs
 here, so the same tool that measures the engine's true ceiling doubles as
 the testbed for the policies the C stack never had (deep pipelining,
-batched doorbells, sleep-until-IRQ). Compress only; QM v3 devices;
-`/dev/hisi_zip-*` required (cells skip with a printed reason otherwise).
+batched doorbells, sleep-until-IRQ). Compress times the raw lz77 engine;
+decompress times in-crate software decoding (`src/lz4dec.rs`) of the
+rebuilt standard LZ4 blocks — the decode side is software everywhere, the
+native path just also drops the C library from the process. QM v3
+devices; `/dev/hisi_zip-*` required (cells skip with a printed reason
+otherwise).
 See [docs/native-bench.md](docs/native-bench.md) for the full matrix, the
 two-view reading rules, and the ceiling-interpretation framework.
 

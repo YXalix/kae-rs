@@ -65,7 +65,11 @@ the engine itself is the limit and the placement verdict is final.
   sample is possible — the `deflate` dialect, a block that is not a
   request-size multiple, a manual worker run without `--sample-out` — the
   ratio falls back to the pre-rebuild engine output and the `note` names
-  it.
+  it. The same applies when a sample rebuild **fails**: the timed engine
+  numbers stand, the row stays `OK`, and the note records
+  `sample=failed:<cause>` (the row's err= and the worker's stderr also
+  surface in the summary/TSV note). The decompress cell depends on the
+  rebuild and fails its cell instead — the decode has nothing to decode.
 
 ## Running
 
@@ -148,8 +152,19 @@ number taken under it is a floor.
 ## Scope and caveats
 
 - Stateless flat requests only, window fixed at 16K for lz77 (kaelz4's
-  defaults); the compress op only — native decompression does not exist
-  (the natural decoder of the rebuilt blocks is the software library).
+  defaults). Compress times the engine's lz77 parse; decompress times
+  in-crate software decoding (`src/lz4dec.rs`) of the rebuilt standard
+  LZ4 blocks — the decode side is software in every implementation (KAE
+  accelerates compression only; the patched library decompresses in
+  software too), and the native path keeps a C library out of the
+  process entirely. The decompress cell needs the lz77 dialect (deflate
+  output is not LZ4) and blocks that are request-size multiples.
+- The decompress setup rebuilds **every** block from live hardware
+  triples (one request per `req_size` slice, untimed), then bit-checks
+  each rebuilt block against the original before the timed decode loop —
+  a full-pipeline self-test per run. The setup is one request in flight
+  on one queue; `KAE_NATIVE_DEPTH`/`KAE_NATIVE_DB_BATCH`/`KAE_NATIVE_WAIT`
+  still shape that queue.
 - The SS region needs ~`depth × 4 × req_size` bytes per queue; at the
   default depth 8 and 64K requests that is ~2 MiB. Forcing
   `KAE_NATIVE_DEPTH` to 1024 at 64K requests asks for ~260 MiB of

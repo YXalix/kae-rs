@@ -12,6 +12,7 @@
 //! faster wall clock.
 
 use crate::lz4::PROBE_SYMBOLS;
+use crate::lz4dec;
 use crate::rebuild;
 use crate::sysres::{timed_loop, timed_pool_loop, LoopStats};
 use crate::uacce;
@@ -228,16 +229,21 @@ pub fn run(args: &[String]) -> i32 {
         return bench_async_compress(&a, &data, block, nblocks);
     }
 
-    // native uacce engine path (compress only; no C library in the process)
+    // native uacce engine path (no C library in the process): compress
+    // drives the raw lz77 pump, decompress decodes the rebuilt LZ4 blocks
+    // with the in-crate decoder (decompression is software in every impl)
     if a.impl_name == IMPL_NATIVE {
-        if a.op != "compress" {
-            println!(
-                "RESULT status=UNSUPPORTED impl=native op={} note=native_compress_only",
-                a.op
-            );
-            return EXIT_USAGE;
+        match a.op.as_str() {
+            "compress" => return bench_native(&a, &data, block, nblocks),
+            "decompress" => return bench_native_decompress(&a, &data, block, nblocks),
+            other => {
+                println!(
+                    "RESULT status=UNSUPPORTED impl=native op={} note=native_compress_decompress_only",
+                    other
+                );
+                return EXIT_USAGE;
+            }
         }
-        return bench_native(&a, &data, block, nblocks);
     }
 
     // --workers >1 turns sw/hw into the threaded block pool form (the
@@ -441,6 +447,24 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
     EXIT_OK
 }
 
+/// The native knobs shared by both ops: `KAE_NATIVE_DEPTH` in-flight
+/// requests per queue (default 8, capped at the engine's queue depth),
+/// `KAE_NATIVE_DB_BATCH` SQEs per doorbell (default = depth) and
+/// `KAE_NATIVE_WAIT` — `spin` (default) or `poll` (sleep on the uacce fd).
+fn native_knobs() -> (usize, usize, bool) {
+    let env_num = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    let depth = env_num("KAE_NATIVE_DEPTH", 8).min(uacce::QM_Q_DEPTH);
+    let batch = env_num("KAE_NATIVE_DB_BATCH", depth);
+    let wait_poll = std::env::var("KAE_NATIVE_WAIT").map(|v| v == "poll").unwrap_or(false);
+    (depth, batch, wait_poll)
+}
+
 /// `native`: drive the ZIP engine through the crate's own uacce module — no
 /// libwd, no patched library, and no payload copies in the timed loop (the
 /// workload sits in DMA-visible SS memory once at setup). The request size
@@ -460,23 +484,16 @@ fn bench_async_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usiz
 /// and `ratio_pct` is the true LZ4 block ratio of the sample blocks. Falls
 /// back to the pre-rebuild engine output ratio when no sample is possible
 /// (deflate dialect, block not a request multiple, manual run without
-/// `--sample-out`); the note field names the fallback.
+/// `--sample-out`); a rebuild failure demotes the same way — the timed
+/// engine numbers stand, the note records `sample=failed:<cause>` and the
+/// ratio is the pre-rebuild one.
 fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let devices = uacce::zip_devices();
     if devices.is_empty() {
         println!("RESULT status=NO_DEVICE impl=native op=compress note=no_hisi_zip_uacce_node");
         return EXIT_OPEN_FAIL;
     }
-    let env_num = |name: &str, default: usize| -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(default)
-    };
-    let depth = env_num("KAE_NATIVE_DEPTH", 8).min(uacce::QM_Q_DEPTH);
-    let batch = env_num("KAE_NATIVE_DB_BATCH", depth);
-    let wait_poll = std::env::var("KAE_NATIVE_WAIT").map(|v| v == "poll").unwrap_or(false);
+    let (depth, batch, wait_poll) = native_knobs();
     let alg = match std::env::var("KAE_NATIVE_ALG").as_deref() {
         Ok("deflate") => uacce::NativeAlg::Deflate,
         _ => uacce::NativeAlg::Lz77,
@@ -550,11 +567,12 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
                     ratio_pct = packed as f64 / (count as u64 * block as u64) as f64 * 100.0;
                 }
                 Err(e) => {
-                    println!(
-                        "RESULT status=COMPRESS_FAIL impl=native op=compress block={} at=sample err={}",
-                        block, e
-                    );
-                    return EXIT_COMPRESS_FAIL;
+                    // the timed engine numbers stand; the sample is the
+                    // cross-validation extra, so a failure here demotes the
+                    // cell to the pre-rebuild ratio and records the cause
+                    // (the orchestrator surfaces err= in the row note)
+                    eprintln!("worker: native sample rebuild failed: {e}");
+                    sample_note = format!(",sample=failed:{}", flat(&e));
                 }
             }
         }
@@ -589,6 +607,181 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
     EXIT_OK
 }
 
+/// `native` decompress: decode the standard LZ4 blocks the native pipeline
+/// produces, with the in-crate decoder (`src/lz4dec.rs`) — no C library in
+/// the process, and the same software-decode work every other
+/// implementation's decompress cell measures (KAE accelerates compression
+/// only; sw/hw decode is liblz4's software instead of this). Setup
+/// (untimed): one lz77 request per `req_size` slice rebuilds every block
+/// into standard LZ4 (the compress cell's sample path, over all blocks),
+/// then a warm-up self-check decodes each block and requires the original
+/// bytes back. The timed loop and the accounting match [`bench_decompress`]:
+/// decompressed bytes / wall clock, user+sys per GB. Needs the lz77 dialect
+/// (the deflate output is not LZ4) and blocks that are request-size
+/// multiples.
+fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    if std::env::var("KAE_NATIVE_ALG").as_deref() == Ok("deflate") {
+        println!(
+            "RESULT status=UNSUPPORTED impl=native op=decompress note=decode_needs_the_lz77_dialect"
+        );
+        return EXIT_USAGE;
+    }
+    let devices = uacce::zip_devices();
+    if devices.is_empty() {
+        println!("RESULT status=NO_DEVICE impl=native op=decompress note=no_hisi_zip_uacce_node");
+        return EXIT_OPEN_FAIL;
+    }
+    let req_size = block.min(uacce::MAX_LZ77_REQ);
+    if block % req_size != 0 {
+        println!(
+            "RESULT status=UNSUPPORTED impl=native op=decompress note=block_not_request_multiple"
+        );
+        return EXIT_USAGE;
+    }
+    let (depth, batch, wait_poll) = native_knobs();
+    // the rebuild setup is one request in flight on one queue; the pump
+    // knobs still shape that queue's behavior
+    let mut pump = match uacce::NativePump::open(
+        &devices,
+        1,
+        req_size,
+        depth,
+        batch,
+        wait_poll,
+        uacce::NativeAlg::Lz77,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            println!(
+                "RESULT status=OPEN_FAIL impl=native op=decompress err={}",
+                flat(&e)
+            );
+            return EXIT_OPEN_FAIL;
+        }
+    };
+    pump.run(0.1); // settle the queue the same way a bench run does
+
+    // untimed setup: rebuild every block from its hardware triples into
+    // standard LZ4
+    let per_block = block / req_size;
+    let mut blob: Vec<u8> = Vec::with_capacity(data.len());
+    let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
+    let mut stream = Vec::new();
+    for b in 0..nblocks {
+        let base = blob.len();
+        for r in 0..per_block {
+            let off = b * block + r * req_size;
+            let sample = match pump.sample_triples(&data[off..off + req_size]) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!(
+                        "RESULT status=COMPRESS_FAIL impl=native op=decompress block={} at=triples err={}",
+                        block,
+                        flat(&e)
+                    );
+                    return EXIT_COMPRESS_FAIL;
+                }
+            };
+            let n = match rebuild::lz77_block(&data[off..off + req_size], &sample.seqs, &mut stream)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    let detail = format!(
+                        "{e} (lit={} seqs={})",
+                        sample.lit,
+                        sample.seqs.len() / 8
+                    );
+                    println!(
+                        "RESULT status=COMPRESS_FAIL impl=native op=decompress block={} at=rebuild err={}",
+                        block,
+                        flat(&detail)
+                    );
+                    return EXIT_COMPRESS_FAIL;
+                }
+            };
+            blob.extend_from_slice(&stream[..n]);
+        }
+        extents.push((base, blob.len() - base));
+    }
+    let out_bytes = blob.len() as u64;
+
+    // warm-up self-check: the decoder returns every block's original bytes
+    let mut plain = vec![0u8; block];
+    for (b, &(off, len)) in extents.iter().enumerate() {
+        let expect = &data[b * block..(b + 1) * block];
+        match lz4dec::decode_block(&blob[off..off + len], &mut plain) {
+            Ok(n) if n == block && plain.as_slice() == expect => {}
+            other => {
+                let err = other.err().unwrap_or_else(|| "size_mismatch".into());
+                println!(
+                    "RESULT status=DECOMPRESS_MISMATCH impl=native op=decompress block={} at={} err={}",
+                    block,
+                    b,
+                    flat(&err)
+                );
+                return EXIT_VERIFY_FAIL;
+            }
+        }
+    }
+
+    // timed decode loop; throughput counts the decompressed bytes, and a
+    // mid-loop failure fails the cell instead of silently deflating them
+    let mut decode_err: Option<String> = None;
+    let st = timed_loop(
+        nblocks,
+        |b| {
+            if decode_err.is_some() {
+                return 0;
+            }
+            let (off, len) = extents[b];
+            match lz4dec::decode_block(&blob[off..off + len], &mut plain) {
+                Ok(n) if n == block => n,
+                Ok(_) => {
+                    decode_err = Some("size_mismatch".into());
+                    0
+                }
+                Err(e) => {
+                    decode_err = Some(e);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = decode_err {
+        println!(
+            "RESULT status=DECOMPRESS_MISMATCH impl=native op=decompress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_VERIFY_FAIL;
+    }
+    let in_bytes = (nblocks as u64) * (block as u64) * st.passes; // decompressed bytes
+    let note = format!(
+        "native,alg=lz77,depth={},wait={},req_size={},decode=rust,rebuild_reqs={}",
+        depth,
+        if wait_poll { "poll" } else { "spin" },
+        req_size,
+        nblocks * per_block,
+    );
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVE,
+        op: "decompress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes,
+        out_bytes,
+        // the ratio is a compression metric; it stays 0 for decompress rows
+        ratio_pct: 0.0,
+        note: &note,
+    });
+    EXIT_OK
+}
+
 /// Rebuild the first blocks of the workload into standard LZ4 blocks (one
 /// hardware request per `req_size` slice, engine idle after the timed run)
 /// and write the packed sample file. Returns (rebuilt bytes, blocks
@@ -613,8 +806,13 @@ fn build_native_sample(
             let chunk = &data[off..off + req_size];
             let sample = pump.sample_triples(chunk)?;
             let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream).map_err(|e| {
+                // the first triples' hex rides along: the layout evidence
+                // the failure is about, visible in the row note on the
+                // target machine without a rerun under a debugger
+                let head: String =
+                    sample.seqs.iter().take(64).map(|b| format!("{b:02x}")).collect();
                 format!(
-                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={})",
+                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
                     sample.lit,
                     sample.seqs.len() / 8,
                     sample.ll_overflow_cnt,
