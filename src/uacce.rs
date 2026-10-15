@@ -629,6 +629,7 @@ impl Queue {
         let seq_area = unsafe { optr.add(lit_cap) };
         let ck = u32::from_le(sqe.checksum);
         Ok(Lz77Sample {
+            lits: unsafe { std::slice::from_raw_parts(optr, lit) }.to_vec(),
             seqs: unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) }.to_vec(),
             lit,
             ll_overflow_cnt: ck >> 24,
@@ -782,6 +783,10 @@ pub struct Lz77Sample {
     pub seqs: Vec<u8>,
     /// literal byte count (comp_data_length)
     pub lit: usize,
+    /// the engine's literals area (`lit` bytes): the rebuild takes
+    /// literals from the input instead, so the area is the ground truth
+    /// to diff against when a rebuilt block decodes wrong
+    pub lits: Vec<u8>,
     /// literal-length overflow report (checksum dw): count and position
     pub ll_overflow_cnt: u32,
     pub ll_overflow_pos: u32,
@@ -1052,6 +1057,39 @@ mod hw_tests {
             crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
         assert_eq!(decoded, chunk.len());
         assert_eq!(&dst[..decoded], chunk, "rebuild output must decode to the input");
+
+        // the vendor oracle: kaelz4's own LZ4 block for the same input.
+        // This one test loads the vendor stack (the other native tests
+        // keep the process free of it) — a byte difference against our
+        // rebuild localizes the triple rule at fault.
+        let vendor = crate::KaeLz4::open_hw()
+            .expect("open the patched liblz4 stack")
+            .compress_vec(chunk)
+            .expect("vendor compress of the same input");
+        let mut vdst = vec![0u8; chunk.len()];
+        let vn = crate::lz4dec::decode_block(&vendor, &mut vdst).expect("vendor block decodes");
+        assert_eq!(vn, chunk.len());
+        assert_eq!(&vdst[..vn], chunk, "vendor oracle sanity");
+        if block[..n] != vendor[..] {
+            let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let d = block[..n].iter().zip(vendor.iter()).position(|(a, b)| a != b);
+            eprintln!(
+                "native: rebuild {}B vs vendor {}B, first diff at {d:?}",
+                n,
+                vendor.len()
+            );
+            if let Some(d) = d {
+                let lo = d.saturating_sub(16);
+                eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
+                eprintln!("native: vendor: {}", hx(&vendor[lo..(d + 16).min(vendor.len())]));
+            }
+            eprintln!("native: triples: {}", hx(&sample.seqs));
+        }
+        assert_eq!(
+            &block[..n],
+            &vendor[..],
+            "native rebuild differs from the vendor oracle on the same input"
+        );
     }
 }
 

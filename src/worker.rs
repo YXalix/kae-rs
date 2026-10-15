@@ -607,11 +607,20 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
     EXIT_OK
 }
 
+/// Hex for the failure dumps.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// A rebuild failure plus the sample evidence needed to read it off a
 /// bench row or TSV note: the completion-report literals/triples, the
 /// ll-overflow report and the first triples' hex.
 fn rebuild_fail_detail(sample: &uacce::Lz77Sample, e: &str) -> String {
-    let head: String = sample.seqs.iter().take(64).map(|b| format!("{b:02x}")).collect();
+    let head = hex(&sample.seqs[..sample.seqs.len().min(64)]);
     format!(
         "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
         sample.lit,
@@ -619,6 +628,53 @@ fn rebuild_fail_detail(sample: &uacce::Lz77Sample, e: &str) -> String {
         sample.ll_overflow_cnt,
         sample.ll_overflow_pos
     )
+}
+
+/// Decode one rebuilt request block and require the original bytes back;
+/// the error names the first diverging byte so a dump can be read
+/// against it.
+fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
+    let mut dst = vec![0u8; input.len()];
+    match lz4dec::decode_block(block, &mut dst) {
+        Ok(n) if n == input.len() && dst.as_slice() == input => Ok(()),
+        Ok(n) => match dst[..n].iter().zip(input).position(|(a, b)| a != b) {
+            Some(d) => Err(format!(
+                "first diff at {d}B: got 0x{:02x} want 0x{:02x}",
+                dst[d], input[d]
+            )),
+            None => Err(format!("decoded {n}B of {}B", input.len())),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// The full evidence for one failed rebuild check on the worker's
+/// stderr: the request's triples, the rebuilt block, the engine's
+/// literals area and the input — enough to replay the triple rules
+/// offline.
+fn dump_rebuild_check(
+    req_idx: usize,
+    off: usize,
+    sample: &uacce::Lz77Sample,
+    input: &[u8],
+    block: &[u8],
+    e: &str,
+) {
+    eprintln!(
+        "native: request {req_idx} (data {off}..{}) rebuild check failed: {e}",
+        off + input.len()
+    );
+    eprintln!(
+        "native: lit={} ll_overflow_cnt={} ll_overflow_pos={} seqs={}",
+        sample.lit,
+        sample.ll_overflow_cnt,
+        sample.ll_overflow_pos,
+        sample.seqs.len() / 8
+    );
+    eprintln!("native: triples: {}", hex(&sample.seqs));
+    eprintln!("native: block: {}", hex(block));
+    eprintln!("native: lits: {}", hex(&sample.lits));
+    eprintln!("native: input: {}", hex(input));
 }
 
 /// `native` decompress: decode the standard LZ4 blocks the native pipeline
@@ -709,30 +765,32 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
                     return EXIT_COMPRESS_FAIL;
                 }
             };
+            // the rebuild self-check: the decoded block must be the
+            // original bytes, per request, before anything is timed
+            let req_idx = b * per_block + r;
+            if let Err(e) = check_rebuilt_request(&data[off..off + req_size], &stream[..n]) {
+                dump_rebuild_check(
+                    req_idx,
+                    off,
+                    &sample,
+                    &data[off..off + req_size],
+                    &stream[..n],
+                    &e,
+                );
+                println!(
+                    "RESULT status=DECOMPRESS_MISMATCH impl=native op=decompress block={} req={req_idx} at=rebuild_check err={}",
+                    block,
+                    flat(&e)
+                );
+                return EXIT_VERIFY_FAIL;
+            }
             blob.extend_from_slice(&stream[..n]);
         }
         extents.push((base, blob.len() - base));
     }
     let out_bytes = blob.len() as u64;
 
-    // warm-up self-check: the decoder returns every block's original bytes
     let mut plain = vec![0u8; block];
-    for (b, &(off, len)) in extents.iter().enumerate() {
-        let expect = &data[b * block..(b + 1) * block];
-        match lz4dec::decode_block(&blob[off..off + len], &mut plain) {
-            Ok(n) if n == block && plain.as_slice() == expect => {}
-            other => {
-                let err = other.err().unwrap_or_else(|| "size_mismatch".into());
-                println!(
-                    "RESULT status=DECOMPRESS_MISMATCH impl=native op=decompress block={} at={} err={}",
-                    block,
-                    b,
-                    flat(&err)
-                );
-                return EXIT_VERIFY_FAIL;
-            }
-        }
-    }
 
     // timed decode loop; throughput counts the decompressed bytes, and a
     // mid-loop failure fails the cell instead of silently deflating them
@@ -817,6 +875,10 @@ fn build_native_sample(
             let sample = pump.sample_triples(chunk)?;
             let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream)
                 .map_err(|e| rebuild_fail_detail(&sample, &e))?;
+            if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
+                dump_rebuild_check(b * per_block + r, off, &sample, chunk, &stream[..n], &e);
+                return Err(format!("rebuild check: {e} (block {b} request {r})"));
+            }
             packed.extend_from_slice(&stream[..n]);
         }
         lens.push(packed.len() - base);
