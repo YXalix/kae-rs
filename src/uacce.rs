@@ -1026,6 +1026,33 @@ mod hw_tests {
         assert_eq!(decoded, data.len());
         assert_eq!(&dst[..decoded], &data[..], "rebuild output must decode to the input");
     }
+
+    /// The shape the 8K+ bench requests hit on the mixed layout: one
+    /// request spanning the first random -> text page pair, a
+    /// literal-only stretch ahead of matches. Rebuild + decode must
+    /// return the input.
+    #[test]
+    #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
+    fn hw_lz77_page_boundary_rebuilds_to_decodable_lz4() {
+        let devices = zip_devices();
+        assert!(!devices.is_empty(), "needs /dev/hisi_zip-* uacce nodes");
+        let req = 8192;
+        let mut pump = NativePump::open(&devices, 1, req, 8, 8, false, NativeAlg::Lz77)
+            .expect("open native queue");
+        pump.run(0.2); // settle the queue the same way a bench run does
+        let mut data = vec![0u8; 8 * 4096];
+        crate::data::fill_pages(&mut data);
+        let chunk = &data[6 * 4096..6 * 4096 + req]; // pages 6-7: random, then text
+        let sample = pump.sample_triples(chunk).expect("sample request");
+
+        let mut block = Vec::new();
+        let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block).expect("rebuild");
+        let mut dst = vec![0u8; chunk.len()];
+        let decoded =
+            crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
+        assert_eq!(decoded, chunk.len());
+        assert_eq!(&dst[..decoded], chunk, "rebuild output must decode to the input");
+    }
 }
 
 // The QP number (doorbell identity) is captured from SET_QP_CTX at open

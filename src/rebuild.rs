@@ -40,7 +40,7 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     let mut rep = [1usize, 4, 8];
     let mut pending_lit = 0usize;
     let mut ip = 0usize;
-    for t in seqs.chunks_exact(8) {
+    for (ti, t) in seqs.chunks_exact(8).enumerate() {
         let off_base = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
         let lit_len = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
         let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
@@ -48,13 +48,17 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
             pending_lit += lit_len + 3;
             continue;
         }
-        let off = resolve_offset(off_base, lit_len, &mut rep)?;
+        // the literal run covers the literal-only triples folded in ahead
+        // of this match; the repeat-code rules branch on that whole run
+        let lit = lit_len + pending_lit;
+        pending_lit = 0;
+        let off = resolve_offset(off_base, lit, &mut rep).map_err(|e| {
+            format!("{e} (triple {ti}, rep=[{}, {}, {}])", rep[0], rep[1], rep[2])
+        })?;
         // the token nibble carries mlBase - 1; the decoder's match length
         // is nibble + 4 = mlBase + 3
         let nib = ml_base - 1;
         let ml = nib + 4;
-        let lit = lit_len + pending_lit;
-        pending_lit = 0;
         if ip + lit > input.len() {
             return Err(format!(
                 "triple literals overrun the input (at {}+{}/{}B)",
@@ -121,6 +125,8 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
 /// is `offset + 3` and shifts the history down; offBase 1..3 are repeat
 /// codes over the recent offsets, where a zero-length literal run swaps
 /// entries instead of only rotating them (zstd's offset update rules).
+/// `lit_len` is the match's whole literal run — literal-only triples are
+/// already folded in — which is the length zstd's rules branch on.
 fn resolve_offset(off_base: usize, lit_len: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
     if off_base == 0 {
         return Err("triple offBase is 0".into());
@@ -289,6 +295,35 @@ mod tests {
             b"kkkk",                // repeat 1 after a zero run -> 4
             b"kkkk",                // repeat 1 after a zero run -> 1 (RLE)
             b"l",                   // tail literal
+        ]
+        .concat();
+        roundtrip(&input, &seqs);
+    }
+
+    /// A literal-only triple (mlBase 0) folds into the next match's
+    /// literal run: at litLength 0 that match is not ll0, so repeat code 3
+    /// resolves to rep[2] and repeat code 1 keeps rep[0] without the
+    /// zero-run swap.
+    #[test]
+    fn repeat_codes_after_a_literal_only_triple_see_the_folded_literal_run() {
+        let seqs = [
+            triple(6 + 3, 8, 1), // literals "abcdefgh", match at offset 6
+            triple(4 + 3, 0, 1), // explicit offset 4 -> rep [4, 6, 1]
+            triple(0, 5, 0),     // literal-only triple: 8 pending literals
+            triple(3, 0, 1),     // repeat code 3 at litLength 0 -> rep[2] = 1 (RLE)
+            triple(0, 2, 0),     // literal-only triple: 5 pending literals
+            triple(1, 0, 1),     // repeat code 1 at litLength 0 -> rep[0] = 1, no swap
+        ]
+        .concat();
+        let input = [
+            b"abcdefgh".as_slice(),
+            b"cdef",     // offset 6 match
+            b"cdef",     // offset 4 match
+            b"ijklmnop", // folded literals
+            b"pppp",     // offset 1 RLE match
+            b"abcde",    // folded literals
+            b"eeee",     // offset 1 RLE match
+            b"Z",        // tail
         ]
         .concat();
         roundtrip(&input, &seqs);

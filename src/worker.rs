@@ -607,6 +607,20 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
     EXIT_OK
 }
 
+/// A rebuild failure plus the sample evidence needed to read it off a
+/// bench row or TSV note: the completion-report literals/triples, the
+/// ll-overflow report and the first triples' hex.
+fn rebuild_fail_detail(sample: &uacce::Lz77Sample, e: &str) -> String {
+    let head: String = sample.seqs.iter().take(64).map(|b| format!("{b:02x}")).collect();
+    format!(
+        "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
+        sample.lit,
+        sample.seqs.len() / 8,
+        sample.ll_overflow_cnt,
+        sample.ll_overflow_pos
+    )
+}
+
 /// `native` decompress: decode the standard LZ4 blocks the native pipeline
 /// produces, with the in-crate decoder (`src/lz4dec.rs`) — no C library in
 /// the process, and the same software-decode work every other
@@ -686,11 +700,7 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
             {
                 Ok(n) => n,
                 Err(e) => {
-                    let detail = format!(
-                        "{e} (lit={} seqs={})",
-                        sample.lit,
-                        sample.seqs.len() / 8
-                    );
+                    let detail = rebuild_fail_detail(&sample, &e);
                     println!(
                         "RESULT status=COMPRESS_FAIL impl=native op=decompress block={} at=rebuild err={}",
                         block,
@@ -805,20 +815,8 @@ fn build_native_sample(
             let off = b * block + r * req_size;
             let chunk = &data[off..off + req_size];
             let sample = pump.sample_triples(chunk)?;
-            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream).map_err(|e| {
-                // the first triples' hex rides along: the layout evidence
-                // the failure is about, visible in the row note on the
-                // target machine without a rerun under a debugger
-                let head: String =
-                    sample.seqs.iter().take(64).map(|b| format!("{b:02x}")).collect();
-                format!(
-                    "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
-                    sample.lit,
-                    sample.seqs.len() / 8,
-                    sample.ll_overflow_cnt,
-                    sample.ll_overflow_pos
-                )
-            })?;
+            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream)
+                .map_err(|e| rebuild_fail_detail(&sample, &e))?;
             packed.extend_from_slice(&stream[..n]);
         }
         lens.push(packed.len() - base);

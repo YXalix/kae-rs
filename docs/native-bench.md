@@ -172,9 +172,12 @@ number taken under it is a floor.
   depth instead.
 - The rebuild is unit-tested against the system liblz4
   (`rebuild_decodes_with_system_liblz4`) and against hardware by the
-  `#[ignore]`d test `hw_lz77_sample_rebuilds_to_decodable_lz4`
-  (`cargo test -- --ignored` on the target machine); the bench verify op
-  re-checks every run's sample.
+  `#[ignore]`d tests `hw_lz77_sample_rebuilds_to_decodable_lz4` and
+  `hw_lz77_page_boundary_rebuilds_to_decodable_lz4` (a request spanning a
+  random -> text page pair of the mixed layout, the shape that exercises
+  literal-only triples ahead of repeat codes; `cargo test -- --ignored`
+  on the target machine); the bench verify op re-checks every run's
+  sample.
 - `src/uacce.rs` is the module of record for the ABI: every constant is
   copied, not guessed, with its source called out next to the definition
   (uacce UAPI, `hisi_qm.h` ioctls, `uadk/v1/drv/hisi_qm_udrv.{c,h}` for
