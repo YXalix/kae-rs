@@ -1043,14 +1043,27 @@ mod hw_tests {
         assert_eq!(&dst[..decoded], &data[..], "rebuild output must decode to the input");
     }
 
-    /// The two multi-page shapes the 8K+ bench requests fail on: a text
-    /// page pair with a 17-byte pattern period (repeat codes fire mid
-    /// page), and a text -> zeros page pair (the parse switches from a
-    /// periodic offset to offset-1 runs). For each, the vendor oracle —
-    /// kaelz4's own LZ4 block for the same input — is diffed byte-wise
-    /// against our rebuild, and everything is printed before any assert
-    /// so one run reads out the rule at fault. This one test loads the
-    /// vendor stack; the other native tests keep the process free of it.
+    /// The two multi-page shapes the bench requests hit at page
+    /// boundaries: a text page pair with a 17-byte pattern period, and a
+    /// text -> zeros page pair (the parse switches from a periodic offset
+    /// to offset-1 runs). The vendor oracle is kaelz4's own LZ4 block for
+    /// the same input: the patched liblz4 compresses through the same
+    /// engine and converts its triples 1:1 (kaelz4_triples_rebuild), so
+    /// both blocks encode the same kind of parse. The asserted contract:
+    ///
+    /// - our rebuild decodes back to the input;
+    /// - our parse equals the vendor's parse once consecutive
+    ///   same-offset matches merge into runs. Byte equality is not
+    ///   required — the engine splits a long same-offset run at a
+    ///   different point on every request (one input, three consecutive
+    ///   parses: 252|48|252x14|248, 204|252x15|92, 44|192|252x15|60 over
+    ///   the same 20..4096 run), so the vendor block lands on an
+    ///   arbitrary one of those choppings;
+    /// - a resample of the same request normalizes to the same runs.
+    ///
+    /// This one test loads the vendor stack; the other native tests keep
+    /// the process free of it. Everything is printed before any assert so
+    /// one on-target run reads out the rule at fault.
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_page_boundary_rebuilds_to_decodable_lz4() {
@@ -1068,9 +1081,8 @@ mod hw_tests {
         let mut problems = Vec::new();
         for first_page in [9, 18] {
             let chunk = &data[first_page * 4096..first_page * 4096 + req];
-            // sample the same request twice: the LZ77_ONLY parse is a pure
-            // function of the input, so a difference here means queue
-            // state the vendor comparison has to account for
+            // sample the same request twice: consecutive parses of one
+            // input may split matches differently, never cover new spans
             let sample = pump.sample_triples(chunk).expect("sample request");
             let resample = pump.sample_triples(chunk).expect("resample request");
             eprintln!(
@@ -1101,15 +1113,21 @@ mod hw_tests {
             let mut block = Vec::new();
             let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block).expect("rebuild");
             let mut dst = vec![0u8; chunk.len()];
+            let mut decoded = false;
             match crate::lz4dec::decode_block(&block[..n], &mut dst) {
                 Ok(m) if &dst[..m] == chunk => {
                     eprintln!("native: rebuild decodes to the input ({n}B)");
+                    decoded = true;
                 }
                 Ok(m) => {
                     let d = dst[..m].iter().zip(chunk).position(|(a, b)| a != b);
-                    eprintln!("native: rebuild decodes to {m}B, first diff at {d:?}");
+                    problems.push(format!(
+                        "pages {first_page}: rebuild decodes to {m}B, first diff at {d:?}"
+                    ));
                 }
-                Err(e) => eprintln!("native: rebuild decode failed: {e}"),
+                Err(e) => problems.push(format!(
+                    "pages {first_page}: rebuild decode failed: {e}"
+                )),
             }
 
             let vblock = vendor.compress_vec(chunk).expect("vendor compress");
@@ -1121,38 +1139,85 @@ mod hw_tests {
             for line in lz4_sequences(&vblock) {
                 eprintln!("vendor: {line}");
             }
-            if block[..n] != vblock[..] {
-                let d = block[..n].iter().zip(vblock.iter()).position(|(a, b)| a != b);
-                eprintln!(
-                    "native: rebuild {n}B vs vendor {}B, first diff at {d:?}",
-                    vblock.len()
-                );
-                if let Some(d) = d {
-                    let lo = d.saturating_sub(16);
-                    eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
-                    eprintln!(
-                        "native: vendor: {}",
-                        hx(&vblock[lo..(d + 16).min(vblock.len())])
-                    );
-                }
+            if !decoded {
+                continue;
+            }
+
+            // Same engine either side, so the parses must agree; only the
+            // chop of a long same-offset run is free to differ.
+            let ours = walk_lz4_block(&block[..n]);
+            let theirs = walk_lz4_block(&vblock);
+            let our_runs = match_runs(&ours);
+            if our_runs != match_runs(&theirs) || ours.tail_len != theirs.tail_len {
+                let at = runs_mismatch(&our_runs, &match_runs(&theirs)).unwrap_or_else(|| {
+                    format!("tail {}B vs {}B", ours.tail_len, theirs.tail_len)
+                });
                 problems.push(format!(
-                    "pages {first_page}: rebuild {}B vs vendor {}B, first diff at {d:?}",
-                    n,
-                    vblock.len()
+                    "pages {first_page}: parse diverges from the vendor oracle ({at})"
                 ));
-            } else {
+                continue;
+            }
+
+            // the resample may chop differently but must cover the same runs
+            let mut rblock = Vec::new();
+            let rn = crate::rebuild::lz77_block(chunk, &resample.seqs, &mut rblock)
+                .expect("rebuild resample");
+            let mut rdst = vec![0u8; chunk.len()];
+            match crate::lz4dec::decode_block(&rblock[..rn], &mut rdst) {
+                Ok(m) if &rdst[..m] == chunk => {
+                    let resampled = match_runs(&walk_lz4_block(&rblock[..rn]));
+                    if resampled != our_runs {
+                        let at = runs_mismatch(&resampled, &our_runs)
+                            .expect("mismatch reports the differing run");
+                        problems.push(format!(
+                            "pages {first_page}: resample parse diverges from run 1 ({at})"
+                        ));
+                    }
+                }
+                Ok(m) => problems.push(format!(
+                    "pages {first_page}: resample rebuild decodes to {m}B, not the input"
+                )),
+                Err(e) => problems.push(format!(
+                    "pages {first_page}: resample rebuild decode failed: {e}"
+                )),
+            }
+
+            if block[..n] == vblock[..] {
                 eprintln!("native: rebuild matches the vendor oracle byte-for-byte");
+                continue;
+            }
+            let d = block[..n].iter().zip(vblock.iter()).position(|(a, b)| a != b);
+            eprintln!(
+                "native: rebuild {n}B vs vendor {}B, first diff at {d:?} \
+                 (parse equal across {} runs; split variance only)",
+                vblock.len(),
+                our_runs.len()
+            );
+            if let Some(d) = d {
+                let lo = d.saturating_sub(16);
+                eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
+                eprintln!(
+                    "native: vendor: {}",
+                    hx(&vblock[lo..(d + 16).min(vblock.len())])
+                );
             }
         }
         assert!(problems.is_empty(), "{}", problems.join("; "));
     }
 
-    /// Walk a well-formed LZ4 block and describe each sequence: the
-    /// literal run's input span, then the match's offset, length, and
-    /// output span. One line each, so a hardware-run log carries the
-    /// vendor's exact parse without wrapped hex.
-    fn lz4_sequences(block: &[u8]) -> Vec<String> {
-        let mut lines = Vec::new();
+    /// A block walked end to end: every sequence as (literal length,
+    /// literal position in the output, match offset, match length), then
+    /// the unmatched tail literal run.
+    struct Lz4Walk {
+        seqs: Vec<(usize, usize, usize, usize)>,
+        tail_at: usize,
+        tail_len: usize,
+    }
+
+    /// Walk a well-formed LZ4 block sequence by sequence; a block always
+    /// ends with a literal run, recorded as the tail.
+    fn walk_lz4_block(block: &[u8]) -> Lz4Walk {
+        let mut seqs = Vec::new();
         let (mut i, mut out) = (0usize, 0usize);
         while i < block.len() {
             let tok = block[i];
@@ -1172,8 +1237,11 @@ mod hw_tests {
             i += lit;
             out += lit;
             if i == block.len() {
-                lines.push(format!("final: lit {lit} at {lit_at}..{out}"));
-                return lines;
+                return Lz4Walk {
+                    seqs,
+                    tail_at: lit_at,
+                    tail_len: lit,
+                };
             }
             let off = u16::from_le_bytes(block[i..i + 2].try_into().unwrap()) as usize;
             i += 2;
@@ -1188,13 +1256,102 @@ mod hw_tests {
                     }
                 }
             }
-            let end = out + ml;
-            lines.push(format!(
-                "seq: lit {lit} at {lit_at}..{out} match off {off} ml {ml} span {out}..{end}"
-            ));
-            out = end;
+            seqs.push((lit, lit_at, off, ml));
+            out += ml;
         }
+        unreachable!("block ends mid-sequence at {i}");
+    }
+
+    /// The chop-invariant form of a parse: consecutive same-offset matches
+    /// with no literals between them merge into one (start, end, offset)
+    /// run. The engine splits a long run at a different point on every
+    /// request, so two parses of one input compare equal exactly when they
+    /// cover the same spans at the same offsets.
+    fn match_runs(walk: &Lz4Walk) -> Vec<(usize, usize, usize)> {
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for &(lit, lit_at, off, ml) in &walk.seqs {
+            let start = lit_at + lit;
+            let extends = lit == 0
+                && runs
+                    .last()
+                    .is_some_and(|&(_, end, run_off)| end == start && run_off == off);
+            if extends {
+                runs.last_mut().unwrap().1 = start + ml;
+            } else {
+                runs.push((start, start + ml, off));
+            }
+        }
+        runs
+    }
+
+    /// First divergence between two run lists, for a failure message.
+    fn runs_mismatch(a: &[(usize, usize, usize)], b: &[(usize, usize, usize)]) -> Option<String> {
+        let i = a
+            .iter()
+            .zip(b)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()));
+        (i != a.len() || a.len() != b.len())
+            .then(|| format!("run {i}: {:?} vs {:?}", a.get(i), b.get(i)))
+    }
+
+    /// Walk a well-formed LZ4 block and describe each sequence: the
+    /// literal run's input span, then the match's offset, length, and
+    /// output span. One line each, so a hardware-run log carries the
+    /// vendor's exact parse without wrapped hex.
+    fn lz4_sequences(block: &[u8]) -> Vec<String> {
+        let walk = walk_lz4_block(block);
+        let mut lines = Vec::new();
+        for &(lit, lit_at, off, ml) in &walk.seqs {
+            let at = lit_at + lit;
+            lines.push(format!(
+                "seq: lit {lit} at {lit_at}..{at} match off {off} ml {ml} span {at}..{}",
+                at + ml
+            ));
+        }
+        lines.push(format!(
+            "final: lit {} at {}..{}",
+            walk.tail_len,
+            walk.tail_at,
+            walk.tail_at + walk.tail_len
+        ));
         lines
+    }
+
+    /// The oracle comparison normalizes parses through `walk_lz4_block`
+    /// plus `match_runs`; both must see one split sequence and one merged
+    /// run as the same coverage. No hardware needed.
+    #[test]
+    fn lz4_walk_merges_same_offset_splits_into_runs() {
+        // one LZ77_ONLY triple: [u32 litLength][u16 offBase][u16 mlBase]
+        let triple = |off: usize, lit: u32, ml_base: u16| {
+            let mut t = [0u8; 8];
+            t[0..4].copy_from_slice(&lit.to_le_bytes());
+            t[4..6].copy_from_slice(&(off.saturating_sub(1) as u16).to_le_bytes());
+            t[6..8].copy_from_slice(&ml_base.to_le_bytes());
+            t
+        };
+        let input = b"abababababababab";
+        let block = |seqs: &[u8]| {
+            let mut out = Vec::new();
+            let n = crate::rebuild::lz77_block(input, seqs, &mut out).expect("rebuild");
+            out.truncate(n);
+            out
+        };
+        // one 12-byte match at offset 2, and the same coverage chopped in
+        // two same-offset matches: different blocks, one run
+        let merged = walk_lz4_block(&block(&[triple(2, 2, 9)].concat()));
+        let split = walk_lz4_block(&block(&[triple(2, 2, 3), triple(2, 0, 3)].concat()));
+        assert_eq!(merged.seqs, [(2, 0, 2, 12)]);
+        assert_eq!(split.seqs, [(2, 0, 2, 6), (0, 8, 2, 6)]);
+        assert_eq!((merged.tail_at, merged.tail_len), (14, 2));
+        assert_eq!((split.tail_at, split.tail_len), (14, 2));
+        assert_eq!(match_runs(&merged), vec![(2, 14, 2)]);
+        assert_eq!(match_runs(&split), match_runs(&merged));
+        // a literal between two matches keeps them separate, even at the
+        // same offset
+        let apart = walk_lz4_block(&block(&[triple(2, 2, 3), triple(4, 2, 3)].concat()));
+        assert_eq!(match_runs(&apart), vec![(2, 8, 2), (10, 16, 4)]);
     }
 }
 
