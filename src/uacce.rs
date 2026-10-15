@@ -1032,10 +1032,14 @@ mod hw_tests {
         assert_eq!(&dst[..decoded], &data[..], "rebuild output must decode to the input");
     }
 
-    /// The shape the 8K+ bench requests hit on the mixed layout: one
-    /// request spanning the first random -> text page pair, a
-    /// literal-only stretch ahead of matches. Rebuild + decode must
-    /// return the input.
+    /// The two multi-page shapes the 8K+ bench requests fail on: a text
+    /// page pair with a 17-byte pattern period (repeat codes fire mid
+    /// page), and a text -> zeros page pair (the parse switches from a
+    /// periodic offset to offset-1 runs). For each, the vendor oracle —
+    /// kaelz4's own LZ4 block for the same input — is diffed byte-wise
+    /// against our rebuild, and everything is printed before any assert
+    /// so one run reads out the rule at fault. This one test loads the
+    /// vendor stack; the other native tests keep the process free of it.
     #[test]
     #[ignore = "requires /dev/hisi_zip-* uacce nodes: run with cargo test -- --ignored"]
     fn hw_lz77_page_boundary_rebuilds_to_decodable_lz4() {
@@ -1045,51 +1049,74 @@ mod hw_tests {
         let mut pump = NativePump::open(&devices, 1, req, 8, 8, false, NativeAlg::Lz77)
             .expect("open native queue");
         pump.run(0.2); // settle the queue the same way a bench run does
-        let mut data = vec![0u8; 8 * 4096];
+        let mut data = vec![0u8; 20 * 4096];
         crate::data::fill_pages(&mut data);
-        let chunk = &data[6 * 4096..6 * 4096 + req]; // pages 6-7: random, then text
-        let sample = pump.sample_triples(chunk).expect("sample request");
+        let vendor = crate::KaeLz4::open_hw().expect("open the patched liblz4 stack");
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
-        let mut block = Vec::new();
-        let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block).expect("rebuild");
-        let mut dst = vec![0u8; chunk.len()];
-        let decoded =
-            crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
-        assert_eq!(decoded, chunk.len());
-        assert_eq!(&dst[..decoded], chunk, "rebuild output must decode to the input");
-
-        // the vendor oracle: kaelz4's own LZ4 block for the same input.
-        // This one test loads the vendor stack (the other native tests
-        // keep the process free of it) — a byte difference against our
-        // rebuild localizes the triple rule at fault.
-        let vendor = crate::KaeLz4::open_hw()
-            .expect("open the patched liblz4 stack")
-            .compress_vec(chunk)
-            .expect("vendor compress of the same input");
-        let mut vdst = vec![0u8; chunk.len()];
-        let vn = crate::lz4dec::decode_block(&vendor, &mut vdst).expect("vendor block decodes");
-        assert_eq!(vn, chunk.len());
-        assert_eq!(&vdst[..vn], chunk, "vendor oracle sanity");
-        if block[..n] != vendor[..] {
-            let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-            let d = block[..n].iter().zip(vendor.iter()).position(|(a, b)| a != b);
+        let mut problems = Vec::new();
+        for first_page in [9, 18] {
+            let chunk = &data[first_page * 4096..first_page * 4096 + req];
+            let sample = pump.sample_triples(chunk).expect("sample request");
             eprintln!(
-                "native: rebuild {}B vs vendor {}B, first diff at {d:?}",
-                n,
-                vendor.len()
+                "== pages {first_page}-{}: seqs={} lit={} ll_overflow_cnt={} pos={}",
+                first_page + 1,
+                sample.seqs.len() / 8,
+                sample.lit,
+                sample.ll_overflow_cnt,
+                sample.ll_overflow_pos
             );
-            if let Some(d) = d {
-                let lo = d.saturating_sub(16);
-                eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
-                eprintln!("native: vendor: {}", hx(&vendor[lo..(d + 16).min(vendor.len())]));
-            }
             eprintln!("native: triples: {}", hx(&sample.seqs));
+
+            let mut block = Vec::new();
+            let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block)
+                .expect("rebuild");
+            let mut dst = vec![0u8; chunk.len()];
+            match crate::lz4dec::decode_block(&block[..n], &mut dst) {
+                Ok(m) if &dst[..m] == chunk => {
+                    eprintln!("native: rebuild decodes to the input ({n}B)");
+                }
+                Ok(m) => {
+                    let d = dst[..m].iter().zip(chunk).position(|(a, b)| a != b);
+                    eprintln!("native: rebuild decodes to {m}B, first diff at {d:?}");
+                }
+                Err(e) => eprintln!("native: rebuild decode failed: {e}"),
+            }
+
+            let vblock = vendor.compress_vec(chunk).expect("vendor compress");
+            let mut vdst = vec![0u8; chunk.len()];
+            let vn = crate::lz4dec::decode_block(&vblock, &mut vdst)
+                .expect("vendor block decodes");
+            assert_eq!(&vdst[..vn], chunk, "vendor oracle sanity");
+            eprintln!(
+                "native: vendor block {}B: {}",
+                vn,
+                hx(&vblock[..vn.min(192)])
+            );
+            if block[..n] != vblock[..] {
+                let d = block[..n].iter().zip(vblock.iter()).position(|(a, b)| a != b);
+                eprintln!(
+                    "native: rebuild {n}B vs vendor {}B, first diff at {d:?}",
+                    vblock.len()
+                );
+                if let Some(d) = d {
+                    let lo = d.saturating_sub(16);
+                    eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
+                    eprintln!(
+                        "native: vendor: {}",
+                        hx(&vblock[lo..(d + 16).min(vblock.len())])
+                    );
+                }
+                problems.push(format!(
+                    "pages {first_page}: rebuild {}B vs vendor {}B, first diff at {d:?}",
+                    n,
+                    vblock.len()
+                ));
+            } else {
+                eprintln!("native: rebuild matches the vendor oracle byte-for-byte");
+            }
         }
-        assert_eq!(
-            &block[..n],
-            &vendor[..],
-            "native rebuild differs from the vendor oracle on the same input"
-        );
+        assert!(problems.is_empty(), "{}", problems.join("; "));
     }
 }
 
