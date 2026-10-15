@@ -1024,7 +1024,9 @@ mod hw_tests {
         let sample = pump.sample_triples(&data).expect("sample request");
 
         let mut block = Vec::new();
-        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block).expect("rebuild");
+        let mut rep = crate::rebuild::RepRegister::fresh();
+        let n = crate::rebuild::lz77_block(&data, &sample.seqs, &mut block, &mut rep)
+            .expect("rebuild");
         let mut dst = vec![0u8; data.len()];
         let decoded =
             crate::lz4dec::decode_block(&block[..n], &mut dst).expect("decode");
@@ -1055,9 +1057,14 @@ mod hw_tests {
         let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         let mut problems = Vec::new();
+        let mut rep = crate::rebuild::RepRegister::fresh();
         for first_page in [9, 18] {
             let chunk = &data[first_page * 4096..first_page * 4096 + req];
+            // sample the same request twice: if the engine is stateful the
+            // second parse differs and the vendor comparison needs that
+            // history accounted for
             let sample = pump.sample_triples(chunk).expect("sample request");
+            let resample = pump.sample_triples(chunk).expect("resample request");
             eprintln!(
                 "== pages {first_page}-{}: seqs={} lit={} ll_overflow_cnt={} pos={}",
                 first_page + 1,
@@ -1071,12 +1078,29 @@ mod hw_tests {
                 sample.lits.len(),
                 hx(&sample.lits)
             );
-            for line in crate::rebuild::trace_triples(chunk.len(), &sample.seqs).lines() {
+            eprintln!("native: run 1 triples:");
+            // traces advance copies; the register itself is consumed once,
+            // by the rebuild below
+            let mut trace_rep = rep;
+            for line in
+                crate::rebuild::trace_triples(chunk.len(), &sample.seqs, &mut trace_rep).lines()
+            {
                 eprintln!("native: {line}");
+            }
+            eprintln!("native: run 2 triples:");
+            let mut resample_rep = trace_rep;
+            for line in
+                crate::rebuild::trace_triples(chunk.len(), &resample.seqs, &mut resample_rep)
+                    .lines()
+            {
+                eprintln!("native: {line}");
+            }
+            if sample.seqs == resample.seqs {
+                eprintln!("native: run 2 triples identical to run 1");
             }
 
             let mut block = Vec::new();
-            let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block)
+            let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block, &mut rep)
                 .expect("rebuild");
             let mut dst = vec![0u8; chunk.len()];
             match crate::lz4dec::decode_block(&block[..n], &mut dst) {

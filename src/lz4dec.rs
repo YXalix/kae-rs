@@ -154,7 +154,7 @@ mod tests {
         let input = b"abcdabcdabcd";
         let seqs = [triple(0, 5, 0), triple(8 + 3, 0, 1)].concat();
         let mut block = Vec::new();
-        let n = rebuild::lz77_block(input, &seqs, &mut block).expect("rebuild");
+        let n = rebuild::lz77_block(input, &seqs, &mut block, &mut rebuild::RepRegister::fresh()).expect("rebuild");
         decode(&block[..n], input);
     }
 }

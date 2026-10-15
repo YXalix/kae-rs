@@ -10,8 +10,14 @@
 //! ```
 //!
 //! `offBase > 3` encodes `offset + 3`; offBase 1..3 read the engine's
-//! register of the last three explicitly-coded offsets (a fresh request
-//! starts it at [1, 4, 8]) and leave it alone — see `resolve_offset`.
+//! register of the last three match offsets and leave it alone — see
+//! `resolve_offset`. An explicit offset shifts the register only when it
+//! differs from the newest entry (the engine re-emits the same offset
+//! explicitly without pushing it again), and the register persists across
+//! requests on a queue. A fresh rebuild starts it at `[1, 1, 8]` — the
+//! middle slot is pinned by the hardware oracle dumps (the pages 9-10
+//! boundary match reads it as 1 before any request-internal push reaches
+//! it); the outer two slots are unconstrained there and keep zstd's 1/8.
 //! `mlBase 1` means a 4-byte match; `mlBase 0` carries
 //! no match, and its `litLength` plus 3 bytes fold into the next literal
 //! run. `aux` reads zero in the mid-page matches; the page-boundary
@@ -29,18 +35,33 @@ const RUN_MASK: usize = 15;
 const ML_BITS: usize = 4;
 const ML_MASK: usize = 15;
 
+/// The engine's register of the last three match offsets, most recent
+/// first. It lives on the queue, not in the request: one rebuild call per
+/// request, threaded across a queue's requests in submission order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RepRegister([usize; 3]);
+
+impl RepRegister {
+    pub(crate) fn fresh() -> RepRegister {
+        RepRegister([1, 1, 8])
+    }
+}
+
 /// Rebuild one request's triples (`seqs*8` bytes) against its original
 /// `input` into `out` (cleared first); returns the LZ4 block length.
-pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
+/// `rep` carries the offset register across this queue's requests.
+pub(crate) fn lz77_block(
+    input: &[u8],
+    seqs: &[u8],
+    out: &mut Vec<u8>,
+    rep: &mut RepRegister,
+) -> Result<usize, String> {
     if seqs.len() % 8 != 0 {
         return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
     }
     out.clear();
     out.reserve(input.len() + input.len() / 255 + 16);
 
-    // the engine's register of the last three explicitly-coded offsets,
-    // as a fresh request starts out
-    let mut rep = [1usize, 4, 8];
     let mut pending_lit = 0usize;
     let mut ip = 0usize;
     for (ti, t) in seqs.chunks_exact(8).enumerate() {
@@ -56,10 +77,10 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
         // of this match
         let lit = lit_len + pending_lit;
         pending_lit = 0;
-        let off = resolve_offset(off_base, &mut rep).map_err(|e| {
+        let off = resolve_offset(off_base, rep).map_err(|e| {
             format!(
                 "{e} (triple {ti}, aux {aux}, rep=[{}, {}, {}])",
-                rep[0], rep[1], rep[2]
+                rep.0[0], rep.0[1], rep.0[2]
             )
         })?;
         // the token nibble carries mlBase - 1; the decoder's match length
@@ -130,11 +151,10 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
 /// target machine pins the engine's boundary semantics without any
 /// terminal-wrapped hex to transcribe.
 #[cfg(test)]
-pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
+pub(crate) fn trace_triples(input_len: usize, seqs: &[u8], rep: &mut RepRegister) -> String {
     if seqs.len() % 8 != 0 {
         return format!("triple area is {}B, not a multiple of 8", seqs.len());
     }
-    let mut rep = [1usize, 4, 8];
     let mut pending_lit = 0usize;
     let mut ip = 0usize;
     let mut lines = Vec::new();
@@ -152,7 +172,7 @@ pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
         }
         let lit = lit_len + pending_lit;
         pending_lit = 0;
-        let off = match resolve_offset(off_base, &mut rep) {
+        let off = match resolve_offset(off_base, rep) {
             Ok(off) => off.to_string(),
             Err(e) => format!("ERR({e})"),
         };
@@ -162,32 +182,36 @@ pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
         lines.push(format!(
             "t{ti}: match off_base={off_base} aux={aux} lit={lit} at {lit_at} ml={ml} off={off} span {lit_at}..{} rep=[{}, {}, {}]",
             (lit_at + lit + ml).min(input_len),
-            rep[0],
-            rep[1],
-            rep[2],
+            rep.0[0],
+            rep.0[1],
+            rep.0[2],
         ));
     }
     lines.push(format!("tail at {ip}: {}B", input_len.saturating_sub(ip)));
     lines.join("\n")
 }
 
-/// Resolve one triple's `offBase` against the engine's register of the
-/// last three explicitly-coded offsets in `rep` (most recent first) and
-/// return the match offset. `offBase > 3` is `offset + 3` and shifts the
-/// register; offBase 1..3 read its entries and leave them alone — a
-/// repeat-coded match never changes what a later repeat code reads.
-fn resolve_offset(off_base: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
+/// Resolve one triple's `offBase` against the queue's offset register in
+/// `rep` (most recent first) and return the match offset. `offBase > 3`
+/// is `offset + 3` and shifts the register — but only when the offset
+/// differs from the newest entry: the engine re-emits an unchanged offset
+/// explicitly without pushing it again. offBase 1..3 read the register's
+/// entries and leave them alone, so a repeat-coded match never changes
+/// what a later repeat code reads.
+fn resolve_offset(off_base: usize, rep: &mut RepRegister) -> Result<usize, String> {
     if off_base == 0 {
         return Err("triple offBase is 0".into());
     }
     if off_base > 3 {
         let off = off_base - 3;
-        rep[2] = rep[1];
-        rep[1] = rep[0];
-        rep[0] = off;
+        if off != rep.0[0] {
+            rep.0[2] = rep.0[1];
+            rep.0[1] = rep.0[0];
+            rep.0[0] = off;
+        }
         return Ok(off);
     }
-    Ok(rep[off_base - 1])
+    Ok(rep.0[off_base - 1])
 }
 
 /// 255-style extension bytes after a saturating 4-bit token nibble.
@@ -214,7 +238,8 @@ mod tests {
 
     fn rebuild(input: &[u8], seqs: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let n = lz77_block(input, seqs, &mut out).expect("rebuild");
+        let mut rep = RepRegister::fresh();
+        let n = lz77_block(input, seqs, &mut out, &mut rep).expect("rebuild");
         out.truncate(n);
         out
     }
@@ -288,16 +313,17 @@ mod tests {
         let seqs = [triple(0, 4, 0), triple(1 + 3, 0, 1)].concat(); // offset 1 at 7B output: fine
         roundtrip(&input, &seqs);
         let bad = [triple(1 + 3, 0, 1)].concat(); // offset 1 at 0B output
-        assert!(lz77_block(&input, &bad, &mut Vec::new()).is_err());
+        let mut rep = RepRegister::fresh();
+        assert!(lz77_block(&input, &bad, &mut Vec::new(), &mut rep).is_err());
     }
 
     #[test]
     fn oversized_offset_and_literal_overrun_are_rejected() {
         let input = [0u8; 32];
         let seqs = [triple(0xFFFF, 4, 1)].concat(); // offset 65532: beyond the 4B output
-        assert!(lz77_block(&input, &seqs, &mut Vec::new()).is_err());
+        assert!(lz77_block(&input, &seqs, &mut Vec::new(), &mut RepRegister::fresh()).is_err());
         let seqs = [triple(1 + 3, 33, 1)].concat(); // 33 literals in a 32B input
-        assert!(lz77_block(&input, &seqs, &mut Vec::new()).is_err());
+        assert!(lz77_block(&input, &seqs, &mut Vec::new(), &mut RepRegister::fresh()).is_err());
     }
 
     #[test]
@@ -309,18 +335,17 @@ mod tests {
         roundtrip(&input, &seqs);
     }
 
-    /// The register holds the last three explicitly-coded offsets:
-    /// offBase 1..3 read its entries and leave them alone. The hardware
-    /// proof is the text -> zeros page boundary: after an explicit
-    /// offset 16 and sixteen code-1 matches, the boundary match is
-    /// (code 3, lit 1) — the fresh-frame third entry (offset 1) must
-    /// have survived every code-1 use untouched.
+    /// The register holds the last three match offsets: offBase 1..3 read
+    /// its entries and leave them alone. The hardware proof is the text ->
+    /// zeros page boundary: after an explicit offset 16 and sixteen code-1
+    /// matches, the boundary match is (code 3, lit 1) — the middle entry
+    /// (offset 1) must have survived every code-1 use untouched.
     #[test]
     fn repeat_codes_read_the_register_without_updating_it() {
         let seqs = [
-            triple(6 + 3, 8, 1), // explicit offset 6 -> register [6, 1, 4]
+            triple(6 + 3, 8, 1), // explicit offset 6 -> register [6, 1, 1]
             triple(1, 0, 1),     // code 1 -> 6, register unchanged
-            triple(3, 0, 1),     // code 3 -> 4, register unchanged
+            triple(3, 0, 1),     // code 3 -> 1 (the middle entry), unchanged
             triple(2 + 3, 0, 1), // explicit offset 2 -> register [2, 6, 1]
             triple(3, 0, 1),     // code 3 -> 1 (RLE)
         ]
@@ -329,13 +354,66 @@ mod tests {
             b"abcdefgh".as_slice(),
             b"cdef", // offset 6 match
             b"ghcd", // code 1 -> offset 6
-            b"ghcd", // code 3 -> offset 4
-            b"cdcd", // offset 2 match
+            b"dddd", // code 3 -> offset 1
+            b"dddd", // offset 2 match
             b"dddd", // code 3 -> offset 1 (RLE)
             b"Z",    // tail
         ]
         .concat();
         roundtrip(&input, &seqs);
+    }
+
+    /// Hardware known answer, distilled from the pages 9-10 / 18-19 oracle
+    /// dumps on the target machine: an explicit offset equal to the
+    /// register's newest entry does not shift it, and the register carries
+    /// across requests — the second request's boundary code 3 reads the
+    /// entry the first request's pushes left in the third slot.
+    #[test]
+    fn duplicate_explicit_offsets_do_not_shift_and_the_register_crosses_requests() {
+        let mut rep = RepRegister::fresh();
+        // request 1 (pages 9-10 shape): explicit 16, the same 16 again
+        // (no push), a code-1 match, the boundary code-3 match reading 1,
+        // then an explicit offset-1 push leaving [1, 16, 1]
+        let seqs1 = [
+            triple(16 + 3, 16, 13), // explicit 16 -> [16, 1, 1]
+            triple(16 + 3, 0, 13),  // duplicate explicit 16: no push
+            triple(1, 0, 13),       // code 1 -> 16
+            triple(3, 1, 248),      // code 3 -> 1, one literal, 251-byte RLE
+            triple(1 + 3, 0, 5),    // explicit 1 -> [1, 16, 1]
+        ]
+        .concat();
+        let mut input1 = b"snapshot-page-9 ".repeat(4);
+        input1.push(b'z');
+        input1.extend(std::iter::repeat_n(b'z', 259));
+        {
+            let mut out = Vec::new();
+            let n = lz77_block(&input1, &seqs1, &mut out, &mut rep).expect("rebuild 1");
+            let mut dst = vec![0u8; input1.len()];
+            let m = crate::lz4dec::decode_block(&out[..n], &mut dst).expect("decode 1");
+            assert_eq!(&dst[..m], &input1[..]);
+            assert_eq!(rep, RepRegister([1, 16, 1]));;
+        }
+        // request 2 (pages 18-19 shape) on a queue-warm register: explicit
+        // 17 (pushes -> [17, 1, 16]), the same 17 again (no push), code-1
+        // matches, then the boundary code-3 match reads 16 — the pages-18
+        // dump's cross-request read — and a later code 2 reads 17.
+        let seqs2 = [
+            triple(17 + 3, 20, 1), // explicit 17 -> [17, 1, 16]
+            triple(17 + 3, 0, 1),  // duplicate explicit 17: no push
+            triple(1, 0, 1),       // code 1 -> 17
+            triple(1, 0, 1),       // code 1 -> 17
+            triple(3, 0, 1),       // code 3 -> 16 (the cross-request read)
+            triple(33 + 3, 1, 1),  // explicit 33 -> [33, 17, 1]
+            triple(2, 0, 1),       // code 2 -> 17
+        ]
+        .concat();
+        let input2 = vec![b'x'; 49];
+        let mut out = Vec::new();
+        let n = lz77_block(&input2, &seqs2, &mut out, &mut rep).expect("rebuild 2");
+        let mut dst = vec![0u8; input2.len()];
+        let m = crate::lz4dec::decode_block(&out[..n], &mut dst).expect("decode 2");
+        assert_eq!(&dst[..m], &input2[..]);
+        assert_eq!(rep, RepRegister([33, 17, 1]));;
     }
 
     /// A literal-only triple (mlBase 0) folds its bytes into the next
@@ -395,12 +473,15 @@ mod tests {
             triple(2 + 3, 0, 1), // explicit offset 2 -> register [2, 6, 1]
         ]
         .concat();
-        let lines = trace_triples(64, &seqs);
+        let lines = {
+            let mut rep = RepRegister::fresh();
+            trace_triples(64, &seqs, &mut rep)
+        };
         assert!(lines.contains(
-            "t0: match off_base=9 aux=0 lit=8 at 0 ml=4 off=6 span 0..12 rep=[6, 1, 4]"
+            "t0: match off_base=9 aux=0 lit=8 at 0 ml=4 off=6 span 0..12 rep=[6, 1, 1]"
         ));
         assert!(lines.contains(
-            "t1: match off_base=1 aux=0 lit=0 at 12 ml=4 off=6 span 12..16 rep=[6, 1, 4]"
+            "t1: match off_base=1 aux=0 lit=0 at 12 ml=4 off=6 span 12..16 rep=[6, 1, 1]"
         ));
         assert!(lines.contains("t2: fold off_base=0 aux=0 lit=5 pending=8"));
         assert!(lines.contains(
