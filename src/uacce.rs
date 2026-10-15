@@ -409,6 +409,18 @@ impl Drop for SsRegion {
 
 // ---------- one hardware queue ----------
 
+/// Unmaps every (ptr, len) still held when dropped; disarmed with
+/// `mem::forget` once the opened Queue takes ownership of the mappings.
+struct MapGuard(Vec<(*mut u8, usize)>);
+
+impl Drop for MapGuard {
+    fn drop(&mut self) {
+        for &(p, len) in &self.0 {
+            unsafe { munmap(p, len) };
+        }
+    }
+}
+
 /// Per-queue accounting, aggregated into [`NativeStats`].
 #[derive(Default)]
 struct QueueStats {
@@ -507,62 +519,35 @@ impl Queue {
         }
 
         let sq = do_mmap(&file, dus_len, UACCE_QFRT_DUS)?;
-        let mmio = match do_mmap(&file, mmio_len, UACCE_QFRT_MMIO) {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe { munmap(sq, dus_len) };
-                return Err(e);
-            }
-        };
+        let mut maps = MapGuard(vec![(sq, dus_len)]);
+        let mmio = do_mmap(&file, mmio_len, UACCE_QFRT_MMIO)?;
+        maps.0.push((mmio, mmio_len));
         let r = unsafe { ioctl(file.as_raw_fd(), UACCE_CMD_START_Q, std::ptr::null_mut()) };
         if r < 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { munmap(sq, dus_len) };
-            unsafe { munmap(mmio, mmio_len) };
-            return Err(format!("{dev}: START_Q: {e}"));
+            return Err(format!("{dev}: START_Q: {}", std::io::Error::last_os_error()));
         }
 
         // one input and one output block per in-flight slot
         let ocap = out_cap(alg, req_size);
         let ss_len = depth * (req_size + ocap);
-        let ss = match SsRegion::map(&file, ss_len) {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe { munmap(sq, dus_len) };
-                unsafe { munmap(mmio, mmio_len) };
-                return Err(e);
-            }
+        let ss = SsRegion::map(&file, ss_len)?;
+        let exhausted = || {
+            format!(
+                "{dev}: SS region exhausted (~{} MiB wanted for depth {depth})",
+                ss_len / (1024 * 1024)
+            )
         };
         let mut src = Vec::with_capacity(depth);
         let mut out = Vec::with_capacity(depth);
         let mut cursor = 0usize;
         for _ in 0..depth {
-            let (so, sd) = ss
-                .alloc(&mut cursor, req_size)
-                .ok_or_else(|| {
-                    format!(
-                        "{dev}: SS region exhausted (~{} MiB wanted for depth {depth})",
-                        ss_len / (1024 * 1024)
-                    )
-                })
-                .map_err(|e| {
-                    unsafe { munmap(sq, dus_len) };
-                    unsafe { munmap(mmio, mmio_len) };
-                    e
-                })?;
-            let (oo, od) = ss
-                .alloc(&mut cursor, ocap)
-                .ok_or_else(|| format!("{dev}: SS region exhausted (output area)"))
-                .map_err(|e| {
-                    unsafe { munmap(sq, dus_len) };
-                    unsafe { munmap(mmio, mmio_len) };
-                    e
-                })?;
+            let (so, sd) = ss.alloc(&mut cursor, req_size).ok_or_else(exhausted)?;
+            let (oo, od) = ss.alloc(&mut cursor, ocap).ok_or_else(exhausted)?;
             src.push((ss.ptr_at(so), sd));
             out.push((ss.ptr_at(oo), od));
         }
 
-        Ok(Queue {
+        let queue = Queue {
             file,
             sqn: qp_ctx.id,
             sq,
@@ -584,7 +569,9 @@ impl Queue {
             req_size,
             ocap,
             stats: QueueStats::default(),
-        })
+        };
+        std::mem::forget(maps);
+        Ok(queue)
     }
 
     /// Copy workload data into a slot's input buffer (called once per slot

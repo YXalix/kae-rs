@@ -27,13 +27,11 @@
 //! ```
 //!
 //! Use [`KaeLz4::open_hw`] when only hardware is acceptable (it errors out
-//! directly without hardware instead of silently falling back).
-//! Operational hard rules: never put the KAE patched library into
-//! /usr/local/lib, and never add /usr/local/kae* to the global
-//! LD_LIBRARY_PATH or ld.so.conf.d — that would hijack every host process
-//! depending on liblz4/libzstd/libz (gcc cc1 and readelf both break). This
-//! crate's RTLD_GLOBAL preloading happens only inside this process and
-//! carries no such risk.
+//! directly without hardware instead of silently falling back). Operational
+//! hard rule (details in the README): the KAE patched library must never be
+//! installed into /usr/local/lib or the global LD_LIBRARY_PATH — this
+//! crate's RTLD_GLOBAL preloading stays process-local and carries no such
+//! risk.
 //!
 //! Also bundled: the `kae-bench` binary and `benches/throughput`
 //! (`cargo bench`) compare software/hardware throughput and CPU cost; see

@@ -54,6 +54,22 @@ fn flat(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join("_")
 }
 
+/// Blocks covered by the cross-validation sample: the first
+/// `SAMPLE_CAP_BYTES` of input, at least one block, at most all of them.
+fn sample_block_count(block: usize, nblocks: usize) -> usize {
+    (SAMPLE_CAP_BYTES / block).max(1).min(nblocks)
+}
+
+/// Record the first pool-cell failure; later ones are dropped and the pool
+/// drains without doing timed work.
+fn fail_cell(first_err: &Mutex<Option<String>>, failed: &AtomicBool, msg: String) {
+    let mut g = first_err.lock().unwrap();
+    if g.is_none() {
+        *g = Some(msg);
+    }
+    failed.store(true, Ordering::Relaxed);
+}
+
 /// The `--preload` value is a comma-separated path list (empty entries are
 /// allowed and skipped).
 fn split_preload(s: &str) -> Vec<String> {
@@ -585,7 +601,7 @@ fn build_native_sample(
     req_size: usize,
     path: &str,
 ) -> Result<(u64, usize), String> {
-    let count = (SAMPLE_CAP_BYTES / block).max(1).min(nblocks);
+    let count = sample_block_count(block, nblocks);
     let per_block = block / req_size;
     let mut packed: Vec<u8> = Vec::new();
     let mut lens = Vec::with_capacity(count);
@@ -637,7 +653,7 @@ fn write_sample(
     packed: &[u8],
     nblocks: usize,
 ) -> std::io::Result<()> {
-    let count = (SAMPLE_CAP_BYTES / block).max(1).min(nblocks);
+    let count = sample_block_count(block, nblocks);
     let mut buf = Vec::with_capacity(packed.len().min(SAMPLE_CAP_BYTES + SAMPLE_SLACK_BYTES));
     push_sample_header(&mut buf, block, count);
     let mut off = 0usize;
@@ -660,7 +676,7 @@ fn warm_up_compress(
     nblocks: usize,
 ) -> Result<u64, i32> {
     let mut dst = vec![0u8; kae.bound(block)];
-    let sample_blocks = (SAMPLE_CAP_BYTES / block).max(1).min(nblocks);
+    let sample_blocks = sample_block_count(block, nblocks);
     let mut sample = Vec::with_capacity(SAMPLE_CAP_BYTES + SAMPLE_SLACK_BYTES);
     push_sample_header(&mut sample, block, sample_blocks);
     let mut out_bytes_warm: u64 = 0;
@@ -932,11 +948,7 @@ fn bench_pool_compress(
                     block
                 }
                 Err(e) => {
-                    let mut g = first_err.lock().unwrap();
-                    if g.is_none() {
-                        *g = Some(e.to_string());
-                    }
-                    failed.store(true, Ordering::Relaxed);
+                    fail_cell(&first_err, &failed, e.to_string());
                     0
                 }
             }
@@ -1008,20 +1020,12 @@ fn bench_pool_decompress(
                     counts[t].fetch_add(1, Ordering::Relaxed);
                     block
                 }
-                Ok(_) => {
-                    let mut g = first_err.lock().unwrap();
-                    if g.is_none() {
-                        *g = Some("size_mismatch".into());
-                    }
-                    failed.store(true, Ordering::Relaxed);
-                    0
-                }
-                Err(e) => {
-                    let mut g = first_err.lock().unwrap();
-                    if g.is_none() {
-                        *g = Some(e.to_string());
-                    }
-                    failed.store(true, Ordering::Relaxed);
+                other => {
+                    let err = other
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "size_mismatch".into());
+                    fail_cell(&first_err, &failed, err);
                     0
                 }
             }

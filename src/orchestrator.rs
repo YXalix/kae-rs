@@ -16,6 +16,7 @@ use crate::data;
 use crate::hw_lib_path;
 use crate::uacce_devices;
 use crate::worker;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +49,17 @@ struct Row {
     verify: String,
     status: String,
     note: String,
+}
+
+impl Row {
+    /// The verify column value: only compress rows carry one.
+    fn verify_display(&self) -> String {
+        if self.op == "compress" {
+            self.verify.clone()
+        } else {
+            "-".into()
+        }
+    }
 }
 
 struct Config {
@@ -276,7 +288,11 @@ fn field(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn spawn_worker(exe: &Path, args: &[&str]) -> (Option<String>, String) {
+fn spawn_worker<I, S>(exe: &Path, args: I) -> (Option<String>, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let out = Command::new(exe).args(args).output();
     match out {
         Ok(o) => {
@@ -344,8 +360,7 @@ fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
         args.push("--sample-out".into());
         args.push(p.display().to_string());
     }
-    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let (stdout, stderr) = spawn_worker(exe, &argrefs);
+    let (stdout, stderr) = spawn_worker(exe, &args);
     let mut row = Row {
         data: cell.dataset.into(),
         block: cell.block,
@@ -394,8 +409,7 @@ fn run_verify(exe: &Path, cfg: &Config, data_file: &Path, block: usize, sample: 
         "--sample".into(),
         sample.display().to_string(),
     ];
-    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let (stdout, stderr) = spawn_worker(exe, &argrefs);
+    let (stdout, stderr) = spawn_worker(exe, &args);
     match stdout.as_deref().and_then(|s| first_line_with(s, "VERIFY")) {
         Some(line) => field(&line, "status").unwrap_or_else(|| "PARSE_ERR".into()),
         None => format!("WORKER_ERR_{}", stderr_tail(&stderr)),
@@ -461,7 +475,7 @@ fn probe(cfg: &Config) {
             continue;
         }
         let args = ["--_worker", "--probe", "--lib", &lib, "--preload", &preload];
-        let (stdout, _stderr) = spawn_worker(&exe, &args);
+        let (stdout, _stderr) = spawn_worker(&exe, args);
         match stdout {
             Some(s) => {
                 for line in s.lines() {
@@ -479,11 +493,7 @@ fn print_table(rows: &[Row]) {
     ];
     let mut table: Vec<Vec<String>> = vec![headers.iter().map(|s| s.to_string()).collect()];
     for r in rows {
-        let verify = if r.op == "compress" {
-            r.verify.clone()
-        } else {
-            "-".into()
-        };
+        let verify = r.verify_display();
         // pool rows carry their size in note (workers=N); surface it in the
         // label so the table is self-describing (TSV/JSON keep the impl name)
         let impl_disp = match field(&r.note, "workers") {
@@ -617,11 +627,6 @@ fn write_tsv(path: &str, cfg: &Config, rows: &[Row]) {
         "data\tblock\timpl\top\tgbps\tratio_pct\tcpu_s_per_gb\twall_s\tverify\tstatus\tnote\n",
     );
     for r in rows {
-        let verify = if r.op == "compress" {
-            r.verify.clone()
-        } else {
-            "-".into()
-        };
         s.push_str(&format!(
             "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
             r.data,
@@ -632,7 +637,7 @@ fn write_tsv(path: &str, cfg: &Config, rows: &[Row]) {
             r.ratio_pct,
             r.cpu_per_gb,
             r.wall_s,
-            verify,
+            r.verify_display(),
             r.status,
             r.note
         ));

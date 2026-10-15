@@ -25,7 +25,7 @@ name = "kae-bench"
 path = "src/bin/kae-bench.rs"
 bench = false
 
-# Additional bench entry point: cargo bench -- --data mixed --ops compress
+# Additional bench entry point: cargo bench -- --ops compress
 [[bench]]
 name = "throughput"
 harness = false
