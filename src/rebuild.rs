@@ -9,9 +9,10 @@
 //! [u32 offBase][u16 litLength][u16 mlBase]
 //! ```
 //!
-//! `offBase > 3` encodes `offset + 3`; offBase 1..3 are zstd repeat codes
-//! over the three most recent offsets, updated by zstd's rules (see
-//! `resolve_offset`). `mlBase 1` means a 4-byte match; `mlBase 0` carries
+//! `offBase > 3` encodes `offset + 3`; offBase 1..3 are repeat codes
+//! indexing the three most recent offsets, most recent first, with the
+//! used offset moving to the front (see `resolve_offset`). `mlBase 1`
+//! means a 4-byte match; `mlBase 0` carries
 //! no match, and its `litLength` plus 3 bytes fold into the next literal
 //! run. The rebuild emits the LZ4 block sequences (token, literals, 2-byte
 //! offset, match-length extension) and ends the block with the unmatched
@@ -35,7 +36,7 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     out.clear();
     out.reserve(input.len() + input.len() / 255 + 16);
 
-    // zstd's repeat-offset state, most recent first, as a fresh frame
+    // the repeat-offset state, most recent first, as a fresh frame
     // starts out
     let mut rep = [1usize, 4, 8];
     let mut pending_lit = 0usize;
@@ -49,10 +50,10 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
             continue;
         }
         // the literal run covers the literal-only triples folded in ahead
-        // of this match; the repeat-code rules branch on that whole run
+        // of this match
         let lit = lit_len + pending_lit;
         pending_lit = 0;
-        let off = resolve_offset(off_base, lit, &mut rep).map_err(|e| {
+        let off = resolve_offset(off_base, &mut rep).map_err(|e| {
             format!("{e} (triple {ti}, rep=[{}, {}, {}])", rep[0], rep[1], rep[2])
         })?;
         // the token nibble carries mlBase - 1; the decoder's match length
@@ -120,14 +121,13 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     Ok(out.len())
 }
 
-/// Resolve one triple's `offBase` against the zstd repeat-offset state in
-/// `rep` (most recent first) and return the match offset. `offBase > 3`
-/// is `offset + 3` and shifts the history down; offBase 1..3 are repeat
-/// codes over the recent offsets, where a zero-length literal run swaps
-/// entries instead of only rotating them (zstd's offset update rules).
-/// `lit_len` is the match's whole literal run — literal-only triples are
-/// already folded in — which is the length zstd's rules branch on.
-fn resolve_offset(off_base: usize, lit_len: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
+/// Resolve one triple's `offBase` against the repeat-offset state in
+/// `rep` (most recent first) and return the match offset, updating the
+/// state. `offBase > 3` is `offset + 3` and shifts the history down;
+/// offBase 1..3 index the three recent offsets directly — the dialect has
+/// no zstd-style zero-literal-run shift — and the used offset moves to
+/// the front.
+fn resolve_offset(off_base: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
     if off_base == 0 {
         return Err("triple offBase is 0".into());
     }
@@ -138,15 +138,11 @@ fn resolve_offset(off_base: usize, lit_len: usize, rep: &mut [usize; 3]) -> Resu
         rep[0] = off;
         return Ok(off);
     }
-    let idx = off_base - 1 + usize::from(lit_len == 0);
-    let off = *rep.get(idx).ok_or_else(|| {
-        format!("repeat code {off_base} after a zero-length literal run is not representable")
-    })?;
-    *rep = match (off_base, lit_len == 0) {
-        (1, false) => *rep,
-        (1, true) | (2, false) => [rep[1], rep[0], rep[2]],
-        (2, true) | (3, false) => [rep[2], rep[0], rep[1]],
-        _ => return Err("repeat code 3 after a zero-length literal run".into()),
+    let off = rep[off_base - 1];
+    *rep = match off_base {
+        1 => *rep,
+        2 => [rep[1], rep[0], rep[2]],
+        _ => [rep[2], rep[0], rep[1]],
     };
     Ok(off)
 }
@@ -270,49 +266,43 @@ mod tests {
         roundtrip(&input, &seqs);
     }
 
-    /// The zstd repeat codes over the three most recent offsets, including
-    /// the zero-literal-run swap rule: repeat code 1 after literals keeps
-    /// the history, after a zero literal run it swaps rep[0] and rep[1].
+    /// The repeat codes index the three recent offsets directly — the
+    /// dialect has no zstd zero-literal-run shift — and the used offset
+    /// moves to the front. All three codes here fire at litLength 0, the
+    /// shape the bench's failing requests hit.
     #[test]
-    fn zstd_repeat_codes_resolve_to_the_recent_offsets() {
+    fn repeat_codes_index_the_three_recent_offsets() {
         let seqs = [
-            triple(6 + 3, 8, 1), // new offset 6
-            triple(1, 2, 1),     // repeat code 1 -> 6
-            triple(2, 0, 1),     // repeat code 2 after a zero run -> rep[2] = 4
-            triple(3, 1, 1),     // repeat code 3 -> rep[2] = 1 (RLE)
-            triple(1, 0, 1),     // repeat code 1 after a zero run -> 4
-            triple(1, 0, 1),     // repeat code 1 after a zero run -> 1 (RLE)
+            triple(6 + 3, 8, 1), // explicit offset 6 -> rep [6, 1, 4]
+            triple(1, 0, 1),     // code 1 -> rep[0] = 6
+            triple(2, 0, 1),     // code 2 -> rep[1] = 1 (RLE)
+            triple(3, 0, 1),     // code 3 -> rep[2] = 4
         ]
         .concat();
         let input = [
-            b"abcdefgh".as_slice(), // literals
-            b"cdef",                // offset 6 match
-            b"ij",                  // literals
-            b"cdef",                // repeat 1 -> 6
-            b"cdef",                // repeat 2 after a zero run -> 4
-            b"k",                   // literal
-            b"kkkk",                // repeat 3 -> 1 (RLE)
-            b"kkkk",                // repeat 1 after a zero run -> 4
-            b"kkkk",                // repeat 1 after a zero run -> 1 (RLE)
-            b"l",                   // tail literal
+            b"abcdefgh".as_slice(),
+            b"cdef", // offset 6 match
+            b"ghcd", // code 1 -> offset 6
+            b"dddd", // code 2 -> offset 1 (RLE)
+            b"dddd", // code 3 -> offset 4
+            b"Z",    // tail
         ]
         .concat();
         roundtrip(&input, &seqs);
     }
 
-    /// A literal-only triple (mlBase 0) folds into the next match's
-    /// literal run: at litLength 0 that match is not ll0, so repeat code 3
-    /// resolves to rep[2] and repeat code 1 keeps rep[0] without the
-    /// zero-run swap.
+    /// A literal-only triple (mlBase 0) folds its bytes into the next
+    /// match's literal run and leaves the repeat-offset state alone: the
+    /// codes after it still index the recent offsets directly.
     #[test]
     fn repeat_codes_after_a_literal_only_triple_see_the_folded_literal_run() {
         let seqs = [
             triple(6 + 3, 8, 1), // literals "abcdefgh", match at offset 6
             triple(4 + 3, 0, 1), // explicit offset 4 -> rep [4, 6, 1]
             triple(0, 5, 0),     // literal-only triple: 8 pending literals
-            triple(3, 0, 1),     // repeat code 3 at litLength 0 -> rep[2] = 1 (RLE)
+            triple(3, 0, 1),     // code 3 -> rep[2] = 1 (RLE)
             triple(0, 2, 0),     // literal-only triple: 5 pending literals
-            triple(1, 0, 1),     // repeat code 1 at litLength 0 -> rep[0] = 1, no swap
+            triple(1, 0, 1),     // code 1 -> rep[0] = 1 (RLE)
         ]
         .concat();
         let input = [
