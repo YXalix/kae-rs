@@ -1091,7 +1091,7 @@ mod hw_tests {
             eprintln!(
                 "native: vendor block {}B: {}",
                 vn,
-                hx(&vblock[..vn.min(192)])
+                hx(&vblock[..vblock.len().min(192)])
             );
             if block[..n] != vblock[..] {
                 let d = block[..n].iter().zip(vblock.iter()).position(|(a, b)| a != b);

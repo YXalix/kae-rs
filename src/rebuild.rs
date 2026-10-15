@@ -10,9 +10,9 @@
 //! ```
 //!
 //! `offBase > 3` encodes `offset + 3`; offBase 1..3 read the engine's
-//! shift register of the three most recent match offsets, and every
-//! match shifts its offset in (see `resolve_offset`). `mlBase 1`
-//! means a 4-byte match; `mlBase 0` carries
+//! register of the last three explicitly-coded offsets (a fresh request
+//! starts it at [1, 4, 8]) and leave it alone — see `resolve_offset`.
+//! `mlBase 1` means a 4-byte match; `mlBase 0` carries
 //! no match, and its `litLength` plus 3 bytes fold into the next literal
 //! run. The rebuild emits the LZ4 block sequences (token, literals, 2-byte
 //! offset, match-length extension) and ends the block with the unmatched
@@ -36,8 +36,8 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     out.clear();
     out.reserve(input.len() + input.len() / 255 + 16);
 
-    // the engine's register of the three most recent match offsets, as
-    // a fresh request starts out
+    // the engine's register of the last three explicitly-coded offsets,
+    // as a fresh request starts out
     let mut rep = [1usize, 4, 8];
     let mut pending_lit = 0usize;
     let mut ip = 0usize;
@@ -121,25 +121,23 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     Ok(out.len())
 }
 
-/// Resolve one triple's `offBase` against the engine's shift register of
-/// the three most recent match offsets in `rep` (most recent first) and
-/// return the match offset. `offBase > 3` is `offset + 3`; offBase 1..3
-/// read the register's entries. Every match then shifts its offset in —
-/// repeat-coded ones too, so a code-1 use duplicates the front entry and
-/// the oldest falls off.
+/// Resolve one triple's `offBase` against the engine's register of the
+/// last three explicitly-coded offsets in `rep` (most recent first) and
+/// return the match offset. `offBase > 3` is `offset + 3` and shifts the
+/// register; offBase 1..3 read its entries and leave them alone — a
+/// repeat-coded match never changes what a later repeat code reads.
 fn resolve_offset(off_base: usize, rep: &mut [usize; 3]) -> Result<usize, String> {
     if off_base == 0 {
         return Err("triple offBase is 0".into());
     }
-    let off = if off_base > 3 {
-        off_base - 3
-    } else {
-        rep[off_base - 1]
-    };
-    rep[2] = rep[1];
-    rep[1] = rep[0];
-    rep[0] = off;
-    Ok(off)
+    if off_base > 3 {
+        let off = off_base - 3;
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+        rep[0] = off;
+        return Ok(off);
+    }
+    Ok(rep[off_base - 1])
 }
 
 /// 255-style extension bytes after a saturating 4-bit token nibble.
@@ -261,26 +259,29 @@ mod tests {
         roundtrip(&input, &seqs);
     }
 
-    /// The repeat codes read the engine's shift register: offBase N is
-    /// the match N back, and every match — repeat-coded ones included —
-    /// shifts its offset in. The code-1 shift here is what keeps offset
-    /// 1 (the register's initial third entry) reachable by the later
-    /// code 3, the shape the bench's failing requests hit.
+    /// The register holds the last three explicitly-coded offsets:
+    /// offBase 1..3 read its entries and leave them alone. The hardware
+    /// proof is the text -> zeros page boundary: after an explicit
+    /// offset 16 and sixteen code-1 matches, the boundary match is
+    /// (code 3, lit 1) — the fresh-frame third entry (offset 1) must
+    /// have survived every code-1 use untouched.
     #[test]
-    fn repeat_codes_read_the_shifting_match_offset_register() {
+    fn repeat_codes_read_the_register_without_updating_it() {
         let seqs = [
             triple(6 + 3, 8, 1), // explicit offset 6 -> register [6, 1, 4]
-            triple(1, 0, 1),     // code 1 -> 6, register [6, 6, 1]
-            triple(3, 0, 1),     // code 3 -> 1 (RLE), register [1, 6, 6]
-            triple(2, 0, 1),     // code 2 -> 6, register [6, 1, 6]
+            triple(1, 0, 1),     // code 1 -> 6, register unchanged
+            triple(3, 0, 1),     // code 3 -> 4, register unchanged
+            triple(2 + 3, 0, 1), // explicit offset 2 -> register [2, 6, 1]
+            triple(3, 0, 1),     // code 3 -> 1 (RLE)
         ]
         .concat();
         let input = [
             b"abcdefgh".as_slice(),
             b"cdef", // offset 6 match
             b"ghcd", // code 1 -> offset 6
+            b"ghcd", // code 3 -> offset 4
+            b"cdcd", // offset 2 match
             b"dddd", // code 3 -> offset 1 (RLE)
-            b"cddd", // code 2 -> offset 6
             b"Z",    // tail
         ]
         .concat();
@@ -298,7 +299,7 @@ mod tests {
             triple(0, 5, 0),     // literal-only triple: 8 pending literals
             triple(3, 0, 1),     // code 3 -> rep[2] = 1 (RLE)
             triple(0, 2, 0),     // literal-only triple: 5 pending literals
-            triple(1, 0, 1),     // code 1 -> rep[0] = 1 (RLE)
+            triple(1, 0, 1),     // code 1 -> rep[0] = 4
         ]
         .concat();
         let input = [
@@ -308,7 +309,7 @@ mod tests {
             b"ijklmnop", // folded literals
             b"pppp",     // offset 1 RLE match
             b"abcde",    // folded literals
-            b"eeee",     // offset 1 RLE match
+            b"bcde",     // offset 4 match
             b"Z",        // tail
         ]
         .concat();
