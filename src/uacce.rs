@@ -1066,7 +1066,14 @@ mod hw_tests {
                 sample.ll_overflow_cnt,
                 sample.ll_overflow_pos
             );
-            eprintln!("native: triples: {}", hx(&sample.seqs));
+            eprintln!(
+                "native: lit area {}B: {}",
+                sample.lits.len(),
+                hx(&sample.lits)
+            );
+            for line in crate::rebuild::trace_triples(chunk.len(), &sample.seqs).lines() {
+                eprintln!("native: {line}");
+            }
 
             let mut block = Vec::new();
             let n = crate::rebuild::lz77_block(chunk, &sample.seqs, &mut block)
@@ -1088,11 +1095,10 @@ mod hw_tests {
             let vn = crate::lz4dec::decode_block(&vblock, &mut vdst)
                 .expect("vendor block decodes");
             assert_eq!(&vdst[..vn], chunk, "vendor oracle sanity");
-            eprintln!(
-                "native: vendor block {}B: {}",
-                vn,
-                hx(&vblock[..vblock.len().min(192)])
-            );
+            eprintln!("native: vendor block {}B:", vblock.len());
+            for line in lz4_sequences(&vblock) {
+                eprintln!("vendor: {line}");
+            }
             if block[..n] != vblock[..] {
                 let d = block[..n].iter().zip(vblock.iter()).position(|(a, b)| a != b);
                 eprintln!(
@@ -1117,6 +1123,56 @@ mod hw_tests {
             }
         }
         assert!(problems.is_empty(), "{}", problems.join("; "));
+    }
+
+    /// Walk a well-formed LZ4 block and describe each sequence: the
+    /// literal run's input span, then the match's offset, length, and
+    /// output span. One line each, so a hardware-run log carries the
+    /// vendor's exact parse without wrapped hex.
+    fn lz4_sequences(block: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let (mut i, mut out) = (0usize, 0usize);
+        while i < block.len() {
+            let tok = block[i];
+            i += 1;
+            let mut lit = (tok >> 4) as usize;
+            if lit == 15 {
+                loop {
+                    let b = *block.get(i).expect("literal extension") as usize;
+                    i += 1;
+                    lit += b;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            let lit_at = out;
+            i += lit;
+            out += lit;
+            if i == block.len() {
+                lines.push(format!("final: lit {lit} at {lit_at}..{out}"));
+                return lines;
+            }
+            let off = u16::from_le_bytes(block[i..i + 2].try_into().unwrap()) as usize;
+            i += 2;
+            let mut ml = (tok & 15) as usize + 4;
+            if (tok & 15) == 15 {
+                loop {
+                    let b = *block.get(i).expect("match extension") as usize;
+                    i += 1;
+                    ml += b;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            let end = out + ml;
+            lines.push(format!(
+                "seq: lit {lit} at {lit_at}..{out} match off {off} ml {ml} span {out}..{end}"
+            ));
+            out = end;
+        }
+        lines
     }
 }
 

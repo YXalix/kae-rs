@@ -6,7 +6,7 @@
 //! include/kaelz4.h seqDef). One triple, little-endian:
 //!
 //! ```text
-//! [u32 offBase][u16 litLength][u16 mlBase]
+//! [u16 offBase][u16 aux][u16 litLength][u16 mlBase]
 //! ```
 //!
 //! `offBase > 3` encodes `offset + 3`; offBase 1..3 read the engine's
@@ -14,7 +14,9 @@
 //! starts it at [1, 4, 8]) and leave it alone — see `resolve_offset`.
 //! `mlBase 1` means a 4-byte match; `mlBase 0` carries
 //! no match, and its `litLength` plus 3 bytes fold into the next literal
-//! run. The rebuild emits the LZ4 block sequences (token, literals, 2-byte
+//! run. `aux` reads zero in the mid-page matches; the page-boundary
+//! regions carry nonzero values whose rule the hw oracle test dumps
+//! triple-by-triple. The rebuild emits the LZ4 block sequences (token, literals, 2-byte
 //! offset, match-length extension) and ends the block with the unmatched
 //! input tail as the final literal run — the same arithmetic as the
 //! kaelz4 rebuild, so the output decodes with the stock liblz4. The
@@ -42,7 +44,8 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     let mut pending_lit = 0usize;
     let mut ip = 0usize;
     for (ti, t) in seqs.chunks_exact(8).enumerate() {
-        let off_base = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+        let off_base = u16::from_le_bytes(t[0..2].try_into().unwrap()) as usize;
+        let aux = u16::from_le_bytes(t[2..4].try_into().unwrap());
         let lit_len = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
         let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
         if ml_base == 0 {
@@ -54,7 +57,10 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
         let lit = lit_len + pending_lit;
         pending_lit = 0;
         let off = resolve_offset(off_base, &mut rep).map_err(|e| {
-            format!("{e} (triple {ti}, rep=[{}, {}, {}])", rep[0], rep[1], rep[2])
+            format!(
+                "{e} (triple {ti}, aux {aux}, rep=[{}, {}, {}])",
+                rep[0], rep[1], rep[2]
+            )
         })?;
         // the token nibble carries mlBase - 1; the decoder's match length
         // is nibble + 4 = mlBase + 3
@@ -79,12 +85,9 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
         out.extend_from_slice(&input[ip..ip + lit]);
         ip += lit;
 
-        // 2-byte offset; the 16K request window keeps it far below 64K.
-        // Decoded output so far is exactly the consumed input, so `ip` is
-        // the reference the decoder would validate against.
-        if off > u16::MAX as usize {
-            return Err(format!("match offset {off} exceeds 64KB"));
-        }
+        // 2-byte offset. Decoded output so far is exactly the consumed
+        // input, so `ip` is the reference the decoder would validate
+        // against.
         if off > ip {
             return Err(format!("match offset {off} reaches before the block start"));
         }
@@ -119,6 +122,53 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     }
     out.extend_from_slice(&input[ip..]);
     Ok(out.len())
+}
+
+/// Walk the triples exactly the way `lz77_block` does and return one line
+/// per triple: the raw fields, the register-resolved offset, and the input
+/// span consumed. The hardware oracle test prints this so one run on the
+/// target machine pins the engine's boundary semantics without any
+/// terminal-wrapped hex to transcribe.
+#[cfg(test)]
+pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
+    if seqs.len() % 8 != 0 {
+        return format!("triple area is {}B, not a multiple of 8", seqs.len());
+    }
+    let mut rep = [1usize, 4, 8];
+    let mut pending_lit = 0usize;
+    let mut ip = 0usize;
+    let mut lines = Vec::new();
+    for (ti, t) in seqs.chunks_exact(8).enumerate() {
+        let off_base = u16::from_le_bytes(t[0..2].try_into().unwrap()) as usize;
+        let aux = u16::from_le_bytes(t[2..4].try_into().unwrap());
+        let lit_len = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
+        let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
+        if ml_base == 0 {
+            pending_lit += lit_len + 3;
+            lines.push(format!(
+                "t{ti}: fold off_base={off_base} aux={aux} lit={lit_len} pending={pending_lit}"
+            ));
+            continue;
+        }
+        let lit = lit_len + pending_lit;
+        pending_lit = 0;
+        let off = match resolve_offset(off_base, &mut rep) {
+            Ok(off) => off.to_string(),
+            Err(e) => format!("ERR({e})"),
+        };
+        let ml = ml_base + 3;
+        let lit_at = ip;
+        ip += lit + ml;
+        lines.push(format!(
+            "t{ti}: match off_base={off_base} aux={aux} lit={lit} at {lit_at} ml={ml} off={off} span {lit_at}..{} rep=[{}, {}, {}]",
+            (lit_at + lit + ml).min(input_len),
+            rep[0],
+            rep[1],
+            rep[2],
+        ));
+    }
+    lines.push(format!("tail at {ip}: {}B", input_len.saturating_sub(ip)));
+    lines.join("\n")
 }
 
 /// Resolve one triple's `offBase` against the engine's register of the
@@ -244,7 +294,7 @@ mod tests {
     #[test]
     fn oversized_offset_and_literal_overrun_are_rejected() {
         let input = [0u8; 32];
-        let seqs = [triple(0xFFFF + 3, 4, 1)].concat(); // offset 65536
+        let seqs = [triple(0xFFFF, 4, 1)].concat(); // offset 65532: beyond the 4B output
         assert!(lz77_block(&input, &seqs, &mut Vec::new()).is_err());
         let seqs = [triple(1 + 3, 33, 1)].concat(); // 33 literals in a 32B input
         assert!(lz77_block(&input, &seqs, &mut Vec::new()).is_err());
@@ -332,6 +382,31 @@ mod tests {
         }
         seqs.extend(triple(1, 0, 101));
         roundtrip(&input, &seqs);
+    }
+
+    /// The trace walks triples exactly like `lz77_block`: same fold
+    /// credit, same register update, same consumed spans.
+    #[test]
+    fn trace_walks_matches_and_folds_like_the_rebuild() {
+        let seqs = [
+            triple(6 + 3, 8, 1), // explicit offset 6 -> register [6, 1, 4]
+            triple(1, 0, 1),     // code 1 -> 6, register unchanged
+            triple(0, 5, 0),     // literal-only: 8 pending literals
+            triple(2 + 3, 0, 1), // explicit offset 2 -> register [2, 6, 1]
+        ]
+        .concat();
+        let lines = trace_triples(64, &seqs);
+        assert!(lines.contains(
+            "t0: match off_base=9 aux=0 lit=8 at 0 ml=4 off=6 span 0..12 rep=[6, 1, 4]"
+        ));
+        assert!(lines.contains(
+            "t1: match off_base=1 aux=0 lit=0 at 12 ml=4 off=6 span 12..16 rep=[6, 1, 4]"
+        ));
+        assert!(lines.contains("t2: fold off_base=0 aux=0 lit=5 pending=8"));
+        assert!(lines.contains(
+            "t3: match off_base=5 aux=0 lit=8 at 16 ml=4 off=2 span 16..28 rep=[2, 6, 1]"
+        ));
+        assert!(lines.contains("tail at 28: 36B"));
     }
 
     /// The property the rebuild exists for: the system liblz4 decodes the
