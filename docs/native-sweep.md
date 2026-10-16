@@ -1,137 +1,95 @@
-# The native sweep runbook: what to run on the target machine
+# The native sweep: one command, the complete dataset
 
-The native cells exist to answer one verdict question (see
+The sweep answers one verdict question (see
 [native-bench.md](native-bench.md)): **is the ZIP engine faster than the
 ~4 GB/s plateau the C userspace stack achieves, or is the engine itself
-the ceiling?** This page is the concrete on-machine procedure — one
-command per experiment, one TSV per run, roughly fifteen minutes end to
-end. Run it from a checkout of 9018b49 ("raw: rebuild the lz77 triples
-into standard LZ4 for the sample verify") or later.
+the ceiling?** One command runs the whole experiment series and leaves
+every number in a single directory:
 
-Keep the two views straight while sweeping: the native GB/s numbers
-below are the **lz77 ceiling view**; the kae-vs-sw adoption comparison
-(throughput + CPU on the same LZ4 format) is read from the E1 anchor's
-sw/hw rows against the native rows' LZ4 ratio and CPU.
+```bash
+cargo build --release
+./target/release/kae-bench --sweep            # data lands in ./kae-sweep
+./target/release/kae-bench --sweep /mnt/s1    # or any directory
+```
+
+About ten minutes. The directory is the deliverable — send it back
+whole (`tar cf kae-native-data.tar kae-sweep`), nothing else is needed.
 
 ## Preconditions
 
-- One or more `/dev/hisi_zip-*` uacce nodes (QM v3 only). The
-  queue-scaling experiment wants two devices; `ls -l /dev/hisi_zip-*`
-  says what the machine has.
+- One or more `/dev/hisi_zip-*` uacce nodes (QM v3 only). Without one
+  only the e1 baseline runs and everything native is skipped with a
+  printed reason.
 - The system liblz4 (`liblz4.so.1`) for the verify op.
-- `cargo build --release`.
 
-## Machine context (once)
+## What it runs
 
-```bash
-git rev-parse HEAD          > rev.txt
-lscpu                       > machine.txt
-ls -l /dev/hisi_zip-*      >> machine.txt
-ldconfig -p | grep liblz4  >> machine.txt
-cat /sys/module/hisi_zip/parameters/perf_mode >> machine.txt 2>/dev/null || true
-./target/release/kae-bench --probe
-```
+Every experiment is a full `kae-bench` run re-executed as a subprocess
+with its own TSV and log; every native run pins the three knobs
+explicitly (`KAE_NATIVE_DEPTH`, `KAE_NATIVE_DB_BATCH`, `KAE_NATIVE_WAIT`)
+so nothing inherits ambient environment. Native experiments use 64K
+requests and sustained 2s windows — the default 0.8s windows read boost
+clocks (the first sweep's 64K rows read 9.6 GB/s at 0.8s and 6.4 GB/s
+at 2s).
 
-The `perf_mode` line records which driver mode every number below was
-taken under: the default `perf_mode=0` is the high-compression-ratio,
-low-throughput mode, so all of them are floors (see
-[kae-limitations.md](kae-limitations.md)).
+| files | experiment |
+|---|---|
+| `machine.txt`, `rev.txt`, `probe.txt` | host, devices, `perf_mode`, library inventory, code revision, symbol probe |
+| `e1-base.tsv` | the anchor: sw, hw, hwasync and native on the same synthetic input (or `--input` file), default windows |
+| `e2-depth-{1,4,16,64,256}.tsv` | the verdict: single-queue throughput against in-flight depth, 64K, spin |
+| `e3-queues2.tsv`, `e3-queues4.tsv` | queue scaling at depth 8 (`--workers` = queues, round-robin over devices) |
+| `e4-spin-d8.tsv`, `e4-poll-d8.tsv` | wait policy: identical runs differing only in spin vs `poll()`-the-fd |
+| `e5-db1.tsv` | the doorbell tax: `KAE_NATIVE_DB_BATCH=1` against the full-depth batch |
+| `e6-small.tsv` | sustained small-block scan: 4K, 8K, 16K, 64K, 128K requests |
+| `native-fail-*.txt` | rebuild-check dumps, if any sample failed (the audit verdict inside names the side at fault) |
+| `summary.md` | every TSV as a table plus the computed readings (ladder saturation, spin-vs-poll CPU, queue scaling, doorbell) |
 
-## The experiments
+`--sweep` composes with the ordinary options where they make sense:
+`--input FILE` sweeps a real file instead of the synthetic dataset,
+`--size`, the library paths and the pass bounds pass through to every
+experiment.
 
-Each run fully rewrites its `--tsv` file, so every command names its
-own. No extra flags are needed beyond what is shown: every native row's
-`note` field carries the exact configuration
-(`alg,queues,depth,db_batch,wait,req_size,nvcsw,nivcsw[,pre_ratio]`).
+## Reading the results
 
-### E0 — plumbing check (seconds)
+- **Depth ladder saturates well above 4 GB/s** → the engine is faster
+  than the C stack; the kaelz4 async plateau is submit/harvest overhead,
+  and finishing the native backend is worth it.
+- **Depth ladder saturates at or below 4 GB/s** → the engine (or its
+  current `perf_mode` — see the next section) is the ceiling; no
+  userspace rewrite changes the placement verdict.
+- **`e4-poll-d8` at a fraction of `e4-spin-d8`'s CPU with equal
+  throughput** (`cpu s/GB`, and `nvcsw` in the row note) → the
+  sleep-until-IRQ design works end to end through uacce.
+- **`e3-queues*` vs `e4-spin-d8`** → whether a second device's queues
+  add throughput on top of the single-queue saturation point.
+- **`nvcsw`/`nivcsw` in every native row's note**: spin runs show ~zero
+  voluntary switches, poll runs many — the same one-number check
+  proposed for any wait-side rewrite.
 
-```bash
-KAE_NATIVE_ALG=deflate ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv /dev/null
-```
-
-Confirms the uacce dialog (open, SQE, doorbell, CQE) works on this
-machine: `status=OK` and no hw errors before anything else is worth
-running. `NO_DEVICE`/`OPEN_FAIL` here stops the sweep.
-
-### E1 — full baseline: all impls, one scan (~2–3 min)
-
-```bash
-./target/release/kae-bench --tsv e1-base.tsv
-```
-
-The anchor: sw, hw, hwasync and native on the same synthetic input, same
-driver mode. The 2.91 GB/s sync and ~4 GB/s async figures in
-[kae-limitations.md](kae-limitations.md) predate the one-input bench —
-re-anchor before comparing anything against them.
-
-### E2 — the depth ladder (the verdict)
-
-```bash
-for k in 1 4 16 64 256; do
-  KAE_NATIVE_DEPTH=$k ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e2-depth-$k.tsv
-done
-```
-
-The decisive curve: single-queue throughput against in-flight depth.
-Saturation well above 4 GB/s means the C-stack plateau is a userspace
-artifact and the native backend is worth finishing; saturation at or
-below it means the engine (or its current `perf_mode` — see the last
-section) is the ceiling. Depth 1024 is skipped deliberately: at 64K
-requests it asks for ~260 MiB of DMA-coherent SS memory per queue and
-fails in the mapping ([native-bench.md](native-bench.md)).
-
-### E3 — queue scaling
-
-```bash
-./target/release/kae-bench --impl native --workers 2 --blocks 65536 --min-sec 2 --tsv e3-queues2.tsv
-# with two or more devices, also:
-./target/release/kae-bench --impl native --workers 4 --blocks 65536 --min-sec 2 --tsv e3-queues4.tsv
-```
-
-Whether the second device's queues add throughput on top of E2's
-saturation point — the difference between one engine and two.
-
-### E4 — wait policy: spin vs poll
-
-```bash
-KAE_NATIVE_WAIT=poll ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e4-poll-d8.tsv
-# repeat at the depth K where E2 saturated:
-KAE_NATIVE_WAIT=poll KAE_NATIVE_DEPTH=<K> ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e4-poll-dbest.tsv
-```
-
-Same throughput at a fraction of the pump CPU (`cpu_s_per_gb`, and
-`nvcsw`/`nivcsw` in the note) is the sleep-until-IRQ design working
-end to end.
-
-### E5 — the doorbell tax
-
-```bash
-KAE_NATIVE_DB_BATCH=1 ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv e5-db1.tsv
-```
-
-Per-request doorbell stores against E2's default full-depth batching —
-the MMIO cost the C stack pays on every single request.
-
-## Sending the results back
-
-```bash
-tar czf kae-native-data.tgz rev.txt machine.txt \
-  e1-base.tsv e2-depth-*.tsv e3-*.tsv e4-*.tsv e5-db1.tsv \
-  native-fail-*.txt
-```
-
-`native-fail-*.txt` are the rebuild-check dumps a failing sample run
-leaves in the working directory — each carries the audit verdict that
-names the side at fault (see [native-bench.md](native-bench.md)), so
-include them whenever any `sample=failed` note appears in a TSV.
+Keep the two views straight: the native GB/s numbers are the **lz77
+ceiling view** (the engine's parse alone); the kae-vs-sw adoption
+comparison (throughput + CPU on the same LZ4 format) is read from the
+e1 sw/hw rows against the native rows' LZ4 ratio and CPU.
 
 ## If the ladder saturates at or below 4 GB/s
 
 Do not conclude "the engine is the ceiling" until the sweep has been
 repeated with the driver loaded `perf_mode=1`: under the default mode
 every number is a floor, so a ≤4 GB/s saturation may be the mode rather
-than the engine. Record how the driver is loaded (modprobe options,
-module parameter file), reload with `perf_mode=1`, and re-run E1–E5.
-A ladder that saturates above 4 GB/s under the default mode needs no
-second pass — the verdict is already in.
+than the engine. `machine.txt` records which mode every number was
+taken under. Reload the driver with `perf_mode=1` and re-run the sweep
+into a fresh directory.
+
+## Custom runs
+
+The sweep covers the standard series. For anything else the same
+commands work standalone — the knob reference and the per-experiment
+rationale are [native-bench.md](native-bench.md):
+
+```bash
+# a single experiment by hand
+KAE_NATIVE_DEPTH=4 ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv /dev/null
+
+# plumbing check before anything else: deflate dialect completes
+KAE_NATIVE_ALG=deflate ./target/release/kae-bench --impl native --blocks 65536 --min-sec 2 --tsv /dev/null
+```

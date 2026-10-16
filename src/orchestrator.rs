@@ -79,6 +79,8 @@ struct Config {
     json: String,
     probe: bool,
     host: String,
+    /// --sweep [DIR]: run the whole native experiment series into DIR.
+    sweep: Option<String>,
 }
 
 fn usage() {
@@ -105,6 +107,9 @@ usage: kae-bench [options]
   --tsv PATH        results TSV (default ./kae_bench_results.tsv; empty string disables)
   --json PATH       additional JSON output
   --probe           only probe the environment/symbols, then exit
+  --sweep [DIR]     one-shot native sweep: machine context + the full experiment
+                    series (E1 baseline, depth ladder, queues, wait policy, doorbell,
+                    small blocks) into DIR (default kae-sweep), packed as a tarball
   -h, --help        this help
 
 cargo bench equivalent: cargo bench -- [same options as above]"
@@ -181,6 +186,7 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
         json: String::new(),
         probe: false,
         host: read_hostname(),
+        sweep: None,
     };
     let mut i = 0;
     let val = |i: &mut usize, name: &str| -> Result<String, String> {
@@ -250,6 +256,16 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             "--tsv" => c.tsv = val(&mut i, "--tsv")?,
             "--json" => c.json = val(&mut i, "--json")?,
             "--probe" => c.probe = true,
+            "--sweep" => {
+                // the directory value is optional
+                match args.get(i + 1) {
+                    Some(v) if !v.starts_with('-') => {
+                        c.sweep = Some(v.clone());
+                        i += 1;
+                    }
+                    _ => c.sweep = Some("kae-sweep".into()),
+                }
+            }
             // cargo bench appends libtest's customary flags to a harness=false binary; ignore them
             "--bench" | "--test" | "--nocapture" | "--exact" | "--include-ignored" | "--list" => {}
             "-h" | "--help" => {
@@ -444,14 +460,7 @@ fn env_report(cfg: &Config) {
     let kernel = read("/proc/sys/kernel/osrelease").trim().to_string();
     println!("host:           {}", cfg.host);
     println!("kernel:         {kernel}");
-    let cpuinfo = read("/proc/cpuinfo");
-    let model = cpuinfo
-        .lines()
-        .find(|l| l.starts_with("model name"))
-        .or_else(|| cpuinfo.lines().find(|l| l.starts_with("CPU part")))
-        .map(|l| l.split(':').nth(1).unwrap_or("?").trim().to_string())
-        .unwrap_or_else(|| "unknown".into());
-    println!("cpu:            {model}");
+    println!("cpu:            {}", cpu_model());
     let uacce = uacce_devices();
     println!(
         "uacce devices:  {}",
@@ -812,6 +821,407 @@ fn summarize(cfg: &Config, rows: &[Row]) {
     }
 }
 
+// ---------- the one-shot sweep: the whole experiment series in one command ----------
+
+/// The sweep's native experiments run at 64K requests in sustained windows
+/// (the 0.8s default reads boost clocks: the first sweep's 64K rows read
+/// 9.6 GB/s at 0.8s and 6.4 GB/s at 2s).
+const SWEEP_BLOCK: usize = 65536;
+const SWEEP_MIN_SEC: f64 = 2.0;
+const SWEEP_DEPTHS: [usize; 5] = [1, 4, 16, 64, 256];
+const SWEEP_SMALL_BLOCKS: &str = "4096,8192,16384,65536,131072";
+
+/// One experiment of the sweep: a full kae-bench run (this same binary
+/// re-executed, so sw/hw keep their subprocess isolation) with its own TSV
+/// and the native knobs pinned explicitly — no run inherits ambient
+/// KAE_NATIVE_* variables.
+struct SweepExp {
+    name: String,
+    args: Vec<String>,
+    env: Vec<(&'static str, String)>,
+}
+
+/// One parsed TSV data row (the sweep summary reads its own outputs).
+struct SweepRow {
+    block: u64,
+    impl_name: String,
+    op: String,
+    gbps: f64,
+    ratio_pct: f64,
+    cpu_per_gb: f64,
+    verify: String,
+    status: String,
+    note: String,
+}
+
+fn read_tsv_rows(path: &Path) -> Vec<SweepRow> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .skip(1) // the host comment
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            if c.len() < 11 {
+                return None;
+            }
+            Some(SweepRow {
+                block: c[1].parse().ok()?,
+                impl_name: c[2].into(),
+                op: c[3].into(),
+                gbps: c[4].parse().unwrap_or(0.0),
+                ratio_pct: c[5].parse().unwrap_or(0.0),
+                cpu_per_gb: c[6].parse().unwrap_or(0.0),
+                verify: c[8].into(),
+                status: c[9].into(),
+                note: c[10].into(),
+            })
+        })
+        .collect()
+}
+
+/// The CPU model line for the env report and the sweep's machine context.
+fn cpu_model() -> String {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    cpuinfo
+        .lines()
+        .find(|l| l.starts_with("model name"))
+        .or_else(|| cpuinfo.lines().find(|l| l.starts_with("CPU part")))
+        .map(|l| l.split(':').nth(1).unwrap_or("?").trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Machine context of the sweep host: what every number below was taken
+/// under (devices, driver mode, libraries, code revision).
+fn write_sweep_context(cfg: &Config, dir: &Path, exe: &Path) {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let mut zips: Vec<String> = std::fs::read_dir("/dev")
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("hisi_zip"))
+                .collect()
+        })
+        .unwrap_or_default();
+    zips.sort();
+    let perf = read("/sys/module/hisi_zip/parameters/perf_mode");
+    let mut m = format!(
+        "host: {}\nkernel: {}\ncpu: {}\nuacce devices: {}\nzip nodes: {}\nsw lib: {}\nhw lib: {}\nperf_mode: {}\n",
+        cfg.host,
+        read("/proc/sys/kernel/osrelease").trim(),
+        cpu_model(),
+        uacce_devices().join(" "),
+        zips.join(" "),
+        cfg.sw_lib,
+        if cfg.hw_lib.is_empty() { "NOT FOUND" } else { &cfg.hw_lib },
+        if perf.is_empty() { "unknown (module parameter file absent)" } else { perf.trim() },
+    );
+    m.push_str(&format!(
+        "unix_time: {}\n",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::write(dir.join("machine.txt"), m);
+
+    let rev = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "git unavailable".into());
+    let _ = std::fs::write(dir.join("rev.txt"), rev);
+
+    let mut probe_cmd = Command::new(exe);
+    probe_cmd
+        .arg("--probe")
+        .arg("--sw-lz4-lib")
+        .arg(&cfg.sw_lib);
+    if !cfg.hw_lib.is_empty() {
+        probe_cmd.arg("--hw-lz4-lib").arg(&cfg.hw_lib);
+    }
+    if let Ok(o) = probe_cmd.output() {
+        let _ = std::fs::write(dir.join("probe.txt"), o.stdout);
+    }
+}
+
+/// The experiment series: E1 baseline, the depth ladder, queue scaling,
+/// both wait policies at depth 8, the doorbell tax, and the sustained
+/// small-block scan. Every native run pins depth/batch/wait explicitly.
+fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
+    let base = || -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        if !cfg.input.is_empty() {
+            a.extend(["--input".to_string(), cfg.input.clone()]);
+        } else {
+            a.extend(["--size".to_string(), cfg.size_mib.to_string()]);
+        }
+        a.extend(["--sw-lz4-lib".to_string(), cfg.sw_lib.clone()]);
+        if !cfg.hw_lib.is_empty() {
+            a.extend(["--hw-lz4-lib".to_string(), cfg.hw_lib.clone()]);
+        }
+        a.extend([
+            "--passes-min".to_string(),
+            cfg.passes_min.to_string(),
+            "--passes-max".to_string(),
+            cfg.passes_max.to_string(),
+        ]);
+        a
+    };
+    let mut exps = vec![SweepExp {
+        name: "e1-base".into(),
+        args: {
+            let mut a = base();
+            a.extend([
+                "--blocks".to_string(),
+                cfg.blocks
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "--min-sec".to_string(),
+                cfg.min_sec.to_string(),
+            ]);
+            a
+        },
+        env: vec![],
+    }];
+    if !native_available() {
+        return exps;
+    }
+    let b64 = SWEEP_BLOCK.to_string();
+    let native = |blocks: &str| -> Vec<String> {
+        let mut a = base();
+        a.extend([
+            "--impl".to_string(),
+            "native".to_string(),
+            "--blocks".to_string(),
+            blocks.to_string(),
+            "--min-sec".to_string(),
+            SWEEP_MIN_SEC.to_string(),
+        ]);
+        a
+    };
+    let knobs =
+        |depth: usize, batch: usize, wait: &str| -> Vec<(&'static str, String)> {
+            vec![
+                ("KAE_NATIVE_DEPTH", depth.to_string()),
+                ("KAE_NATIVE_DB_BATCH", batch.to_string()),
+                ("KAE_NATIVE_WAIT", wait.to_string()),
+            ]
+        };
+    for k in SWEEP_DEPTHS {
+        exps.push(SweepExp {
+            name: format!("e2-depth-{k}"),
+            args: native(&b64),
+            env: knobs(k, k, "spin"),
+        });
+    }
+    for q in [2usize, 4] {
+        let mut a = native(&b64);
+        a.extend(["--workers".to_string(), q.to_string()]);
+        exps.push(SweepExp {
+            name: format!("e3-queues{q}"),
+            args: a,
+            env: knobs(8, 8, "spin"),
+        });
+    }
+    exps.push(SweepExp {
+        name: "e4-spin-d8".into(),
+        args: native(&b64),
+        env: knobs(8, 8, "spin"),
+    });
+    exps.push(SweepExp {
+        name: "e4-poll-d8".into(),
+        args: native(&b64),
+        env: knobs(8, 8, "poll"),
+    });
+    exps.push(SweepExp {
+        name: "e5-db1".into(),
+        args: native(&b64),
+        env: knobs(8, 1, "spin"),
+    });
+    exps.push(SweepExp {
+        name: "e6-small".into(),
+        args: native(SWEEP_SMALL_BLOCKS),
+        env: knobs(8, 8, "spin"),
+    });
+    exps
+}
+
+/// The computed readings over the sweep's own TSVs, as summary.md's tail.
+fn sweep_readings(dir: &Path) -> String {
+    let ok_row = |name: &str| -> Option<SweepRow> {
+        read_tsv_rows(&dir.join(format!("{name}.tsv")))
+            .into_iter()
+            .find(|r| r.op == "compress" && r.status == "OK")
+    };
+    let mut s = String::from("\n## readings\n\n");
+    let ladder: Vec<(usize, f64)> = SWEEP_DEPTHS
+        .iter()
+        .filter_map(|k| ok_row(&format!("e2-depth-{k}")).map(|r| (*k, r.gbps)))
+        .collect();
+    if !ladder.is_empty() {
+        s.push_str(&format!(
+            "- depth ladder (64K, spin, 1 queue): {}\n",
+            ladder
+                .iter()
+                .map(|(k, g)| format!("d{k} {g:.2}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if let Some((k, _)) = ladder
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .and_then(|(_, max)| {
+                ladder
+                    .iter()
+                    .find(|(_, g)| *g >= max * 0.99)
+                    .map(|(k, _)| (k, ()))
+            })
+        {
+            s.push_str(&format!("  saturates at depth {k}.\n"));
+        }
+    }
+    if let (Some(sp), Some(po)) = (ok_row("e4-spin-d8"), ok_row("e4-poll-d8")) {
+        s.push_str(&format!(
+            "- wait policy at depth 8: spin {:.2} GB/s @ {:.2} s/GB vs poll {:.2} GB/s @ {:.2} s/GB\n",
+            sp.gbps, sp.cpu_per_gb, po.gbps, po.cpu_per_gb
+        ));
+    }
+    if let Some(q1) = ok_row("e4-spin-d8").map(|r| r.gbps) {
+        let line = ok_row("e3-queues2")
+            .map(|r| format!("2q {q1:.2} -> {:.2}", r.gbps))
+            .unwrap_or_default();
+        let line = match ok_row("e3-queues4") {
+            Some(r) => format!("{line}, 4q -> {:.2}", r.gbps),
+            None => line,
+        };
+        if !line.is_empty() {
+            s.push_str(&format!("- queue scaling: {line} GB/s\n"));
+        }
+    }
+    if let (Some(b), Some(d1)) = (ok_row("e4-spin-d8"), ok_row("e5-db1")) {
+        s.push_str(&format!(
+            "- doorbell: full-depth batch {:.2} GB/s vs db_batch=1 {:.2} GB/s\n",
+            b.gbps, d1.gbps
+        ));
+    }
+    s
+}
+
+fn write_sweep_summary(cfg: &Config, dir: &Path, dumps: usize) {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tsv"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let mut s = format!(
+        "# kae native sweep — {}\n\nPer-experiment data in the .tsv files, full worker output in the .log files, machine context in machine.txt/rev.txt/probe.txt.\n",
+        cfg.host
+    );
+    for n in &names {
+        let rows = read_tsv_rows(&dir.join(n));
+        if rows.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("\n## {}\n\n", n.trim_end_matches(".tsv")));
+        s.push_str("| block | impl | op | GB/s | ratio% | cpu s/GB | verify | status | note |\n");
+        s.push_str("|---|---|---|---|---|---|---|---|---|\n");
+        for r in &rows {
+            s.push_str(&format!(
+                "| {} | {} | {} | {:.2} | {:.1} | {:.2} | {} | {} | {} |\n",
+                r.block,
+                r.impl_name,
+                r.op,
+                r.gbps,
+                r.ratio_pct,
+                r.cpu_per_gb,
+                if r.verify.is_empty() { "-" } else { &r.verify },
+                r.status,
+                r.note
+            ));
+        }
+    }
+    s.push_str(&sweep_readings(dir));
+    if dumps > 0 {
+        s.push_str(&format!(
+            "\n{dumps} rebuild-check dump(s) collected here (native-fail-*.txt); the audit verdict inside names the side at fault.\n"
+        ));
+    }
+    let _ = std::fs::write(dir.join("summary.md"), s);
+}
+
+/// --sweep: run the whole experiment series once, leave every number in
+/// `dir` (one TSV + one log per experiment, machine context, summary.md,
+/// any rebuild-check dumps). Nothing is mailed or packed — the directory
+/// is the deliverable.
+fn run_sweep(cfg: &Config, dir: &Path) -> i32 {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("kae-bench: --sweep: {e}");
+        return 1;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kae-bench"));
+    println!("== kae-bench sweep -> {} ==", dir.display());
+    write_sweep_context(cfg, dir, &exe);
+    let exps = sweep_experiments(cfg);
+    let total = exps.len();
+    if !native_available() {
+        println!("(no /dev/hisi_zip-* device: only the e1 baseline runs)");
+    }
+    for (i, exp) in exps.iter().enumerate() {
+        print!("[{:2}/{}] {:<12} ... ", i + 1, total, exp.name);
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let tsv = dir.join(format!("{}.tsv", exp.name));
+        let mut cmd = Command::new(&exe);
+        cmd.args(&exp.args).arg("--tsv").arg(&tsv);
+        for (k, v) in &exp.env {
+            cmd.env(k, v);
+        }
+        match cmd.output() {
+            Ok(o) => {
+                let log = format!(
+                    "{}\n--- stderr ---\n{}\n--- exit: {} ---\n",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                    o.status
+                );
+                let _ = std::fs::write(dir.join(format!("{}.log", exp.name)), log);
+                match read_tsv_rows(&tsv)
+                    .into_iter()
+                    .find(|r| r.op == "compress" && r.status == "OK")
+                {
+                    Some(r) => println!("OK  {:.2} GB/s, {:.2} s/GB", r.gbps, r.cpu_per_gb),
+                    None => println!("no OK compress row (see {}/{}.log)", dir.display(), exp.name),
+                }
+            }
+            Err(e) => println!("spawn failed: {e}"),
+        }
+    }
+    // the workers leave rebuild-check dumps in the cwd; move them in
+    let mut dumps = 0usize;
+    if let Ok(rd) = std::fs::read_dir(".") {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if name.to_string_lossy().starts_with("native-fail-") {
+                let _ = std::fs::rename(e.path(), dir.join(&name));
+                dumps += 1;
+            }
+        }
+    }
+    write_sweep_summary(cfg, dir, dumps);
+    println!("sweep data: {} (summary.md, *.tsv, *.log, machine context)", dir.display());
+    0
+}
+
 pub fn main() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(|s| s.as_str()) == Some("--_worker") {
@@ -824,6 +1234,9 @@ pub fn main() -> i32 {
             return 1;
         }
     };
+    if let Some(dir) = cfg.sweep.clone() {
+        return run_sweep(&cfg, Path::new(&dir));
+    }
     env_report(&cfg);
     if cfg.probe {
         probe(&cfg);
