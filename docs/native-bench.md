@@ -57,19 +57,33 @@ the engine itself is the limit and the placement verdict is final.
   well-formed submit/harvest loop.
 - **Standard LZ4 output via the triple rebuild.** After the timed run the
   worker rebuilds the first sample blocks' triples into standard LZ4
-  block format (`src/rebuild.rs`, same arithmetic as the kaelz4 rebuild)
-  and writes the packed sample file. The orchestrator's verify op decodes
-  it with the system liblz4 exactly like the library-backed cells, and
-  the row's `ratio_pct` is the rebuilt blocks' true LZ4 ratio (the
-  pre-rebuild triples ratio lands in the `note` as `pre_ratio`). Where no
+  format (`src/rebuild.rs`, same arithmetic as the kaelz4 rebuild) and
+  writes the packed sample file. A block spanning several hardware
+  requests joins its request streams into one continuous LZ4 stream
+  (non-terminal requests drop an empty closing token; the last one keeps
+  it — liblz4 requires the final literal token even when empty). The
+  orchestrator's verify op decodes it with the system liblz4 exactly like
+  the library-backed cells, and the row's `ratio_pct` is the rebuilt
+  blocks' true LZ4 ratio (the pre-rebuild triples ratio lands in the
+  `note` as `pre_ratio`, next to `rebuild_s_per_gb` — the software
+  triple-to-LZ4 conversion cost, the number an end-to-end native LZ4
+  pipeline would add to the engine's parse time). Where no
   sample is possible — the `deflate` dialect, a block that is not a
   request-size multiple, a manual worker run without `--sample-out` — the
   ratio falls back to the pre-rebuild engine output and the `note` names
   it. The same applies when a sample rebuild **fails**: the timed engine
   numbers stand, the row stays `OK`, and the note records
   `sample=failed:<cause>` (the row's err= and the worker's stderr also
-  surface in the summary/TSV note). The decompress cell depends on the
-  rebuild and fails its cell instead — the decode has nothing to decode.
+  surface in the summary/TSV note). A failed request's check runs the
+  triple audit (`rebuild::audit_triples`: every match's bytes must equal
+  the bytes at `position - offset`, and the engine's literal area must
+  equal the walk's literal spans) — its verdict in the note and dump
+  names the side at fault: a violated rule means the engine's triples
+  are inconsistent, `Ok` means the LZ4 encoding is. The full evidence
+  (triples, rebuilt bytes, literal area, input) lands on stderr and in
+  `native-fail-<request>.txt` in the worker's working directory. The
+  decompress cell depends on the rebuild and fails its cell instead —
+  the decode has nothing to decode.
 
 ## Running
 
@@ -123,8 +137,10 @@ KAE_NATIVE_WAIT=poll ./target/release/kae-bench --impl native --blocks 65536
 KAE_NATIVE_DB_BATCH=1 ./target/release/kae-bench --impl native --blocks 65536
 # (default batches a full depth per doorbell)
 
-# small-block economics
-./target/release/kae-bench --impl native --blocks 4096,16384,65536,131072
+# small-block economics (min-sec 2: the default 0.8s windows read
+# boost clocks — the same input read 9.6 GB/s at 0.8s and 6.4 GB/s
+# sustained at 2s in the first sweep)
+./target/release/kae-bench --impl native --blocks 4096,16384,65536,131072 --min-sec 2
 ```
 
 Repeat the sweep after loading the driver with `perf_mode=1` (see
@@ -160,11 +176,13 @@ number taken under it is a floor.
   process entirely. The decompress cell needs the lz77 dialect (deflate
   output is not LZ4) and blocks that are request-size multiples.
 - The decompress setup rebuilds **every** request from live hardware
-  triples (one request per `req_size` slice, untimed) and bit-checks
-  each rebuilt request against its original before the timed decode
-  loop — a full-pipeline self-test per run. The first failing request
-  dumps its triples, rebuilt bytes, the engine's literals area and the
-  input to the worker's stderr. The setup is one request in flight
+  triples (one request per `req_size` slice, untimed), joins each
+  block's request streams into one continuous LZ4 stream, and bit-checks
+  each request's rebuilt bytes against its original before the timed
+  decode loop — a full-pipeline self-test per run. The first failing
+  request dumps its triples, rebuilt bytes, the engine's literals area
+  and the input to the worker's stderr and `native-fail-<request>.txt`,
+  with the audit verdict in both. The setup is one request in flight
   on one queue; `KAE_NATIVE_DEPTH`/`KAE_NATIVE_DB_BATCH`/`KAE_NATIVE_WAIT`
   still shape that queue.
 - The SS region needs ~`depth × 4 × req_size` bytes per queue; at the

@@ -14,7 +14,7 @@
 use crate::lz4::PROBE_SYMBOLS;
 use crate::lz4dec;
 use crate::rebuild;
-use crate::sysres::{timed_loop, timed_pool_loop, LoopStats};
+use crate::sysres::{now_s, timed_loop, timed_pool_loop, LoopStats};
 use crate::uacce;
 use crate::{AsyncBatch, Backend, KaeLz4};
 use std::fs;
@@ -554,8 +554,8 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
             sample_note = ",sample=skipped:block_not_request_multiple".into();
         } else {
             match build_native_sample(&mut pump, data, block, nblocks, req_size, &a.sample_out) {
-                Ok((packed, count)) => {
-                    sample_note = format!(",pre_ratio={ratio_pct:.1}");
+                Ok((packed, count, rebuild_s_per_gb)) => {
+                    sample_note = format!(",pre_ratio={ratio_pct:.1},rebuild_s_per_gb={rebuild_s_per_gb:.3}");
                     ratio_pct = packed as f64 / (count as u64 * block as u64) as f64 * 100.0;
                 }
                 Err(e) => {
@@ -640,29 +640,50 @@ fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
     }
 }
 
-/// The full evidence for one failed rebuild check on the worker's
-/// stderr: the request's triples, the rebuilt block, the engine's
-/// literals area and the input — enough to replay the triple rules
-/// offline.
+/// The full evidence for one failed rebuild check: on stderr and in a
+/// dump file next to the run (the sweep tarball picks the file up; the
+/// console line may be lost). The audit verdict names the side at fault:
+/// a violated rule means the engine's triples are inconsistent (match
+/// bytes or literal area), `Ok` means the triples are fine and the LZ4
+/// encoding is.
 fn dump_rebuild_check(
     label: &str,
     sample: &uacce::Lz77Sample,
     input: &[u8],
     block: &[u8],
     e: &str,
+    audit: &Result<(), String>,
 ) {
-    eprintln!("native: {label} rebuild check failed: {e}");
-    eprintln!(
-        "native: lit={} ll_overflow_cnt={} ll_overflow_pos={} seqs={}",
-        sample.lit,
-        sample.ll_overflow_cnt,
-        sample.ll_overflow_pos,
-        sample.seqs.len() / 8
-    );
-    eprintln!("native: triples: {}", hex(&sample.seqs));
-    eprintln!("native: block: {}", hex(block));
-    eprintln!("native: lits: {}", hex(&sample.lits));
-    eprintln!("native: input: {}", hex(input));
+    let verdict = match audit {
+        Ok(()) => "triples self-consistent (match bytes and literal area agree): \
+                   the LZ4 encoding is at fault"
+            .to_string(),
+        Err(a) => a.clone(),
+    };
+    let lines = vec![
+        format!("native: {label} rebuild check failed: {e}"),
+        format!(
+            "native: lit={} ll_overflow_cnt={} ll_overflow_pos={} overflow={} seqs={}",
+            sample.lit,
+            sample.ll_overflow_cnt,
+            sample.ll_overflow_pos,
+            hex(&sample.overflow),
+            sample.seqs.len() / 8
+        ),
+        format!("native: audit: {verdict}"),
+        format!("native: triples: {}", hex(&sample.seqs)),
+        format!("native: block: {}", hex(block)),
+        format!("native: lits: {}", hex(&sample.lits)),
+        format!("native: input: {}", hex(input)),
+    ];
+    for l in &lines {
+        eprintln!("{l}");
+    }
+    let path = format!("native-fail-{}.txt", flat(label));
+    match fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()) {
+        Ok(()) => eprintln!("native: full dump written to {path}"),
+        Err(w) => eprintln!("native: dump write to {path} failed: {w}"),
+    }
 }
 
 /// Why one request's rebuild failed: the stage and its flat-ready
@@ -694,22 +715,39 @@ impl RebuildFailure {
 }
 
 /// One `req_size` request through the engine and back: sample its triples
-/// off the engine, rebuild them into a standard LZ4 block in `stream`, and
+/// off the engine, rebuild them into a standard LZ4 stream in `stream`, and
 /// require the decode to return the original bytes. A self-check failure
-/// dumps the request's full evidence (`label` names it in the dump header).
-/// Returns the rebuilt block's length in `stream`.
+/// runs the triple audit and dumps the request's full evidence (`label`
+/// names it in the dump and the dump file). `terminal` blocks close with
+/// the literal run even when empty; non-terminal segments join into the
+/// following request's stream. `rebuild_s` accumulates the pure
+/// triple-to-LZ4 conversion time (the sample path reports it; the decode
+/// setup passes a throwaway). Returns the rebuilt stream's length.
 fn rebuild_request(
     pump: &mut uacce::NativePump,
     chunk: &[u8],
     stream: &mut Vec<u8>,
     label: &str,
+    terminal: bool,
+    rebuild_s: &mut f64,
 ) -> Result<usize, RebuildFailure> {
     let sample = pump.sample_triples(chunk).map_err(RebuildFailure::Triples)?;
-    let n = rebuild::lz77_block(chunk, &sample.seqs, stream)
-        .map_err(|e| RebuildFailure::Rebuild(rebuild_fail_detail(&sample, &e)))?;
+    let t0 = now_s();
+    let rebuilt = if terminal {
+        rebuild::lz77_block(chunk, &sample.seqs, stream)
+    } else {
+        rebuild::lz77_segment(chunk, &sample.seqs, stream)
+    };
+    *rebuild_s += now_s() - t0;
+    let n = rebuilt.map_err(|e| RebuildFailure::Rebuild(rebuild_fail_detail(&sample, &e)))?;
     if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
-        dump_rebuild_check(label, &sample, chunk, &stream[..n], &e);
-        return Err(RebuildFailure::Check(e));
+        let audit = rebuild::audit_triples(chunk, &sample.seqs, Some(&sample.lits));
+        dump_rebuild_check(label, &sample, chunk, &stream[..n], &e, &audit);
+        let verdict = match audit {
+            Ok(()) => "triples self-consistent, LZ4 encoding at fault".to_string(),
+            Err(a) => a,
+        };
+        return Err(RebuildFailure::Check(format!("{e}; audit: {verdict}")));
     }
     Ok(n)
 }
@@ -779,11 +817,14 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     pump.run(0.1); // settle the queue the same way a bench run does
 
     // untimed setup: rebuild every block from its hardware triples into
-    // standard LZ4
+    // standard LZ4, joining the per-request streams into one continuous
+    // block stream (non-terminal requests drop an empty closing token, so
+    // the block decodes as a single LZ4 unit)
     let per_block = block / req_size;
     let mut blob: Vec<u8> = Vec::with_capacity(data.len());
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
     let mut stream = Vec::new();
+    let mut rebuild_s = 0.0f64;
     for b in 0..nblocks {
         let base = blob.len();
         for r in 0..per_block {
@@ -794,6 +835,8 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
                 &data[off..off + req_size],
                 &mut stream,
                 &format!("request {req_idx} (data {off}..{})", off + req_size),
+                r == per_block - 1,
+                &mut rebuild_s,
             ) {
                 Ok(n) => n,
                 Err(f) => {
@@ -882,10 +925,12 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     EXIT_OK
 }
 
-/// Rebuild the first blocks of the workload into standard LZ4 blocks (one
-/// hardware request per `req_size` slice, engine idle after the timed run)
-/// and write the packed sample file. Returns (rebuilt bytes, blocks
-/// covered). `block` must be a `req_size` multiple — the caller checks.
+/// Rebuild the first blocks of the workload into standard LZ4 streams (one
+/// hardware request per `req_size` slice, engine idle after the timed run),
+/// joining each block's request streams into one continuous LZ4 stream, and
+/// write the packed sample file. Returns (rebuilt bytes, blocks covered,
+/// pure triple-to-LZ4 seconds per GB). `block` must be a `req_size`
+/// multiple — the caller checks.
 fn build_native_sample(
     pump: &mut uacce::NativePump,
     data: &[u8],
@@ -893,12 +938,13 @@ fn build_native_sample(
     nblocks: usize,
     req_size: usize,
     path: &str,
-) -> Result<(u64, usize), String> {
+) -> Result<(u64, usize, f64), String> {
     let count = sample_block_count(block, nblocks);
     let per_block = block / req_size;
     let mut packed: Vec<u8> = Vec::new();
     let mut lens = Vec::with_capacity(count);
     let mut stream = Vec::new();
+    let mut rebuild_s = 0.0f64;
     for b in 0..count {
         let base = packed.len();
         for r in 0..per_block {
@@ -909,6 +955,8 @@ fn build_native_sample(
                 chunk,
                 &mut stream,
                 &format!("request {} (data {off}..{})", b * per_block + r, off + req_size),
+                r == per_block - 1,
+                &mut rebuild_s,
             )
             .map_err(|f| format!("{}: {} (block {b} request {r})", f.stage(), f.detail()))?;
             packed.extend_from_slice(&stream[..n]);
@@ -916,7 +964,8 @@ fn build_native_sample(
         lens.push(packed.len() - base);
     }
     write_sample(path, block, &lens, &packed, count).map_err(|e| format!("write_sample: {e}"))?;
-    Ok((packed.len() as u64, count))
+    let gb = count as f64 * block as f64 / 1e9;
+    Ok((packed.len() as u64, count, rebuild_s / gb))
 }
 
 /// Packed sample file layout: [magic][block][count] + per-block (clen +

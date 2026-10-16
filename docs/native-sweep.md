@@ -117,8 +117,14 @@ the MMIO cost the C stack pays on every single request.
 
 ```bash
 tar czf kae-native-data.tgz rev.txt machine.txt \
-  e1-base.tsv e2-depth-*.tsv e3-*.tsv e4-*.tsv e5-db1.tsv
+  e1-base.tsv e2-depth-*.tsv e3-*.tsv e4-*.tsv e5-db1.tsv \
+  native-fail-*.txt
 ```
+
+`native-fail-*.txt` are the rebuild-check dumps a failing sample run
+leaves in the working directory — each carries the audit verdict that
+names the side at fault (see [native-bench.md](native-bench.md)), so
+include them whenever any `sample=failed` note appears in a TSV.
 
 ## If the ladder saturates at or below 4 GB/s
 

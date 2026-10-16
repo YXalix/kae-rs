@@ -33,6 +33,25 @@ const ML_MASK: usize = 15;
 /// Rebuild one request's triples (`seqs*8` bytes) against its original
 /// `input` into `out` (cleared first); returns the LZ4 block length.
 pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
+    walk_triples(input, seqs, out, true)
+}
+
+/// Rebuild one request as the non-final segment of a joined stream (a
+/// bench block the caller assembles from several request streams). The
+/// closing literal run is emitted only when non-empty: an empty trailing
+/// token mid-stream would make the next segment's first two bytes decode
+/// as a match offset. (liblz4 requires a final literal token even when
+/// empty, so the last segment always closes through [`lz77_block`].)
+pub(crate) fn lz77_segment(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
+    walk_triples(input, seqs, out, false)
+}
+
+fn walk_triples(
+    input: &[u8],
+    seqs: &[u8],
+    out: &mut Vec<u8>,
+    terminal: bool,
+) -> Result<usize, String> {
     if seqs.len() % 8 != 0 {
         return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
     }
@@ -97,9 +116,138 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
         ));
     }
 
-    // the unmatched tail is the final literal run (no match, block ends)
-    push_literal_run(out, &input[ip..]);
+    // the unmatched tail is the closing literal run (no match after it);
+    // dropped only for a non-terminal segment whose tail is empty
+    if terminal || ip < input.len() {
+        push_literal_run(out, &input[ip..]);
+    }
     Ok(out.len())
+}
+
+/// Check one request's triples against its input — and, when the engine's
+/// literal area is available, against the parse it describes — without
+/// producing output. A valid lz77 parse satisfies two local rules the
+/// rebuild's correctness stands on, and each failure names the side at
+/// fault:
+///
+/// - every match's covered bytes equal the bytes at `position - offset`
+///   (the decoder copies output to output, and the output is the input).
+///   A violation means the engine emitted a match that does not match.
+/// - the engine's literal area, read linearly, is exactly the walk's
+///   literal spans (the area never covers the MFLIMIT tail past the parse
+///   length). A divergence means the fold credit or literal-length
+///   reading is wrong, not the offsets.
+///
+/// `Ok` with both rules holding and a failing decode would mean the LZ4
+/// encoding itself (the token/extension arithmetic) is at fault.
+pub(crate) fn audit_triples(
+    input: &[u8],
+    seqs: &[u8],
+    lits: Option<&[u8]>,
+) -> Result<(), String> {
+    if seqs.len() % 8 != 0 {
+        return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
+    }
+    let mut lit_cur = 0usize;
+    let mut pending_lit = 0usize;
+    let mut ip = 0usize;
+    for (ti, t) in seqs.chunks_exact(8).enumerate() {
+        let lit_len = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+        let off_base = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
+        let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
+        if ml_base == 0 {
+            pending_lit += lit_len + 3;
+            continue;
+        }
+        let lit = lit_len + pending_lit;
+        pending_lit = 0;
+        let at = ip + lit; // the decoded position the match starts at
+        if at > input.len() {
+            return Err(format!("triple {ti} literals overrun the input"));
+        }
+        if let Some(area) = lits {
+            let n = (area.len() - lit_cur).min(lit);
+            if area[lit_cur..lit_cur + n] != input[ip..ip + n] {
+                let d = area[lit_cur..lit_cur + n]
+                    .iter()
+                    .zip(&input[ip..ip + n])
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                return Err(format!(
+                    "literal area diverges at {cur}B (triple {ti}): engine 0x{engine:02x} vs walk 0x{walk:02x} at +{d}B",
+                    cur = lit_cur + d,
+                    engine = area[lit_cur + d],
+                    walk = input[ip + d],
+                ));
+            }
+            lit_cur += n;
+            if n < lit {
+                return Err(format!(
+                    "literal area ends after {lit_cur}B; triple {ti} still expects literals"
+                ));
+            }
+        }
+        let off = off_base + 1;
+        let ml = ml_base + 3;
+        if off > at {
+            return Err(format!(
+                "triple {ti} offset {off} reaches before the block start ({at}B decoded)"
+            ));
+        }
+        if at + ml > input.len() {
+            return Err(format!(
+                "triple {ti} match overruns the input ({at}+{ml}>{}B)",
+                input.len()
+            ));
+        }
+        if input[at..at + ml] != input[at - off..at + ml - off] {
+            let d = input[at..at + ml]
+                .iter()
+                .zip(&input[at - off..at + ml - off])
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "triple {ti} match does not match its offset {off} (ml {ml}): input[{}+{d}] is 0x{:02x}, input[{}+{d}] is 0x{:02x}",
+                at,
+                input[at + d],
+                at - off,
+                input[at - off + d],
+            ));
+        }
+        ip = at + ml;
+    }
+    if ip > input.len() {
+        return Err(format!(
+            "triples consume {}B of a {}B input",
+            ip,
+            input.len()
+        ));
+    }
+    if let Some(area) = lits {
+        // the tail run covers everything up to the input end, so any
+        // literal bytes the walk did not reach are extra engine output
+        let tail = (area.len() - lit_cur).min(input.len() - ip);
+        if area[lit_cur..lit_cur + tail] != input[ip..ip + tail] {
+            let d = area[lit_cur..lit_cur + tail]
+                .iter()
+                .zip(&input[ip..ip + tail])
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "literal area diverges at {}B in the tail run: engine 0x{:02x} vs walk 0x{:02x}",
+                lit_cur + d,
+                area[lit_cur + d],
+                input[ip + d],
+            ));
+        }
+        if lit_cur + tail < area.len() {
+            return Err(format!(
+                "literal area has {} trailing bytes the walk never reached",
+                area.len() - lit_cur - tail
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Walk the triples exactly the way `lz77_block` does and return one line
@@ -281,6 +429,72 @@ mod tests {
         input.extend_from_slice(b"0123456789abcdefghij0123456789abcdefghij01234567");
         let seqs = [triple(1, 3, 29)].concat(); // 3 literals + 32-byte match at offset 1
         roundtrip(&input, &seqs);
+    }
+
+    /// The system liblz4 requires the closing literal token: a stream that
+    /// ends with a match decodes in-crate but is rejected by liblz4, and a
+    /// mid-stream empty tail makes the joined next segment decode its
+    /// first two bytes as an offset — segments drop it, terminals keep it.
+    #[test]
+    fn segment_drops_the_empty_tail_the_terminal_keeps() {
+        // one literal + a 4-byte match at offset 1 covers exactly the input
+        let input = b"aaaaa";
+        let seqs = triple(1, 1, 1);
+        let mut seg = Vec::new();
+        let n = lz77_segment(input, &seqs, &mut seg).expect("segment");
+        assert_eq!(n, seg.len());
+        roundtrip(input, &seqs); // the terminal form decodes standalone
+
+        let mut blk = Vec::new();
+        let m = lz77_block(input, &seqs, &mut blk).expect("block");
+        assert_eq!(m, blk.len());
+        assert_eq!(m, n + 1, "terminal adds exactly the empty tail token");
+        assert_eq!(*blk.last().unwrap(), 0x00, "terminal keeps the empty tail");
+
+        // joined: segment 1 (no tail token) + a terminal literal block
+        let tail_input = b"xyz";
+        let mut joined = seg.clone();
+        let mut second = Vec::new();
+        let n2 = lz77_block(tail_input, &[], &mut second).expect("second");
+        joined.extend_from_slice(&second[..n2]);
+        let mut dst = vec![0u8; input.len() + tail_input.len()];
+        let decoded = crate::lz4dec::decode_block(&joined, &mut dst).expect("joined decodes");
+        assert_eq!(&dst[..decoded], b"aaaaaxyz");
+    }
+
+    /// The audit passes a valid parse — including its literal area — and
+    /// pins each fault class to its side.
+    #[test]
+    fn audit_judges_matches_and_the_literal_area() {
+        let input = b"abcdefgh abcdefgh zzzzzzzz";
+        let seqs = [
+            triple(9, 10, 4), // "abcdefgh " + 7-byte match at offset 9
+            triple(1, 3, 0),  // fold: its literals land in the closing tail
+        ]
+        .concat();
+        // walk: lit 10 + ml 7 cover 0..17; the fold's credit rides in
+        // pending and the 9-byte tail closes the input
+        audit_triples(input, &seqs, None).expect("self-consistent parse");
+
+        // a match that does not match: offset 8 instead of 9
+        let bad_off = [triple(8, 10, 4)].concat();
+        let e = audit_triples(input, &bad_off, None).unwrap_err();
+        assert!(e.contains("does not match its offset"), "{e}");
+
+        // a match overrunning the input
+        let over = [triple(9, 10, 40)].concat();
+        let e = audit_triples(input, &over, None).unwrap_err();
+        assert!(e.contains("overruns the input"), "{e}");
+
+        // the engine's literal area diverges from the walked spans
+        let mut area = input[..10].to_vec();
+        area[3] ^= 0xff;
+        let e = audit_triples(input, &seqs, Some(&area)).unwrap_err();
+        assert!(e.contains("literal area diverges"), "{e}");
+
+        // the correct area agrees and the trailing bytes are the tail
+        let area = input[..10].to_vec();
+        audit_triples(input, &seqs, Some(&area)).expect("area agrees");
     }
 
     /// A literal-only triple (mlBase 0) folds its bytes into the next

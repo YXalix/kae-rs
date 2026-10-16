@@ -640,12 +640,14 @@ impl Queue {
         let (optr, _) = self.out[slot];
         let seq_area = unsafe { optr.add(lit_cap) };
         let ck = u32::from_le(sqe.checksum);
+        let overflow = unsafe { std::slice::from_raw_parts(seq_area.add(ntriples * 8), 8) }.to_vec();
         Ok(Lz77Sample {
             lits: unsafe { std::slice::from_raw_parts(optr, lit) }.to_vec(),
             seqs: unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) }.to_vec(),
             lit,
             ll_overflow_cnt: ck >> 24,
             ll_overflow_pos: ck & 0xff_ffff,
+            overflow,
         })
     }
 
@@ -802,6 +804,9 @@ pub struct Lz77Sample {
     /// literal-length overflow report (checksum dw): count and position
     pub ll_overflow_cnt: u32,
     pub ll_overflow_pos: u32,
+    /// the 8 overflow bytes the engine writes right after the triples
+    /// (uadk OVERFLOW_DATA_SIZE; their contents feed the freq block)
+    pub overflow: Vec<u8>,
 }
 
 /// A pool of hardware queues driven from one thread: submit everything,
