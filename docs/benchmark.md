@@ -15,7 +15,7 @@ mean about the hardware path — weaknesses and their root causes — see
 cargo build --release
 ./target/release/kae-bench --probe     # environment & symbol probe, then exit
 ./target/release/kae-bench             # full scan: sw / hw / hwasync / native (~2 min)
-./target/release/kae-bench --sweep     # the whole native experiment series into ./kae-sweep
+./target/release/kae-bench --sweep     # the whole native experiment series into ./kae-sweep.tsv
 ```
 
 Common invocations:
@@ -51,7 +51,7 @@ Common invocations:
 | `--passes-min N` / `--passes-max N` | 3 / 99 | Pass bounds per cell (the max caps a pathologically slow implementation) |
 | `--tsv PATH` | `./kae_bench_results.tsv` | TSV output (empty string disables) |
 | `--json PATH` | off | Additional JSON output |
-| `--sweep [DIR]` | off | Run the whole native experiment series once into DIR (`kae-sweep`): machine context + baseline + depth ladder + queues + wait policy + doorbell + small blocks, with `summary.md`; see [native-sweep.md](native-sweep.md) |
+| `--sweep [FILE]` | off | Run the whole native experiment series once into ONE file (`kae-sweep.tsv`): machine context + baseline + depth ladder + queues + wait policy + doorbell + small blocks + readings; see [native-sweep.md](native-sweep.md) |
 | `--probe` | off | Environment + symbol probe only |
 | `-h, --help` | | Help |
 

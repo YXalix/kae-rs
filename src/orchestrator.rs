@@ -107,9 +107,9 @@ usage: kae-bench [options]
   --tsv PATH        results TSV (default ./kae_bench_results.tsv; empty string disables)
   --json PATH       additional JSON output
   --probe           only probe the environment/symbols, then exit
-  --sweep [DIR]     one-shot native sweep: machine context + the full experiment
-                    series (E1 baseline, depth ladder, queues, wait policy, doorbell,
-                    small blocks) into DIR (default kae-sweep), packed as a tarball
+  --sweep [FILE]    one-shot native sweep: the whole experiment series (baseline,
+                    depth ladder, queues, wait policy, doorbell, small blocks) plus
+                    machine context and readings in ONE file (default kae-sweep.tsv)
   -h, --help        this help
 
 cargo bench equivalent: cargo bench -- [same options as above]"
@@ -257,13 +257,13 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             "--json" => c.json = val(&mut i, "--json")?,
             "--probe" => c.probe = true,
             "--sweep" => {
-                // the directory value is optional
+                // the file path is optional
                 match args.get(i + 1) {
                     Some(v) if !v.starts_with('-') => {
                         c.sweep = Some(v.clone());
                         i += 1;
                     }
-                    _ => c.sweep = Some("kae-sweep".into()),
+                    _ => c.sweep = Some("kae-sweep.tsv".into()),
                 }
             }
             // cargo bench appends libtest's customary flags to a harness=false binary; ignore them
@@ -841,14 +841,16 @@ struct SweepExp {
     env: Vec<(&'static str, String)>,
 }
 
-/// One parsed TSV data row (the sweep summary reads its own outputs).
+/// One parsed TSV data row (the sweep reads its per-experiment outputs).
 struct SweepRow {
+    data: String,
     block: u64,
     impl_name: String,
     op: String,
     gbps: f64,
     ratio_pct: f64,
     cpu_per_gb: f64,
+    wall_s: f64,
     verify: String,
     status: String,
     note: String,
@@ -867,12 +869,14 @@ fn read_tsv_rows(path: &Path) -> Vec<SweepRow> {
                 return None;
             }
             Some(SweepRow {
+                data: c[0].into(),
                 block: c[1].parse().ok()?,
                 impl_name: c[2].into(),
                 op: c[3].into(),
                 gbps: c[4].parse().unwrap_or(0.0),
                 ratio_pct: c[5].parse().unwrap_or(0.0),
                 cpu_per_gb: c[6].parse().unwrap_or(0.0),
+                wall_s: c[7].parse().unwrap_or(0.0),
                 verify: c[8].into(),
                 status: c[9].into(),
                 note: c[10].into(),
@@ -892,9 +896,10 @@ fn cpu_model() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Machine context of the sweep host: what every number below was taken
-/// under (devices, driver mode, libraries, code revision).
-fn write_sweep_context(cfg: &Config, dir: &Path, exe: &Path) {
+/// The sweep's machine context as comment-ready lines (no '#' prefix):
+/// what every number in the file was taken under (devices, driver mode,
+/// libraries, code revision, symbol probe).
+fn sweep_context(cfg: &Config, exe: &Path) -> Vec<String> {
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
     let mut zips: Vec<String> = std::fs::read_dir("/dev")
         .map(|rd| {
@@ -906,26 +911,6 @@ fn write_sweep_context(cfg: &Config, dir: &Path, exe: &Path) {
         .unwrap_or_default();
     zips.sort();
     let perf = read("/sys/module/hisi_zip/parameters/perf_mode");
-    let mut m = format!(
-        "host: {}\nkernel: {}\ncpu: {}\nuacce devices: {}\nzip nodes: {}\nsw lib: {}\nhw lib: {}\nperf_mode: {}\n",
-        cfg.host,
-        read("/proc/sys/kernel/osrelease").trim(),
-        cpu_model(),
-        uacce_devices().join(" "),
-        zips.join(" "),
-        cfg.sw_lib,
-        if cfg.hw_lib.is_empty() { "NOT FOUND" } else { &cfg.hw_lib },
-        if perf.is_empty() { "unknown (module parameter file absent)" } else { perf.trim() },
-    );
-    m.push_str(&format!(
-        "unix_time: {}\n",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::write(dir.join("machine.txt"), m);
-
     let rev = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -933,19 +918,50 @@ fn write_sweep_context(cfg: &Config, dir: &Path, exe: &Path) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "git unavailable".into());
-    let _ = std::fs::write(dir.join("rev.txt"), rev);
-
+    let mut v = vec![
+        format!("kernel: {}", read("/proc/sys/kernel/osrelease").trim()),
+        format!("cpu: {}", cpu_model()),
+        format!("uacce devices: {}", uacce_devices().join(" ")),
+        format!("zip nodes: {}", zips.join(" ")),
+        format!("sw lib: {}", cfg.sw_lib),
+        format!(
+            "hw lib: {}",
+            if cfg.hw_lib.is_empty() { "NOT FOUND" } else { &cfg.hw_lib }
+        ),
+        format!(
+            "perf_mode: {}",
+            if perf.is_empty() {
+                "unknown (module parameter file absent)"
+            } else {
+                perf.trim()
+            }
+        ),
+        format!("rev: {rev}"),
+        format!(
+            "unix_time: {}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    ];
     let mut probe_cmd = Command::new(exe);
-    probe_cmd
-        .arg("--probe")
-        .arg("--sw-lz4-lib")
-        .arg(&cfg.sw_lib);
+    probe_cmd.arg("--probe").arg("--sw-lz4-lib").arg(&cfg.sw_lib);
     if !cfg.hw_lib.is_empty() {
         probe_cmd.arg("--hw-lz4-lib").arg(&cfg.hw_lib);
     }
     if let Ok(o) = probe_cmd.output() {
-        let _ = std::fs::write(dir.join("probe.txt"), o.stdout);
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            // the probe mode's own lines, without its env-report preamble
+            if line.contains("PROBE ")
+                || line.contains("SYMBOL ")
+                || line.contains("HAS_ASYNC ")
+            {
+                v.push(format!("probe: {line}"));
+            }
+        }
     }
+    v
 }
 
 /// The experiment series: E1 baseline, the depth ladder, queue scaling,
@@ -1052,135 +1068,148 @@ fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
     exps
 }
 
-/// The computed readings over the sweep's own TSVs, as summary.md's tail.
-fn sweep_readings(dir: &Path) -> String {
+/// The computed readings over the sweep's per-experiment TSVs, one line
+/// each (the file carries them as comments, the console prints them).
+fn sweep_readings(tsv_dir: &Path) -> Vec<String> {
     let ok_row = |name: &str| -> Option<SweepRow> {
-        read_tsv_rows(&dir.join(format!("{name}.tsv")))
+        read_tsv_rows(&tsv_dir.join(format!("{name}.tsv")))
             .into_iter()
             .find(|r| r.op == "compress" && r.status == "OK")
     };
-    let mut s = String::from("\n## readings\n\n");
+    let mut v = Vec::new();
     let ladder: Vec<(usize, f64)> = SWEEP_DEPTHS
         .iter()
         .filter_map(|k| ok_row(&format!("e2-depth-{k}")).map(|r| (*k, r.gbps)))
         .collect();
     if !ladder.is_empty() {
-        s.push_str(&format!(
-            "- depth ladder (64K, spin, 1 queue): {}\n",
+        v.push(format!(
+            "depth ladder (64K, spin, 1 queue): {}",
             ladder
                 .iter()
                 .map(|(k, g)| format!("d{k} {g:.2}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        if let Some((k, _)) = ladder
+        let max = ladder
             .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .and_then(|(_, max)| {
-                ladder
-                    .iter()
-                    .find(|(_, g)| *g >= max * 0.99)
-                    .map(|(k, _)| (k, ()))
-            })
-        {
-            s.push_str(&format!("  saturates at depth {k}.\n"));
+            .map(|(_, g)| *g)
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap_or(0.0);
+        if let Some(k) = ladder.iter().find(|(_, g)| *g >= max * 0.99).map(|(k, _)| *k) {
+            v.push(format!("depth ladder saturates at depth {k} ({max:.2} GB/s)"));
         }
     }
     if let (Some(sp), Some(po)) = (ok_row("e4-spin-d8"), ok_row("e4-poll-d8")) {
-        s.push_str(&format!(
-            "- wait policy at depth 8: spin {:.2} GB/s @ {:.2} s/GB vs poll {:.2} GB/s @ {:.2} s/GB\n",
+        v.push(format!(
+            "wait policy at depth 8: spin {:.2} GB/s @ {:.2} s/GB vs poll {:.2} GB/s @ {:.2} s/GB",
             sp.gbps, sp.cpu_per_gb, po.gbps, po.cpu_per_gb
         ));
     }
     if let Some(q1) = ok_row("e4-spin-d8").map(|r| r.gbps) {
-        let line = ok_row("e3-queues2")
-            .map(|r| format!("2q {q1:.2} -> {:.2}", r.gbps))
-            .unwrap_or_default();
-        let line = match ok_row("e3-queues4") {
-            Some(r) => format!("{line}, 4q -> {:.2}", r.gbps),
-            None => line,
-        };
-        if !line.is_empty() {
-            s.push_str(&format!("- queue scaling: {line} GB/s\n"));
+        if let Some(q2) = ok_row("e3-queues2").map(|r| r.gbps) {
+            let line = match ok_row("e3-queues4") {
+                Some(r) => format!("queue scaling: 1q {q1:.2} -> 2q {q2:.2} -> 4q {:.2} GB/s", r.gbps),
+                None => format!("queue scaling: 1q {q1:.2} -> 2q {q2:.2} GB/s"),
+            };
+            v.push(line);
         }
     }
     if let (Some(b), Some(d1)) = (ok_row("e4-spin-d8"), ok_row("e5-db1")) {
-        s.push_str(&format!(
-            "- doorbell: full-depth batch {:.2} GB/s vs db_batch=1 {:.2} GB/s\n",
+        v.push(format!(
+            "doorbell: full-depth batch {:.2} GB/s vs db_batch=1 {:.2} GB/s",
             b.gbps, d1.gbps
         ));
     }
-    s
+    v
 }
 
-fn write_sweep_summary(cfg: &Config, dir: &Path, dumps: usize) {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".tsv"))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    let mut s = format!(
-        "# kae native sweep — {}\n\nPer-experiment data in the .tsv files, full worker output in the .log files, machine context in machine.txt/rev.txt/probe.txt.\n",
-        cfg.host
+/// One experiment's run outcome: its name, rows, and the stderr tail kept
+/// when it produced no usable row.
+struct SweepOutcome {
+    name: String,
+    rows: Vec<SweepRow>,
+    err_tail: String,
+}
+
+/// The whole sweep in one file: machine context as leading '#' comments,
+/// every experiment's rows in one shared table (an `experiment` column
+/// first), the computed readings as trailing '#' comments.
+fn write_sweep_file(
+    cfg: &Config,
+    out: &Path,
+    context: &[String],
+    outcomes: &[SweepOutcome],
+    readings: &[String],
+    tsv_dir: &Path,
+    dumps: usize,
+) {
+    let mut s = format!("# kae-bench native sweep host={}\n", cfg.host);
+    for l in context {
+        s.push_str(&format!("# {l}\n"));
+    }
+    s.push_str(
+        "experiment\tdata\tblock\timpl\top\tgbps\tratio_pct\tcpu_s_per_gb\twall_s\tverify\tstatus\tnote\n",
     );
-    for n in &names {
-        let rows = read_tsv_rows(&dir.join(n));
-        if rows.is_empty() {
+    for o in outcomes {
+        if o.rows.is_empty() {
+            s.push_str(&format!(
+                "# {}: no rows (stderr: {})\n",
+                o.name, o.err_tail
+            ));
             continue;
         }
-        s.push_str(&format!("\n## {}\n\n", n.trim_end_matches(".tsv")));
-        s.push_str("| block | impl | op | GB/s | ratio% | cpu s/GB | verify | status | note |\n");
-        s.push_str("|---|---|---|---|---|---|---|---|---|\n");
-        for r in &rows {
+        for r in &o.rows {
             s.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {:.1} | {:.2} | {} | {} | {} |\n",
-                r.block,
-                r.impl_name,
-                r.op,
-                r.gbps,
-                r.ratio_pct,
-                r.cpu_per_gb,
+                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+                o.name, r.data, r.block, r.impl_name, r.op, r.gbps, r.ratio_pct,
+                r.cpu_per_gb, r.wall_s,
                 if r.verify.is_empty() { "-" } else { &r.verify },
-                r.status,
-                r.note
+                r.status, r.note
             ));
         }
     }
-    s.push_str(&sweep_readings(dir));
+    s.push_str("# readings\n");
+    for l in readings {
+        s.push_str(&format!("# {l}\n"));
+    }
     if dumps > 0 {
         s.push_str(&format!(
-            "\n{dumps} rebuild-check dump(s) collected here (native-fail-*.txt); the audit verdict inside names the side at fault.\n"
+            "# rebuild-check dumps: {dumps} file(s) native-fail-*.txt in the working directory\n"
         ));
     }
-    let _ = std::fs::write(dir.join("summary.md"), s);
+    if let Err(e) = std::fs::write(out, &s) {
+        eprintln!("kae-bench: --sweep: write {}: {e}", out.display());
+    }
+    // keep the per-experiment TSVs out of the way once merged
+    let _ = std::fs::remove_dir_all(tsv_dir);
 }
 
-/// --sweep: run the whole experiment series once, leave every number in
-/// `dir` (one TSV + one log per experiment, machine context, summary.md,
-/// any rebuild-check dumps). Nothing is mailed or packed — the directory
-/// is the deliverable.
-fn run_sweep(cfg: &Config, dir: &Path) -> i32 {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        eprintln!("kae-bench: --sweep: {e}");
-        return 1;
-    }
+/// --sweep: run the whole experiment series once and leave every number
+/// in ONE file — machine context and symbol probe as leading comments,
+/// all experiments' rows in one shared table, the computed readings as
+/// trailing comments. The file is the deliverable.
+fn run_sweep(cfg: &Config, out: &Path) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kae-bench"));
-    println!("== kae-bench sweep -> {} ==", dir.display());
-    write_sweep_context(cfg, dir, &exe);
+    println!("== kae-bench sweep -> {} ==", out.display());
+    let tsv_dir = match make_tmp_dir() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let context = sweep_context(cfg, &exe);
     let exps = sweep_experiments(cfg);
     let total = exps.len();
     if !native_available() {
         println!("(no /dev/hisi_zip-* device: only the e1 baseline runs)");
     }
+    let mut outcomes: Vec<SweepOutcome> = Vec::new();
     for (i, exp) in exps.iter().enumerate() {
         print!("[{:2}/{}] {:<12} ... ", i + 1, total, exp.name);
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        let tsv = dir.join(format!("{}.tsv", exp.name));
+        let tsv = tsv_dir.join(format!("{}.tsv", exp.name));
         let mut cmd = Command::new(&exe);
         cmd.args(&exp.args).arg("--tsv").arg(&tsv);
         for (k, v) in &exp.env {
@@ -1188,37 +1217,51 @@ fn run_sweep(cfg: &Config, dir: &Path) -> i32 {
         }
         match cmd.output() {
             Ok(o) => {
-                let log = format!(
-                    "{}\n--- stderr ---\n{}\n--- exit: {} ---\n",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr),
-                    o.status
-                );
-                let _ = std::fs::write(dir.join(format!("{}.log", exp.name)), log);
-                match read_tsv_rows(&tsv)
-                    .into_iter()
+                let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                let rows = read_tsv_rows(&tsv);
+                match rows
+                    .iter()
                     .find(|r| r.op == "compress" && r.status == "OK")
                 {
                     Some(r) => println!("OK  {:.2} GB/s, {:.2} s/GB", r.gbps, r.cpu_per_gb),
-                    None => println!("no OK compress row (see {}/{}.log)", dir.display(), exp.name),
+                    None => {
+                        println!("no OK compress row");
+                        eprintln!("  stderr: {}", stderr_tail(&stderr));
+                    }
                 }
+                outcomes.push(SweepOutcome {
+                    name: exp.name.clone(),
+                    err_tail: if rows.is_empty() { stderr_tail(&stderr) } else { String::new() },
+                    rows,
+                });
             }
-            Err(e) => println!("spawn failed: {e}"),
+            Err(e) => {
+                println!("spawn failed: {e}");
+                outcomes.push(SweepOutcome {
+                    name: exp.name.clone(),
+                    err_tail: format!("spawn failed: {e}"),
+                    rows: Vec::new(),
+                });
+            }
         }
     }
-    // the workers leave rebuild-check dumps in the cwd; move them in
+    // the workers leave rebuild-check dumps in the cwd; they are the one
+    // thing that stays outside the file (hex dumps are too big to embed)
     let mut dumps = 0usize;
     if let Ok(rd) = std::fs::read_dir(".") {
         for e in rd.flatten() {
             let name = e.file_name();
             if name.to_string_lossy().starts_with("native-fail-") {
-                let _ = std::fs::rename(e.path(), dir.join(&name));
                 dumps += 1;
             }
         }
     }
-    write_sweep_summary(cfg, dir, dumps);
-    println!("sweep data: {} (summary.md, *.tsv, *.log, machine context)", dir.display());
+    let readings = sweep_readings(&tsv_dir);
+    for l in &readings {
+        println!("{l}");
+    }
+    write_sweep_file(cfg, out, &context, &outcomes, &readings, &tsv_dir, dumps);
+    println!("sweep data: {} (one file: context + all rows + readings)", out.display());
     0
 }
 
