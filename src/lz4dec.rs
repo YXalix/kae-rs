@@ -49,10 +49,13 @@ pub(crate) fn decode_block(src: &[u8], dst: &mut [u8]) -> Result<usize, String> 
         let off = u16::from_le_bytes(src[s..s + 2].try_into().unwrap()) as usize;
         s += 2;
         if off == 0 {
-            return Err("zero match offset".into());
+            return Err(format!("zero match offset at {d}B"));
         }
         if off > d {
-            return Err(format!("match offset {off} reaches before the block start"));
+            return Err(format!(
+                "match offset {off} reaches before the block start ({d}B decoded, at {s}/{})",
+                src.len()
+            ));
         }
 
         let mut ml = (token & 15) as usize + 4;

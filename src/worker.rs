@@ -608,23 +608,8 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A rebuild failure plus the sample evidence needed to read it off a
-/// bench row or TSV note: the completion-report literals/triples, the
-/// ll-overflow report and the first triples' hex.
-fn rebuild_fail_detail(sample: &uacce::Lz77Sample, e: &str) -> String {
-    let head = hex(&sample.seqs[..sample.seqs.len().min(64)]);
-    format!(
-        "{e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
-        sample.lit,
-        sample.seqs.len() / 8,
-        sample.ll_overflow_cnt,
-        sample.ll_overflow_pos
-    )
-}
-
-/// Decode one rebuilt request block and require the original bytes back;
-/// the error names the first diverging byte so a dump can be read
-/// against it.
+/// Decode one rebuilt block and require the original bytes back; the
+/// error names the first diverging byte so a dump can be read against it.
 fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
     let mut dst = vec![0u8; input.len()];
     match lz4dec::decode_block(block, &mut dst) {
@@ -641,9 +626,9 @@ fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
 }
 
 /// The full evidence for one failed rebuild check: on stderr and in a
-/// dump file next to the run (the sweep tarball picks the file up; the
+/// dump file next to the run (the sweep file notes their count; the
 /// console line may be lost). The audit verdict names the side at fault:
-/// a violated rule means the engine's triples are inconsistent (match
+/// a violated rule means the request's triples are inconsistent (match
 /// bytes or literal area), `Ok` means the triples are fine and the LZ4
 /// encoding is.
 fn dump_rebuild_check(
@@ -686,68 +671,64 @@ fn dump_rebuild_check(
     }
 }
 
-/// Why one request's rebuild failed: the stage and its flat-ready
-/// diagnostic, so each caller maps stages onto its own error protocol.
-enum RebuildFailure {
-    /// The engine did not answer the sample request.
-    Triples(String),
-    /// The triples do not rebuild into a decodable LZ4 block.
-    Rebuild(String),
-    /// The rebuilt block does not decode back to the input; the full
-    /// evidence dump is already on stderr.
-    Check(String),
-}
-
-impl RebuildFailure {
-    fn stage(&self) -> &'static str {
-        match self {
-            RebuildFailure::Triples(_) => "triples",
-            RebuildFailure::Rebuild(_) => "rebuild",
-            RebuildFailure::Check(_) => "rebuild_check",
-        }
-    }
-
-    fn detail(&self) -> &str {
-        match self {
-            RebuildFailure::Triples(e) | RebuildFailure::Rebuild(e) | RebuildFailure::Check(e) => e,
-        }
-    }
-}
-
-/// One `req_size` request through the engine and back: sample its triples
-/// off the engine, rebuild them into a standard LZ4 stream in `stream`, and
-/// require the decode to return the original bytes. A self-check failure
-/// runs the triple audit and dumps the request's full evidence (`label`
-/// names it in the dump and the dump file). `terminal` blocks close with
-/// the literal run even when empty; non-terminal segments join into the
-/// following request's stream. `rebuild_s` accumulates the pure
-/// triple-to-LZ4 conversion time (the sample path reports it; the decode
-/// setup passes a throwaway). Returns the rebuilt stream's length.
-fn rebuild_request(
+/// One bench block through the engine and back: sample every `req_size`
+/// request's triples off the engine, then rebuild the whole block in ONE
+/// walk over the concatenated inputs and triples — a finished LZ4 block
+/// is not composable (its closing literal run is a parser-level end
+/// marker), so streams are never spliced. The rebuilt block must decode
+/// to the original bytes; on a mismatch every request's triples are
+/// audited and the first inconsistent one is dumped
+/// (`rebuild::audit_triples` names the side at fault). `rebuild_s`
+/// accumulates the pure triple-to-LZ4 conversion time. Returns the
+/// rebuilt block's length in `stream`.
+fn rebuild_block(
     pump: &mut uacce::NativePump,
-    chunk: &[u8],
-    stream: &mut Vec<u8>,
+    data: &[u8],
+    off: usize,
+    block: usize,
+    req_size: usize,
     label: &str,
-    terminal: bool,
+    stream: &mut Vec<u8>,
     rebuild_s: &mut f64,
-) -> Result<usize, RebuildFailure> {
-    let sample = pump.sample_triples(chunk).map_err(RebuildFailure::Triples)?;
+) -> Result<usize, String> {
+    let block_input = &data[off..off + block];
+    let mut seqs = Vec::new();
+    let mut samples = Vec::new();
+    for r in 0..(block / req_size) {
+        let roff = off + r * req_size;
+        let sample = pump
+            .sample_triples(&data[roff..roff + req_size])
+            .map_err(|e| format!("triples: {e} (block {label} request {r})"))?;
+        seqs.extend_from_slice(&sample.seqs);
+        samples.push(sample);
+    }
     let t0 = now_s();
-    let rebuilt = if terminal {
-        rebuild::lz77_block(chunk, &sample.seqs, stream)
-    } else {
-        rebuild::lz77_segment(chunk, &sample.seqs, stream)
-    };
+    let rebuilt = rebuild::lz77_block(block_input, &seqs, stream);
     *rebuild_s += now_s() - t0;
-    let n = rebuilt.map_err(|e| RebuildFailure::Rebuild(rebuild_fail_detail(&sample, &e)))?;
-    if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
-        let audit = rebuild::audit_triples(chunk, &sample.seqs, Some(&sample.lits));
-        dump_rebuild_check(label, &sample, chunk, &stream[..n], &e, &audit);
-        let verdict = match audit {
-            Ok(()) => "triples self-consistent, LZ4 encoding at fault".to_string(),
-            Err(a) => a,
-        };
-        return Err(RebuildFailure::Check(format!("{e}; audit: {verdict}")));
+    let n = rebuilt.map_err(|e| format!("rebuild: {e} (block {label})"))?;
+    if let Err(e) = check_rebuilt_request(block_input, &stream[..n]) {
+        let mut verdict =
+            "triples self-consistent in every request: the LZ4 encoding is at fault".to_string();
+        for (r, sample) in samples.iter().enumerate() {
+            let roff = off + r * req_size;
+            if let Err(a) = rebuild::audit_triples(
+                &data[roff..roff + req_size],
+                &sample.seqs,
+                Some(&sample.lits),
+            ) {
+                verdict = format!("request {r}: {a}");
+                dump_rebuild_check(
+                    &format!("block {label} request {r} (data {roff}..{})", roff + req_size),
+                    sample,
+                    &data[roff..roff + req_size],
+                    &stream[..n],
+                    &e,
+                    &Err(a.clone()),
+                );
+                break;
+            }
+        }
+        return Err(format!("block_check: {e}; audit: {}", flat(&verdict)));
     }
     Ok(n)
 }
@@ -817,9 +798,8 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     pump.run(0.1); // settle the queue the same way a bench run does
 
     // untimed setup: rebuild every block from its hardware triples into
-    // standard LZ4, joining the per-request streams into one continuous
-    // block stream (non-terminal requests drop an empty closing token, so
-    // the block decodes as a single LZ4 unit)
+    // standard LZ4, one walk over each block's concatenated requests, and
+    // require the block to decode back to its input before any timing
     let per_block = block / req_size;
     let mut blob: Vec<u8> = Vec::with_capacity(data.len());
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks);
@@ -827,40 +807,38 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     let mut rebuild_s = 0.0f64;
     for b in 0..nblocks {
         let base = blob.len();
-        for r in 0..per_block {
-            let off = b * block + r * req_size;
-            let req_idx = b * per_block + r;
-            let n = match rebuild_request(
-                &mut pump,
-                &data[off..off + req_size],
-                &mut stream,
-                &format!("request {req_idx} (data {off}..{})", off + req_size),
-                r == per_block - 1,
-                &mut rebuild_s,
-            ) {
-                Ok(n) => n,
-                Err(f) => {
-                    let check = matches!(f, RebuildFailure::Check(_));
-                    println!(
-                        "RESULT status={} impl=native op=decompress block={} req={req_idx} at={} err={}",
-                        if check {
-                            "DECOMPRESS_MISMATCH"
-                        } else {
-                            "COMPRESS_FAIL"
-                        },
-                        block,
-                        f.stage(),
-                        flat(f.detail())
-                    );
-                    return if check {
-                        EXIT_VERIFY_FAIL
+        let n = match rebuild_block(
+            &mut pump,
+            data,
+            b * block,
+            block,
+            req_size,
+            &b.to_string(),
+            &mut stream,
+            &mut rebuild_s,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                let check = e.starts_with("block_check");
+                println!(
+                    "RESULT status={} impl=native op=decompress block={} at={} err={}",
+                    if check {
+                        "DECOMPRESS_MISMATCH"
                     } else {
-                        EXIT_COMPRESS_FAIL
-                    };
-                }
-            };
-            blob.extend_from_slice(&stream[..n]);
-        }
+                        "COMPRESS_FAIL"
+                    },
+                    block,
+                    if check { "block_check" } else { "triples" },
+                    flat(&e)
+                );
+                return if check {
+                    EXIT_VERIFY_FAIL
+                } else {
+                    EXIT_COMPRESS_FAIL
+                };
+            }
+        };
+        blob.extend_from_slice(&stream[..n]);
         extents.push((base, blob.len() - base));
     }
     let out_bytes = blob.len() as u64;
@@ -925,9 +903,9 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     EXIT_OK
 }
 
-/// Rebuild the first blocks of the workload into standard LZ4 streams (one
-/// hardware request per `req_size` slice, engine idle after the timed run),
-/// joining each block's request streams into one continuous LZ4 stream, and
+/// Rebuild the first blocks of the workload into standard LZ4 blocks (one
+/// hardware request per `req_size` slice, engine idle after the timed
+/// run; each block rebuilds from its requests' triples in one walk) and
 /// write the packed sample file. Returns (rebuilt bytes, blocks covered,
 /// pure triple-to-LZ4 seconds per GB). `block` must be a `req_size`
 /// multiple — the caller checks.
@@ -940,28 +918,24 @@ fn build_native_sample(
     path: &str,
 ) -> Result<(u64, usize, f64), String> {
     let count = sample_block_count(block, nblocks);
-    let per_block = block / req_size;
     let mut packed: Vec<u8> = Vec::new();
     let mut lens = Vec::with_capacity(count);
     let mut stream = Vec::new();
     let mut rebuild_s = 0.0f64;
     for b in 0..count {
-        let base = packed.len();
-        for r in 0..per_block {
-            let off = b * block + r * req_size;
-            let chunk = &data[off..off + req_size];
-            let n = rebuild_request(
-                pump,
-                chunk,
-                &mut stream,
-                &format!("request {} (data {off}..{})", b * per_block + r, off + req_size),
-                r == per_block - 1,
-                &mut rebuild_s,
-            )
-            .map_err(|f| format!("{}: {} (block {b} request {r})", f.stage(), f.detail()))?;
-            packed.extend_from_slice(&stream[..n]);
-        }
-        lens.push(packed.len() - base);
+        let n = rebuild_block(
+            pump,
+            data,
+            b * block,
+            block,
+            req_size,
+            &b.to_string(),
+            &mut stream,
+            &mut rebuild_s,
+        )
+        .map_err(|e| format!("{} (block {b})", e))?;
+        packed.extend_from_slice(&stream[..n]);
+        lens.push(n);
     }
     write_sample(path, block, &lens, &packed, count).map_err(|e| format!("write_sample: {e}"))?;
     let gb = count as f64 * block as f64 / 1e9;

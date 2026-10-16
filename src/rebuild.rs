@@ -33,25 +33,6 @@ const ML_MASK: usize = 15;
 /// Rebuild one request's triples (`seqs*8` bytes) against its original
 /// `input` into `out` (cleared first); returns the LZ4 block length.
 pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
-    walk_triples(input, seqs, out, true)
-}
-
-/// Rebuild one request as the non-final segment of a joined stream (a
-/// bench block the caller assembles from several request streams). The
-/// closing literal run is emitted only when non-empty: an empty trailing
-/// token mid-stream would make the next segment's first two bytes decode
-/// as a match offset. (liblz4 requires a final literal token even when
-/// empty, so the last segment always closes through [`lz77_block`].)
-pub(crate) fn lz77_segment(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
-    walk_triples(input, seqs, out, false)
-}
-
-fn walk_triples(
-    input: &[u8],
-    seqs: &[u8],
-    out: &mut Vec<u8>,
-    terminal: bool,
-) -> Result<usize, String> {
     if seqs.len() % 8 != 0 {
         return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
     }
@@ -116,11 +97,8 @@ fn walk_triples(
         ));
     }
 
-    // the unmatched tail is the closing literal run (no match after it);
-    // dropped only for a non-terminal segment whose tail is empty
-    if terminal || ip < input.len() {
-        push_literal_run(out, &input[ip..]);
-    }
+    // the unmatched tail is the closing literal run (no match after it)
+    push_literal_run(out, &input[ip..]);
     Ok(out.len())
 }
 
@@ -248,6 +226,89 @@ pub(crate) fn audit_triples(
         }
     }
     Ok(())
+}
+
+/// Rebuild one bench block from its requests' triples. The requests'
+/// inputs are consecutive slices of `input`; `requests` carries each
+/// request's (triples, input length) in order. A finished LZ4 block is
+/// not composable (its closing literal run is a parser-level end
+/// marker), so the per-request streams are never spliced: the triples
+/// walk ONCE over the whole block, and at each request boundary the
+/// previous request's unconsumed tail (its parse never covers the
+/// MFLIMIT bytes) is charged into the next match's literal length. That
+/// keeps every match sitting at `prior request lengths + its local
+/// position`, which is exactly where its offset references the same data
+/// it referenced inside its own request. Returns the block length.
+pub(crate) fn lz77_block_from_requests(
+    input: &[u8],
+    requests: &[(&[u8], usize)],
+    out: &mut Vec<u8>,
+) -> Result<usize, String> {
+    out.clear();
+    out.reserve(input.len() + input.len() / 255 + 16);
+
+    let mut pending = 0usize;
+    let mut ip = 0usize; // global walk position
+    let mut skip = 0usize; // boundary shortfall charged to the next match
+    let mut boundary = 0usize; // input bytes the finished requests cover
+    for (seqs, len) in requests {
+        boundary += len;
+        if seqs.len() % 8 != 0 {
+            return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
+        }
+        for (ti, t) in seqs.chunks_exact(8).enumerate() {
+            let mut lit_len = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+            let off_base = u16::from_le_bytes(t[4..6].try_into().unwrap()) as usize;
+            let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
+            if ml_base == 0 {
+                pending += lit_len + 3;
+                continue;
+            }
+            if skip > 0 {
+                lit_len += skip;
+                skip = 0;
+            }
+            let lit = lit_len + pending;
+            pending = 0;
+            let off = off_base + 1;
+            let nib = ml_base - 1;
+            let ml = nib + 4;
+            if ip + lit > input.len() {
+                return Err(format!(
+                    "triple literals overrun the input (at {ip}+{lit}/{}B)",
+                    input.len()
+                ));
+            }
+            let token = push_literal_run(out, &input[ip..ip + lit]);
+            ip += lit;
+            if off > ip {
+                return Err(format!(
+                    "match offset {off} reaches before the block start (triple {ti})"
+                ));
+            }
+            if off > u16::MAX as usize {
+                return Err(format!("match offset {off} does not fit the 2-byte LZ4 field"));
+            }
+            out.extend_from_slice(&(off as u16).to_le_bytes());
+            if nib >= ML_MASK {
+                out[token] += ML_MASK as u8;
+                push_extension(out, nib - ML_MASK);
+            } else {
+                out[token] += nib as u8;
+            }
+            ip += ml;
+        }
+        skip += boundary - ip;
+    }
+    if ip > input.len() {
+        return Err(format!(
+            "triples consume {}B of a {}B input",
+            ip,
+            input.len()
+        ));
+    }
+    push_literal_run(out, &input[ip..]);
+    Ok(out.len())
 }
 
 /// Walk the triples exactly the way `lz77_block` does and return one line
@@ -431,35 +492,46 @@ mod tests {
         roundtrip(&input, &seqs);
     }
 
-    /// The system liblz4 requires the closing literal token: a stream that
-    /// ends with a match decodes in-crate but is rejected by liblz4, and a
-    /// mid-stream empty tail makes the joined next segment decode its
-    /// first two bytes as an offset — segments drop it, terminals keep it.
+    /// One block, several requests: the requests' triples rebuild through
+    /// [`lz77_block_from_requests`], which charges each request's
+    /// unconsumed tail into the next match's literal length so every
+    /// offset keeps referencing the data it referenced in its own
+    /// request. (Plain triple concatenation would shift request 2's
+    /// matches by request 1's tail and misread every early offset.)
     #[test]
-    fn segment_drops_the_empty_tail_the_terminal_keeps() {
-        // one literal + a 4-byte match at offset 1 covers exactly the input
-        let input = b"aaaaa";
-        let seqs = triple(1, 1, 1);
-        let mut seg = Vec::new();
-        let n = lz77_segment(input, &seqs, &mut seg).expect("segment");
-        assert_eq!(n, seg.len());
-        roundtrip(input, &seqs); // the terminal form decodes standalone
-
-        let mut blk = Vec::new();
-        let m = lz77_block(input, &seqs, &mut blk).expect("block");
-        assert_eq!(m, blk.len());
-        assert_eq!(m, n + 1, "terminal adds exactly the empty tail token");
-        assert_eq!(*blk.last().unwrap(), 0x00, "terminal keeps the empty tail");
-
-        // joined: segment 1 (no tail token) + a terminal literal block
-        let tail_input = b"xyz";
-        let mut joined = seg.clone();
-        let mut second = Vec::new();
-        let n2 = lz77_block(tail_input, &[], &mut second).expect("second");
-        joined.extend_from_slice(&second[..n2]);
-        let mut dst = vec![0u8; input.len() + tail_input.len()];
-        let decoded = crate::lz4dec::decode_block(&joined, &mut dst).expect("joined decodes");
-        assert_eq!(&dst[..decoded], b"aaaaaxyz");
+    fn request_triples_rebuild_as_one_block() {
+        let half = b"abcdefghabcdefghzzzzzzzz"; // a real off-8 match at 10
+        let input1 = half.as_slice();
+        let input2 = half.as_slice();
+        let input = [input1, input2].concat();
+        // fold credit 4 + 6 literals puts the match at 10; it covers
+        // 10..16 copying from 2..8, and the 8-byte tail closes the request
+        // (the fold's credit is its lit plus 3)
+        let t = [triple(1, 1, 0), triple(8, 6, 3)].concat();
+        audit_triples(input1, &t, None).expect("self-consistent request");
+        // each request alone rebuilds and decodes
+        let mut b1 = Vec::new();
+        let n1 = lz77_block(input1, &t, &mut b1).expect("request 1");
+        let mut dst1 = vec![0u8; input1.len()];
+        assert_eq!(
+            crate::lz4dec::decode_block(&b1[..n1], &mut dst1).expect("decode 1"),
+            input1.len()
+        );
+        assert_eq!(dst1, input1);
+        // the two-request block rebuilds as one walk over the whole input
+        let mut block = Vec::new();
+        let n = lz77_block_from_requests(
+            &input,
+            &[(t.as_slice(), input1.len()), (t.as_slice(), input2.len())],
+            &mut block,
+        )
+        .expect("combined rebuild");
+        let mut dst = vec![0u8; input.len()];
+        assert_eq!(
+            crate::lz4dec::decode_block(&block[..n], &mut dst).expect("combined decode"),
+            input.len()
+        );
+        assert_eq!(dst, input);
     }
 
     /// The audit passes a valid parse — including its literal area — and
@@ -594,5 +666,175 @@ mod tests {
             .decompress_block(&block, &mut dst)
             .expect("liblz4 rejected the rebuilt block");
         assert_eq!(&dst[..n], &input[..]);
+    }
+
+    /// A minimal greedy lz77 parser over the input, emitting triples in
+    /// the engine's dialect: real back-references only, explicit offsets,
+    /// folds for the literal gaps, and — sometimes — a trailing fold
+    /// chain that closes the input exactly (the empty-tail shape). The
+    /// point is coverage of the segment shapes the engine produces, not
+    /// its parse quality.
+    struct Gen {
+        input: Vec<u8>,
+        head: Vec<usize>,
+        rng: u64,
+    }
+
+    impl Gen {
+        fn new(seed: u64) -> Gen {
+            let mut x = seed | 1;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let mut input = Vec::new();
+            for _ in 0..12 {
+                match next() % 3 {
+                    0 => input.extend(std::iter::repeat_n(0u8, 4096)),
+                    1 => {
+                        let period = 3 + (next() % 29) as usize;
+                        let ch = b'a' + (next() % 26) as u8;
+                        let p = period as u32;
+                        let c = ch;
+                        input.extend((0..4096u32).map(move |i| ((i * p) as u8).wrapping_add(c)));
+                    }
+                    _ => {
+                        for _ in 0..4096 {
+                            input.push(next() as u8);
+                        }
+                    }
+                }
+            }
+            Gen { input, head: vec![usize::MAX; 1 << 16], rng: next() | 1 }
+        }
+
+        fn rand(&mut self) -> usize {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            (self.rng >> 17) as usize
+        }
+
+        /// One request's triples, mirroring the rebuild walk's accounting
+        /// exactly: folds only pile credit (lit+3) without advancing the
+        /// position, matches flush the credit plus their own literals and
+        /// then consume the match. Greedy 4-byte-hash matching, and a 10%
+        /// chance of letting the last match run into the MFLIMIT tail so
+        /// the walk lands exactly on the input end (empty tail).
+        fn parse(&mut self, mflimit_tail: bool) -> (usize, Vec<u8>) {
+            let end = self.input.len() - if mflimit_tail { 12 } else { 0 };
+            let mut triples: Vec<u8> = Vec::new();
+            let mut ip = 0usize; // literals + matches consumed so far
+            let mut pending = 0usize; // fold credit awaiting the next match
+            loop {
+                if end <= ip {
+                    break; // an MFLIMIT-overrun match ended the request
+                }
+                // sometimes drop a fold bridging toward the next match
+                if self.rand() % 5 == 0 && end - ip > pending + 4 {
+                    let lit = 1 + self.rand() % 40;
+                    let lit = lit.min(end - ip - pending - 1);
+                    triples.extend(triple(0, lit as u32, 0));
+                    pending += lit + 3;
+                    continue;
+                }
+                let lit0 = if pending == 0 && self.rand() % 2 == 0 { self.rand() % 32 } else { 0 };
+                let lit0 = lit0.min(end.saturating_sub(ip + pending)).min(31);
+                let at = ip + pending + lit0;
+                if at + 4 > end {
+                    break;
+                }
+                let key = (self.input[at] as usize) | ((self.input[at + 1] as usize) << 8);
+                let mut off = 0usize;
+                let mut ml = 0usize;
+                let cand = self.head[key];
+                if cand != usize::MAX && cand < at {
+                    let off_c = at - cand;
+                    if off_c <= 16384 {
+                        let max = (end - at).min(65536);
+                        let mut l = 0usize;
+                        while l < max && self.input[at + l] == self.input[at - off_c + l] {
+                            l += 1;
+                        }
+                        if l >= 4 {
+                            off = off_c;
+                            ml = l;
+                        }
+                    }
+                }
+                self.head[key] = at;
+                if ml >= 4 {
+                    // 10% of matches overrun MFLIMIT onto the input end
+                    // when the bytes continue, leaving no tail
+                    if mflimit_tail && self.rand() % 10 == 0 {
+                        let mut l = ml;
+                        while at + l < self.input.len()
+                            && self.input[at + l] == self.input[at - off + l]
+                        {
+                            l += 1;
+                        }
+                        if at + l == self.input.len() {
+                            ml = l;
+                        }
+                    }
+                    triples.extend(triple(off, lit0 as u32, (ml - 3) as u16));
+                    ip = at + ml;
+                    pending = 0;
+                } else if end - at >= 4 {
+                    // no match here: a 1-literal fold consumes 4 bytes
+                    triples.extend(triple(0, 1, 0));
+                    pending += 4;
+                } else {
+                    break;
+                }
+            }
+            (ip, triples)
+        }
+    }
+
+    /// The property the bench's block assembly stands on: per-request
+    /// triples, concatenated, rebuild the concatenated inputs as ONE walk
+    /// that decodes back to the whole block — across random parse shapes,
+    /// empty tails (a match landing exactly on the input end) included.
+    #[test]
+    fn joined_random_parses_rebuild_as_one_block() {
+        let mut g = Gen::new(0x5EED_2026);
+        let mut checked = 0usize;
+        let mut empty_tails = 0usize;
+        for _ in 0..300 {
+            let (ip1, t1) = g.parse(true);
+            let (_ip2, t2) = g.parse(false);
+            let input1 = g.input.clone();
+            let input2 = g.input.clone();
+            if ip1 == input1.len() {
+                empty_tails += 1;
+            }
+            // each request's triples are self-consistent lz77 of its input
+            audit_triples(&input1, &t1, None)
+                .unwrap_or_else(|e| panic!("request 1 audit: {e}"));
+            audit_triples(&input2, &t2, None)
+                .unwrap_or_else(|e| panic!("request 2 audit: {e}"));
+            // the two requests rebuild as one walk over the whole input
+            let input = [input1.as_slice(), input2.as_slice()].concat();
+            let mut block = Vec::new();
+            let n = lz77_block_from_requests(
+                &input,
+                &[(&t1, input1.len()), (&t2, input2.len())],
+                &mut block,
+            )
+            .unwrap_or_else(|e| panic!("combined rebuild: {e}"));
+            let mut dst = vec![0u8; input.len()];
+            let decoded = crate::lz4dec::decode_block(&block[..n], &mut dst)
+                .unwrap_or_else(|e| panic!("combined decode failed: {e}"));
+            assert_eq!(decoded, input.len());
+            assert_eq!(&dst, &input);
+            checked += 1;
+        }
+        assert!(
+            checked > 100 && empty_tails > 0,
+            "checked {checked}, empty tails {empty_tails}"
+        );
     }
 }

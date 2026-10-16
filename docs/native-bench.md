@@ -59,9 +59,10 @@ the engine itself is the limit and the placement verdict is final.
   worker rebuilds the first sample blocks' triples into standard LZ4
   format (`src/rebuild.rs`, same arithmetic as the kaelz4 rebuild) and
   writes the packed sample file. A block spanning several hardware
-  requests joins its request streams into one continuous LZ4 stream
-  (non-terminal requests drop an empty closing token; the last one keeps
-  it — liblz4 requires the final literal token even when empty). The
+  requests rebuilds from its requests' triples in ONE walk, charging
+  each request's unconsumed tail into the next match's literal length —
+  a finished LZ4 block is not composable (its closing literal run is a
+  parser-level end marker), so streams are never spliced. The
   orchestrator's verify op decodes it with the system liblz4 exactly like
   the library-backed cells, and the row's `ratio_pct` is the rebuilt
   blocks' true LZ4 ratio (the pre-rebuild triples ratio lands in the
@@ -74,12 +75,13 @@ the engine itself is the limit and the placement verdict is final.
   it. The same applies when a sample rebuild **fails**: the timed engine
   numbers stand, the row stays `OK`, and the note records
   `sample=failed:<cause>` (the row's err= and the worker's stderr also
-  surface in the summary/TSV note). A failed request's check runs the
-  triple audit (`rebuild::audit_triples`: every match's bytes must equal
-  the bytes at `position - offset`, and the engine's literal area must
-  equal the walk's literal spans) — its verdict in the note and dump
-  names the side at fault: a violated rule means the engine's triples
-  are inconsistent, `Ok` means the LZ4 encoding is. The full evidence
+  surface in the summary/TSV note). A failed block's check runs the
+  triple audit on every request it spans (`rebuild::audit_triples`: each
+  match's bytes must equal the bytes at `position - offset`, and the
+  engine's literal area must equal the walk's literal spans) — the first
+  inconsistent request's verdict lands in the note and dump and names
+  the side at fault: a violated rule means the engine's triples are
+  inconsistent, all-clean means the LZ4 encoding is. The full evidence
   (triples, rebuilt bytes, literal area, input) lands on stderr and in
   `native-fail-<request>.txt` in the worker's working directory. The
   decompress cell depends on the rebuild and fails its cell instead —
@@ -175,14 +177,14 @@ number taken under it is a floor.
   software too), and the native path keeps a C library out of the
   process entirely. The decompress cell needs the lz77 dialect (deflate
   output is not LZ4) and blocks that are request-size multiples.
-- The decompress setup rebuilds **every** request from live hardware
-  triples (one request per `req_size` slice, untimed), joins each
-  block's request streams into one continuous LZ4 stream, and bit-checks
-  each request's rebuilt bytes against its original before the timed
-  decode loop — a full-pipeline self-test per run. The first failing
-  request dumps its triples, rebuilt bytes, the engine's literals area
-  and the input to the worker's stderr and `native-fail-<request>.txt`,
-  with the audit verdict in both. The setup is one request in flight
+- The decompress setup rebuilds **every** block from live hardware
+  triples (one request per `req_size` slice, untimed, one walk per
+  block) and bit-checks each block's rebuilt bytes against its original
+  before the timed decode loop — a full-pipeline self-test per run. The
+  first failing block dumps its first inconsistent request's triples,
+  the rebuilt bytes, the engine's literals area and the input to the
+  worker's stderr and `native-fail-<request>.txt`, with the audit
+  verdict in both. The setup is one request in flight
   on one queue; `KAE_NATIVE_DEPTH`/`KAE_NATIVE_DB_BATCH`/`KAE_NATIVE_WAIT`
   still shape that queue.
 - The SS region needs ~`depth × 4 × req_size` bytes per queue; at the
