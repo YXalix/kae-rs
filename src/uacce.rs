@@ -1052,13 +1052,14 @@ mod hw_tests {
     /// both blocks encode the same kind of parse. The asserted contract:
     ///
     /// - our rebuild decodes back to the input;
-    /// - our parse equals the vendor's parse once consecutive
-    ///   same-offset matches merge into runs. Byte equality is not
+    /// - our parse equals the vendor's parse once same-offset matches
+    ///   merge into runs, literal gaps included. Byte equality is not
     ///   required — the engine splits a long same-offset run at a
     ///   different point on every request (one input, three consecutive
     ///   parses: 252|48|252x14|248, 204|252x15|92, 44|192|252x15|60 over
-    ///   the same 20..4096 run), so the vendor block lands on an
-    ///   arbitrary one of those choppings;
+    ///   the same 20..4096 run) and sometimes emits a few redundant
+    ///   literals mid-run, so no two blocks of one input chop the runs
+    ///   the same way;
     /// - a resample of the same request normalizes to the same runs.
     ///
     /// This one test loads the vendor stack; the other native tests keep
@@ -1262,19 +1263,20 @@ mod hw_tests {
         unreachable!("block ends mid-sequence at {i}");
     }
 
-    /// The chop-invariant form of a parse: consecutive same-offset matches
-    /// with no literals between them merge into one (start, end, offset)
-    /// run. The engine splits a long run at a different point on every
-    /// request, so two parses of one input compare equal exactly when they
-    /// cover the same spans at the same offsets.
+    /// The chop-invariant form of a parse: same-offset matches that
+    /// continue a run merge into one (start, end, offset) run, including
+    /// across the few redundant literals the engine sometimes drops
+    /// mid-run. Two parses of one input compare equal exactly when they
+    /// cover the same spans at the same offsets; callers assert both
+    /// blocks decode to the input first, which is what makes a mid-run
+    /// literal gap redundant rather than a parse change.
     fn match_runs(walk: &Lz4Walk) -> Vec<(usize, usize, usize)> {
         let mut runs: Vec<(usize, usize, usize)> = Vec::new();
         for &(lit, lit_at, off, ml) in &walk.seqs {
             let start = lit_at + lit;
-            let extends = lit == 0
-                && runs
-                    .last()
-                    .is_some_and(|&(_, end, run_off)| end == start && run_off == off);
+            let extends = runs
+                .last()
+                .is_some_and(|&(_, end, run_off)| run_off == off && start >= end);
             if extends {
                 runs.last_mut().unwrap().1 = start + ml;
             } else {
@@ -1348,8 +1350,12 @@ mod hw_tests {
         assert_eq!((split.tail_at, split.tail_len), (14, 2));
         assert_eq!(match_runs(&merged), vec![(2, 14, 2)]);
         assert_eq!(match_runs(&split), match_runs(&merged));
-        // a literal between two matches keeps them separate, even at the
-        // same offset
+        // a same-offset continuation stays in the run even across the
+        // redundant literals the engine drops mid-run; a different
+        // offset starts a new run
+        let gapped = walk_lz4_block(&block(&[triple(2, 2, 3), triple(2, 2, 3)].concat()));
+        assert_eq!(gapped.seqs, [(2, 0, 2, 6), (2, 8, 2, 6)]);
+        assert_eq!(match_runs(&gapped), vec![(2, 16, 2)]);
         let apart = walk_lz4_block(&block(&[triple(2, 2, 3), triple(4, 2, 3)].concat()));
         assert_eq!(match_runs(&apart), vec![(2, 8, 2), (10, 16, 4)]);
     }
