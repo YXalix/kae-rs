@@ -474,7 +474,6 @@ fn compress_tail(fns: &Lz4Fns, tail: &[u8], out: &mut Vec<u8>) -> Result<usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::raw::c_int;
 
     // The tail path runs through the same block ABI as the public KaeLz4
     // API, so the system liblz4 suffices to exercise it.
@@ -487,15 +486,8 @@ mod tests {
         let l = compress_tail(&fns, &tail, &mut out).expect("tail compress");
         assert_eq!(l, out.len());
         let mut restored = vec![0u8; tail.len() + 64];
-        let n = unsafe {
-            (fns.decompress)(
-                out.as_ptr(),
-                restored.as_mut_ptr(),
-                out.len() as c_int,
-                restored.len() as c_int,
-            )
-        };
-        assert_eq!(n as usize, tail.len(), "decompressed length");
-        assert_eq!(&restored[..tail.len()], &tail[..], "bit-exact match");
+        let n = fns.decompress_block(&out, &mut restored).expect("decompress");
+        assert_eq!(n, tail.len(), "decompressed length");
+        assert_eq!(&restored[..n], &tail[..], "bit-exact match");
     }
 }

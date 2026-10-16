@@ -65,16 +65,8 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
             ));
         }
 
-        // token + literal-length extension
-        let token = out.len();
-        out.push(0);
-        if lit >= RUN_MASK {
-            out[token] = (RUN_MASK << ML_BITS) as u8;
-            push_extension(out, lit - RUN_MASK);
-        } else {
-            out[token] = (lit << ML_BITS) as u8;
-        }
-        out.extend_from_slice(&input[ip..ip + lit]);
+        // token + literal-length extension + literals
+        let token = push_literal_run(out, &input[ip..ip + lit]);
         ip += lit;
 
         // 2-byte offset. Decoded output so far is exactly the consumed
@@ -106,16 +98,7 @@ pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result
     }
 
     // the unmatched tail is the final literal run (no match, block ends)
-    let lit = input.len() - ip;
-    let token = out.len();
-    out.push(0);
-    if lit >= RUN_MASK {
-        out[token] = (RUN_MASK << ML_BITS) as u8;
-        push_extension(out, lit - RUN_MASK);
-    } else {
-        out[token] = (lit << ML_BITS) as u8;
-    }
-    out.extend_from_slice(&input[ip..]);
+    push_literal_run(out, &input[ip..]);
     Ok(out.len())
 }
 
@@ -167,6 +150,22 @@ fn push_extension(out: &mut Vec<u8>, mut n: usize) {
     out.push(n as u8);
 }
 
+/// One literal run: token (match nibble still 0, added by the caller),
+/// literal-length extension, then the literal bytes. Returns the token
+/// position.
+fn push_literal_run(out: &mut Vec<u8>, lits: &[u8]) -> usize {
+    let token = out.len();
+    out.push(0);
+    let lit = lits.len();
+    if lit >= RUN_MASK {
+        out[token] = (RUN_MASK << ML_BITS) as u8;
+        push_extension(out, lit - RUN_MASK);
+    } else {
+        out[token] = (lit << ML_BITS) as u8;
+    }
+    out.extend_from_slice(lits);
+    token
+}
 
 #[cfg(test)]
 mod tests {
@@ -360,7 +359,6 @@ mod tests {
     /// op).
     #[test]
     fn rebuild_decodes_with_system_liblz4() {
-        use std::os::raw::c_int;
         let Ok((lib, _)) = crate::open_lib("liblz4.so.1", &[]) else {
             eprintln!("no system liblz4; skipped");
             return;
@@ -378,15 +376,9 @@ mod tests {
         let seqs = [triple(0, 2055, 0), triple(10, 0, 4083)].concat();
         let block = rebuild(&input, &seqs);
         let mut dst = vec![0u8; input.len()];
-        let n = unsafe {
-            (fns.decompress)(
-                block.as_ptr(),
-                dst.as_mut_ptr(),
-                block.len() as c_int,
-                dst.len() as c_int,
-            )
-        };
-        assert!(n >= 0, "liblz4 rejected the rebuilt block");
-        assert_eq!(&dst[..n as usize], &input[..]);
+        let n = fns
+            .decompress_block(&block, &mut dst)
+            .expect("liblz4 rejected the rebuilt block");
+        assert_eq!(&dst[..n], &input[..]);
     }
 }

@@ -70,8 +70,15 @@ pub(crate) fn decode_block(src: &[u8], dst: &mut [u8]) -> Result<usize, String> 
             return Err(format!("match overruns the output buffer at {d}B"));
         }
         let start = d - off;
-        for i in 0..ml {
-            dst[d + i] = dst[start + i];
+        if off >= ml {
+            // source and destination are disjoint: one memcpy
+            let (decoded, out) = dst.split_at_mut(d);
+            out[..ml].copy_from_slice(&decoded[start..start + ml]);
+        } else {
+            // overlapping regions copy byte-by-byte so runs encode
+            for i in 0..ml {
+                dst[d + i] = dst[start + i];
+            }
         }
         d += ml;
     }
@@ -104,6 +111,13 @@ mod tests {
         // "abc" + a 9-byte match at offset 3 → "abcabcabcabc" (the last
         // six copied bytes are themselves copies)
         decode(&[0x35, b'a', b'b', b'c', 0x03, 0x00, 0x00], b"abcabcabcabc");
+    }
+
+    #[test]
+    fn disjoint_match_copies_in_one_slice() {
+        // 4 literals then a 4-byte match at offset 4: source and
+        // destination are exactly disjoint (offset >= match length)
+        decode(&[0x40, b'a', b'b', b'c', b'd', 0x04, 0x00], b"abcdabcd");
     }
 
     #[test]

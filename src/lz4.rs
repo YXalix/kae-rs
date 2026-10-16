@@ -110,4 +110,32 @@ impl Lz4Fns {
             Ok(n as usize)
         }
     }
+
+    /// Returns the decompressed byte count; a negative return counts as
+    /// failure (matching liblz4 return-value semantics). Inputs beyond the
+    /// `c_int` block-size limit are rejected instead of silently truncating
+    /// the length.
+    pub fn decompress_block(&self, src: &[u8], dst: &mut [u8]) -> Result<usize, String> {
+        if src.len() > c_int::MAX as usize || dst.len() > c_int::MAX as usize {
+            return Err(format!(
+                "buffer exceeds LZ4 block limit (src {}B, dst {}B, max {}B)",
+                src.len(),
+                dst.len(),
+                c_int::MAX
+            ));
+        }
+        let n = unsafe {
+            (self.decompress)(
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+                src.len() as c_int,
+                dst.len() as c_int,
+            )
+        };
+        if n < 0 {
+            Err(format!("LZ4_decompress_safe returned {n}"))
+        } else {
+            Ok(n as usize)
+        }
+    }
 }

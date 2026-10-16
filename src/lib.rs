@@ -55,7 +55,6 @@ mod worker;
 
 pub use batch::AsyncBatch;
 use lz4::Lz4Fns;
-use std::os::raw::c_int;
 use std::path::Path;
 
 /// Default probe paths for the patched liblz4 (the first existing one wins).
@@ -298,28 +297,8 @@ impl KaeLz4 {
     /// `c_int` limit (~2 GiB); larger buffers are rejected with
     /// [`KaeError::Decompress`] instead of being silently truncated.
     pub fn decompress(&self, src: &[u8], dst: &mut [u8]) -> Result<usize, KaeError> {
-        if src.len() > c_int::MAX as usize || dst.len() > c_int::MAX as usize {
-            return Err(KaeError::Decompress(format!(
-                "buffer exceeds LZ4 block limit (src {}B, dst {}B, max {}B)",
-                src.len(),
-                dst.len(),
-                c_int::MAX
-            )));
-        }
-        let n = unsafe {
-            (self.fns.decompress)(
-                src.as_ptr(),
-                dst.as_mut_ptr(),
-                src.len() as i32,
-                dst.len() as i32,
-            )
-        };
-        if n < 0 {
-            Err(KaeError::Decompress(format!(
-                "LZ4_decompress_safe returned {n}"
-            )))
-        } else {
-            Ok(n as usize)
-        }
+        self.fns
+            .decompress_block(src, dst)
+            .map_err(KaeError::Decompress)
     }
 }

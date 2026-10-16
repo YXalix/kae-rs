@@ -221,6 +221,17 @@ fn lz77_lit_area(req_size: usize) -> usize {
     req_size.saturating_sub(MFLIMIT) + ZSTD_LIT_RSV as usize
 }
 
+/// Source and output DMA addresses plus the one-shot flags shared by both
+/// dialects (tag_l is the ring index, set by the submit path).
+fn set_sqe_addrs(sqe: &mut Sqe, src_dma: u64, out_dma: u64) {
+    sqe.source_addr_l = src_dma as u32;
+    sqe.source_addr_h = (src_dma >> 32) as u32;
+    sqe.dest_addr_l = out_dma as u32;
+    sqe.dest_addr_h = (out_dma >> 32) as u32;
+    sqe.dw7 = DW7_ONE_SHOT;
+    sqe.tag_l = 0;
+}
+
 /// Fill one lz77 flat SQE (pure, unit-tested; the literals land at the
 /// output start, the 8-byte sequence triples after the literal area). The
 /// dialect is the one kaelz4's LZ4_compress_default drives: LZ77_ONLY at
@@ -234,15 +245,9 @@ fn fill_lz77_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, ocap:
     sqe.dw13 = lit;
     sqe.dest_avail_out = ocap as u32 - lit;
     sqe.input_data_length = in_len.saturating_sub(MFLIMIT) as u32;
-    sqe.source_addr_l = src_dma as u32;
-    sqe.source_addr_h = (src_dma >> 32) as u32;
-    sqe.cipher_key_addr_l = out_dma as u32;
+    set_sqe_addrs(sqe, src_dma, out_dma + lit as u64);
+    sqe.cipher_key_addr_l = out_dma as u32; // the literals area
     sqe.cipher_key_addr_h = (out_dma >> 32) as u32;
-    let seq_at = out_dma + lit as u64;
-    sqe.dest_addr_l = seq_at as u32;
-    sqe.dest_addr_h = (seq_at >> 32) as u32;
-    sqe.dw7 = DW7_ONE_SHOT;
-    sqe.tag_l = 0; // ring index, set by the submit path
 }
 
 /// Fill one deflate flat SQE (32K window; headerless deflate, the
@@ -252,12 +257,7 @@ fn fill_deflate_sqe(sqe: &mut Sqe, src_dma: u64, out_dma: u64, in_len: usize, oc
     sqe.dw9 = HW_RAW_DEFLATE | (WS_32K << WINDOWS_SIZE_SHIFT);
     sqe.dest_avail_out = ocap as u32;
     sqe.input_data_length = in_len as u32;
-    sqe.source_addr_l = src_dma as u32;
-    sqe.source_addr_h = (src_dma >> 32) as u32;
-    sqe.dest_addr_l = out_dma as u32;
-    sqe.dest_addr_h = (out_dma >> 32) as u32;
-    sqe.dw7 = DW7_ONE_SHOT;
-    sqe.tag_l = 0;
+    set_sqe_addrs(sqe, src_dma, out_dma);
 }
 
 // ---------- minimal FFI (the crate binds libm-style externs by hand to
@@ -444,6 +444,7 @@ struct QueueStats {
 
 struct Queue {
     file: File,
+    /// QP number (doorbell identity), captured from SET_QP_CTX at open.
     sqn: u16,
     sq: *mut u8,
     cq: *mut u8,
@@ -1196,7 +1197,7 @@ mod hw_tests {
             );
             if let Some(d) = d {
                 let lo = d.saturating_sub(16);
-                eprintln!("native: native: {}", hx(&block[lo..(d + 16).min(n)]));
+                eprintln!("native: rebuild: {}", hx(&block[lo..(d + 16).min(n)]));
                 eprintln!(
                     "native: vendor: {}",
                     hx(&vblock[lo..(d + 16).min(vblock.len())])
@@ -1360,9 +1361,6 @@ mod hw_tests {
         assert_eq!(match_runs(&apart), vec![(2, 8, 2), (10, 16, 4)]);
     }
 }
-
-// The QP number (doorbell identity) is captured from SET_QP_CTX at open
-// and lives in the sqn field.
 
 #[cfg(test)]
 mod tests {

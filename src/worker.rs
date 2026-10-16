@@ -527,20 +527,12 @@ fn bench_native(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i3
     // ratio; a warm-up without completions means the engine never answered
     let warm = pump.run(1.0);
     if warm.reqs_done == 0 || warm.hw_errors > 0 {
-        println!(
-            "RESULT status=NATIVE_FAIL impl=native op=compress block={} reqs={} hw_err={} err=engine_dead",
-            block, warm.reqs_done, warm.hw_errors
-        );
-        return EXIT_COMPRESS_FAIL;
+        return engine_dead(block, &warm);
     }
 
     let st_native = pump.run(a.min_sec);
     if st_native.reqs_done == 0 || st_native.hw_errors > 0 {
-        println!(
-            "RESULT status=NATIVE_FAIL impl=native op=compress block={} reqs={} hw_err={} err=engine_dead",
-            block, st_native.reqs_done, st_native.hw_errors
-        );
-        return EXIT_COMPRESS_FAIL;
+        return engine_dead(block, &st_native);
     }
     // one continuous run = one pass; CPU covers the whole pump (this
     // process is single-threaded)
@@ -622,7 +614,7 @@ fn hex(bytes: &[u8]) -> String {
 fn rebuild_fail_detail(sample: &uacce::Lz77Sample, e: &str) -> String {
     let head = hex(&sample.seqs[..sample.seqs.len().min(64)]);
     format!(
-        "rebuild: {e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
+        "{e} (lit={} seqs={} ll_overflow_cnt={} pos={} head={head})",
         sample.lit,
         sample.seqs.len() / 8,
         sample.ll_overflow_cnt,
@@ -653,17 +645,13 @@ fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
 /// literals area and the input — enough to replay the triple rules
 /// offline.
 fn dump_rebuild_check(
-    req_idx: usize,
-    off: usize,
+    label: &str,
     sample: &uacce::Lz77Sample,
     input: &[u8],
     block: &[u8],
     e: &str,
 ) {
-    eprintln!(
-        "native: request {req_idx} (data {off}..{}) rebuild check failed: {e}",
-        off + input.len()
-    );
+    eprintln!("native: {label} rebuild check failed: {e}");
     eprintln!(
         "native: lit={} ll_overflow_cnt={} ll_overflow_pos={} seqs={}",
         sample.lit,
@@ -675,6 +663,65 @@ fn dump_rebuild_check(
     eprintln!("native: block: {}", hex(block));
     eprintln!("native: lits: {}", hex(&sample.lits));
     eprintln!("native: input: {}", hex(input));
+}
+
+/// Why one request's rebuild failed: the stage and its flat-ready
+/// diagnostic, so each caller maps stages onto its own error protocol.
+enum RebuildFailure {
+    /// The engine did not answer the sample request.
+    Triples(String),
+    /// The triples do not rebuild into a decodable LZ4 block.
+    Rebuild(String),
+    /// The rebuilt block does not decode back to the input; the full
+    /// evidence dump is already on stderr.
+    Check(String),
+}
+
+impl RebuildFailure {
+    fn stage(&self) -> &'static str {
+        match self {
+            RebuildFailure::Triples(_) => "triples",
+            RebuildFailure::Rebuild(_) => "rebuild",
+            RebuildFailure::Check(_) => "rebuild_check",
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            RebuildFailure::Triples(e) | RebuildFailure::Rebuild(e) | RebuildFailure::Check(e) => e,
+        }
+    }
+}
+
+/// One `req_size` request through the engine and back: sample its triples
+/// off the engine, rebuild them into a standard LZ4 block in `stream`, and
+/// require the decode to return the original bytes. A self-check failure
+/// dumps the request's full evidence (`label` names it in the dump header).
+/// Returns the rebuilt block's length in `stream`.
+fn rebuild_request(
+    pump: &mut uacce::NativePump,
+    chunk: &[u8],
+    stream: &mut Vec<u8>,
+    label: &str,
+) -> Result<usize, RebuildFailure> {
+    let sample = pump.sample_triples(chunk).map_err(RebuildFailure::Triples)?;
+    let n = rebuild::lz77_block(chunk, &sample.seqs, stream)
+        .map_err(|e| RebuildFailure::Rebuild(rebuild_fail_detail(&sample, &e)))?;
+    if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
+        dump_rebuild_check(label, &sample, chunk, &stream[..n], &e);
+        return Err(RebuildFailure::Check(e));
+    }
+    Ok(n)
+}
+
+/// The compress run produced no usable completions: fail the cell with the
+/// completion counters in the row.
+fn engine_dead(block: usize, st: &uacce::NativeStats) -> i32 {
+    println!(
+        "RESULT status=NATIVE_FAIL impl=native op=compress block={} reqs={} hw_err={} err=engine_dead",
+        block, st.reqs_done, st.hw_errors
+    );
+    EXIT_COMPRESS_FAIL
 }
 
 /// `native` decompress: decode the standard LZ4 blocks the native pipeline
@@ -741,49 +788,34 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
         let base = blob.len();
         for r in 0..per_block {
             let off = b * block + r * req_size;
-            let sample = match pump.sample_triples(&data[off..off + req_size]) {
-                Ok(s) => s,
-                Err(e) => {
-                    println!(
-                        "RESULT status=COMPRESS_FAIL impl=native op=decompress block={} at=triples err={}",
-                        block,
-                        flat(&e)
-                    );
-                    return EXIT_COMPRESS_FAIL;
-                }
-            };
-            let n = match rebuild::lz77_block(&data[off..off + req_size], &sample.seqs, &mut stream)
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    let detail = rebuild_fail_detail(&sample, &e);
-                    println!(
-                        "RESULT status=COMPRESS_FAIL impl=native op=decompress block={} at=rebuild err={}",
-                        block,
-                        flat(&detail)
-                    );
-                    return EXIT_COMPRESS_FAIL;
-                }
-            };
-            // the rebuild self-check: the decoded block must be the
-            // original bytes, per request, before anything is timed
             let req_idx = b * per_block + r;
-            if let Err(e) = check_rebuilt_request(&data[off..off + req_size], &stream[..n]) {
-                dump_rebuild_check(
-                    req_idx,
-                    off,
-                    &sample,
-                    &data[off..off + req_size],
-                    &stream[..n],
-                    &e,
-                );
-                println!(
-                    "RESULT status=DECOMPRESS_MISMATCH impl=native op=decompress block={} req={req_idx} at=rebuild_check err={}",
-                    block,
-                    flat(&e)
-                );
-                return EXIT_VERIFY_FAIL;
-            }
+            let n = match rebuild_request(
+                &mut pump,
+                &data[off..off + req_size],
+                &mut stream,
+                &format!("request {req_idx} (data {off}..{})", off + req_size),
+            ) {
+                Ok(n) => n,
+                Err(f) => {
+                    let check = matches!(f, RebuildFailure::Check(_));
+                    println!(
+                        "RESULT status={} impl=native op=decompress block={} req={req_idx} at={} err={}",
+                        if check {
+                            "DECOMPRESS_MISMATCH"
+                        } else {
+                            "COMPRESS_FAIL"
+                        },
+                        block,
+                        f.stage(),
+                        flat(f.detail())
+                    );
+                    return if check {
+                        EXIT_VERIFY_FAIL
+                    } else {
+                        EXIT_COMPRESS_FAIL
+                    };
+                }
+            };
             blob.extend_from_slice(&stream[..n]);
         }
         extents.push((base, blob.len() - base));
@@ -872,13 +904,13 @@ fn build_native_sample(
         for r in 0..per_block {
             let off = b * block + r * req_size;
             let chunk = &data[off..off + req_size];
-            let sample = pump.sample_triples(chunk)?;
-            let n = rebuild::lz77_block(chunk, &sample.seqs, &mut stream)
-                .map_err(|e| rebuild_fail_detail(&sample, &e))?;
-            if let Err(e) = check_rebuilt_request(chunk, &stream[..n]) {
-                dump_rebuild_check(b * per_block + r, off, &sample, chunk, &stream[..n], &e);
-                return Err(format!("rebuild check: {e} (block {b} request {r})"));
-            }
+            let n = rebuild_request(
+                pump,
+                chunk,
+                &mut stream,
+                &format!("request {} (data {off}..{})", b * per_block + r, off + req_size),
+            )
+            .map_err(|f| format!("{}: {} (block {b} request {r})", f.stage(), f.detail()))?;
             packed.extend_from_slice(&stream[..n]);
         }
         lens.push(packed.len() - base);
