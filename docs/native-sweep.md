@@ -30,10 +30,12 @@ About ten minutes. The file is the deliverable — send it back as is.
   end of the run).
 
 The one exception that stays outside the file: `native-fail-*.txt` —
-a failed sample rebuild's hex dumps (a single request's input line
-alone is hundreds of KB). They appear only when a run recorded
-`sample=failed` in its note; the audit verdict inside names the side at
-fault. Send them along with the file when they appear.
+a failed block check's hex dumps (every request's triples and literal
+areas, plus the input and the rebuilt block; the input line alone is
+hundreds of KB). They appear only when a run recorded `sample=failed`
+in its note; the console keeps the per-request audit verdicts and the
+request holding the first decode diff, the file carries the bytes.
+Send them along with the file when they appear.
 
 ## Preconditions
 
@@ -47,19 +49,20 @@ fault. Send them along with the file when they appear.
 Every experiment is a full `kae-bench` run re-executed as a subprocess
 (sw/hw keep their library isolation); every native run pins the three
 knobs explicitly (`KAE_NATIVE_DEPTH`, `KAE_NATIVE_DB_BATCH`,
-`KAE_NATIVE_WAIT`) so nothing inherits ambient environment. Native
-experiments use 64K requests and sustained 2s windows — the default
-0.8s windows read boost clocks (the first sweep's 64K rows read
-9.6 GB/s at 0.8s and 6.4 GB/s at 2s).
+`KAE_NATIVE_WAIT`) so nothing inherits ambient environment. Every
+experiment runs in sustained 2s windows — the default 0.8s windows
+read boost clocks (the first sweep's 64K rows read 9.6 GB/s at 0.8s
+and 6.4 GB/s at 2s).
 
 | experiment | what it answers |
 |---|---|
-| `e1-base` | the anchor: sw, hw, hwasync and native on the same synthetic input (or `--input` file), default windows |
+| `e1-base` | the anchor: sw, hw, hwasync and native on the same synthetic input (or `--input` file) |
 | `e2-depth-{1,4,16,64,256}` | the verdict: single-queue throughput against in-flight depth, 64K, spin |
 | `e3-queues2`, `e3-queues4` | queue scaling at depth 8 (`--workers` = queues, round-robin over devices) |
 | `e4-spin-d8`, `e4-poll-d8` | wait policy: identical runs differing only in spin vs `poll()`-the-fd |
 | `e5-db1` | the doorbell tax: `KAE_NATIVE_DB_BATCH=1` against the full-depth batch |
 | `e6-small` | sustained small-block scan: 4K, 8K, 16K, 64K, 128K requests |
+| `e7-queues2-8k` | queue scaling at the best small request size: does 8K double like 64K, or saturate the device pair earlier |
 
 `--sweep` composes with the ordinary options where they make sense:
 `--input FILE` sweeps a real file instead of the synthetic dataset,

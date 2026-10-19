@@ -823,9 +823,9 @@ fn summarize(cfg: &Config, rows: &[Row]) {
 
 // ---------- the one-shot sweep: the whole experiment series in one command ----------
 
-/// The sweep's native experiments run at 64K requests in sustained windows
-/// (the 0.8s default reads boost clocks: the first sweep's 64K rows read
-/// 9.6 GB/s at 0.8s and 6.4 GB/s at 2s).
+/// Every sweep experiment runs in sustained windows — the 0.8s default
+/// reads boost clocks: the first sweep's 64K rows read 9.6 GB/s at 0.8s
+/// and 6.4 GB/s at 2s.
 const SWEEP_BLOCK: usize = 65536;
 const SWEEP_MIN_SEC: f64 = 2.0;
 const SWEEP_DEPTHS: [usize; 5] = [1, 4, 16, 64, 256];
@@ -998,8 +998,10 @@ fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
                     .map(|b| b.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
+                // the same sustained window as the native experiments: a
+                // shorter one reads e1's native rows high against e4/e6
                 "--min-sec".to_string(),
-                cfg.min_sec.to_string(),
+                SWEEP_MIN_SEC.to_string(),
             ]);
             a
         },
@@ -1065,6 +1067,16 @@ fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
         args: native(SWEEP_SMALL_BLOCKS),
         env: knobs(8, 8, "spin"),
     });
+    // 2 queues at the best small request size: does the 8K rate double the
+    // way 64K does (e3), or do small requests saturate the device pair
+    // before the second queue pays off?
+    let mut a = native("8192");
+    a.extend(["--workers".to_string(), "2".to_string()]);
+    exps.push(SweepExp {
+        name: "e7-queues2-8k".into(),
+        args: a,
+        env: knobs(8, 8, "spin"),
+    });
     exps
 }
 
@@ -1119,6 +1131,18 @@ fn sweep_readings(tsv_dir: &Path) -> Vec<String> {
             "doorbell: full-depth batch {:.2} GB/s vs db_batch=1 {:.2} GB/s",
             b.gbps, d1.gbps
         ));
+    }
+    if let Some(q2) = ok_row("e7-queues2-8k") {
+        let q1 = read_tsv_rows(&tsv_dir.join("e6-small.tsv"))
+            .into_iter()
+            .find(|r| r.op == "compress" && r.status == "OK" && r.block == 8192);
+        v.push(match q1 {
+            Some(q1) => format!(
+                "2q at 8K: {:.2} GB/s vs 1q {:.2} (e6-small)",
+                q2.gbps, q1.gbps
+            ),
+            None => format!("2q at 8K: {:.2} GB/s", q2.gbps),
+        });
     }
     v
 }
