@@ -1215,6 +1215,15 @@ fn write_sweep_file(
 fn run_sweep(cfg: &Config, out: &Path) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kae-bench"));
     println!("== kae-bench sweep -> {} ==", out.display());
+    // earlier runs' rebuild-check dumps would ride along; the trailing
+    // dump count must name this run's failures only
+    if let Ok(rd) = std::fs::read_dir(".") {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("native-fail-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let tsv_dir = match make_tmp_dir() {
         Ok(t) => t,
         Err(e) => {
