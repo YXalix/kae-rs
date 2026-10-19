@@ -42,7 +42,7 @@ Common invocations:
 | `--input FILE` | — | Benchmark a real file instead of synthetic data (dataset label becomes `input`) |
 | `--size MIB` | 64 | Synthetic dataset size |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
-| `--impl LIST` | `sw,hw,hwasync,native,soft,nativesw` | `sw`, `hw`, `hwasync` (compress only), `native` (the crate's own uacce engine path; its decompress cell decodes with lz4rip — see [native-bench.md](native-bench.md)), `soft` (the bare pure-Rust lz4rip engine, any machine), `nativesw` (`KaeNative`: the production per-block engine path with per-request software fallback; runs everywhere, degrading to `soft` without a ZIP device) |
+| `--impl LIST` | `sw,hw,hwasync,native,soft,nativesw` | `sw`, `hw`, `hwasync` (compress only), `native` (the crate's own uacce engine path; its decompress cell decodes with lz4rip — see [native-bench.md](native-bench.md)), `soft` (the bare pure-Rust lz4rip engine, any machine), `nativesw` (`KaeNative`: the production engine path — `compress_segment` batch through the in-flight ring, per-block software fallback; runs everywhere, degrading to `soft` without a ZIP device) |
 | `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `native`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |

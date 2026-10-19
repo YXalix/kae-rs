@@ -237,14 +237,17 @@ two-view reading rules, and the ceiling-interpretation framework.
 `src/native.rs` wraps the engine in the block-level API the zfile worker
 loop would drive: [`KaeNative::open`] probes for a ZIP engine and degrades
 to the lz4rip software engine when none is present or the queue cannot be
-opened; on a live queue every block compresses through the engine
-synchronously (load slot → submit → wait → rebuild), and a request that
-stalls past `KAE_NATIVE_TIMEOUT_MS` (default 500) or completes with a
-hardware error fails that whole block over to software — never a mixed
-block — with the split counted in `hw_requests()`/`sw_requests()`. No C
-library in either mode. The bench cell is `nativesw` (it runs everywhere,
-saying `mode=soft` in its note without a device); `soft` is the bare
-lz4rip baseline.
+opened; on a live queue [`KaeNative::compress_segment`] drives a whole
+segment through the engine as a ring of in-flight requests (depth from
+`KAE_NATIVE_DEPTH`, default 8 — the depth hides the chip's per-request
+latency, which is why the per-block `compress` loop cannot compete), and a
+request that stalls past `KAE_NATIVE_TIMEOUT_MS` (default 500) or
+completes with a hardware error fails that whole block over to software —
+never a mixed block — with the split counted in
+`hw_requests()`/`sw_requests()`; a wedged queue sticks the handle in
+software mode (`stuck()`). No C library in either mode. The bench cell is
+`nativesw` (it runs everywhere, saying `mode=soft` in its note without a
+device); `soft` is the bare lz4rip baseline.
 
 ```rust
 use kae::{native_available, Backend, KaeNative};
@@ -257,6 +260,11 @@ match nat.backend() {
 }
 let packed = nat.compress_vec(&block)?;    // standard LZ4 block out
 let n = nat.decompress(&packed, &mut restored)?;  // lz4rip in every mode
+
+// the throughput shape: a whole segment per call through the in-flight
+// ring (depth from KAE_NATIVE_DEPTH, default 8) — the depth is what hides
+// the engine's per-request latency, which a per-block loop cannot
+let lens = nat.compress_segment(&segment, 4096, &mut packed)?;
 ```
 
 ## Operational hard rules

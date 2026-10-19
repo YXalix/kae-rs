@@ -78,3 +78,53 @@ fn soft_mode_roundtrips_every_block_shape() {
     assert_eq!(nat.hw_requests(), 0);
     assert!(nat.sw_requests() >= 5, "every block counts: {nat:?}");
 }
+
+#[test]
+fn soft_mode_compress_segment_packs_blocks_and_tail() {
+    if native_available() {
+        return;
+    }
+    let mut nat = KaeNative::open().unwrap();
+
+    let block = 4096;
+    let mut segment = vec![0u8; 10 * block + 100];
+    // chunks_mut yields the 10 whole blocks plus the 100B tail; each gets
+    // its own pattern so every decode is checkable against the segment
+    for (page, p) in segment.chunks_mut(block).enumerate() {
+        let byte = match page % 3 {
+            0 => 0u8,
+            1 => 0xA5,
+            _ => (page % 251) as u8,
+        };
+        p.iter_mut().for_each(|b| *b = byte);
+    }
+
+    let mut packed = Vec::new();
+    let lens = nat.compress_segment(&segment, block, &mut packed).expect("segment");
+    assert_eq!(lens.len(), 11, "one entry per whole block, the tail last");
+    assert_eq!(lens.iter().sum::<usize>(), packed.len(), "contiguous packing");
+
+    // every entry decodes back to its plain bytes
+    let mut off = 0;
+    for (i, l) in lens.iter().enumerate() {
+        let plain_len = if i < 10 { block } else { 100 };
+        let mut restored = vec![0u8; plain_len];
+        let n = nat.decompress(&packed[off..off + l], &mut restored).expect("decode");
+        assert_eq!(n, plain_len, "entry {i}");
+        assert_eq!(&restored[..n], &segment[i * block..i * block + plain_len], "entry {i}");
+        off += l;
+    }
+    assert_eq!(off, packed.len());
+
+    // rejections mirror the async batch contract
+    let mut out = Vec::new();
+    assert!(matches!(
+        nat.compress_segment(&segment, 0, &mut out),
+        Err(kae::KaeError::Compress(_))
+    ));
+    assert!(matches!(
+        nat.compress_segment(&[], block, &mut out),
+        Err(kae::KaeError::Compress(_))
+    ));
+    assert_eq!(nat.hw_requests(), 0, "soft mode never touches hardware");
+}

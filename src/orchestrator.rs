@@ -96,8 +96,10 @@ usage: kae-bench [options]
                     native = the crate's own uacce engine path (compress: the raw
                     lz77 pump; decompress: lz4rip decode of the rebuilt blocks), no
                     C library in the process; soft = the pure-Rust lz4rip engine,
-                    any machine; nativesw = the production per-block engine path
-                    with per-request software fallback — runs everywhere, degrading
+                    any machine; nativesw = the production engine path
+                    (compress_segment batch through the in-flight ring,
+                    per-block software fallback; KAE_NATIVE_SHAPE=block
+                    keeps the per-block loop) — runs everywhere, degrading
                     to soft without a ZIP device)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
                     --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's

@@ -1718,14 +1718,14 @@ fn bench_soft_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usi
     EXIT_OK
 }
 
-/// `nativesw`: the production per-block engine path (`KaeNative`) —
-/// hardware first, software fallback per request. Without a ZIP device the
-/// cell runs the soft engine end to end and says so in the note
-/// (`mode=soft`) instead of failing; with one, every block goes through the
-/// engine synchronously and the note carries the fallback accounting
-/// (`hw=N,sw=M`). Accounting matches [`bench_compress`]; the timed loop is
-/// single-threaded (the production shape: one handle per worker thread,
-/// scale by threads).
+/// `nativesw`: the production engine path (`KaeNative`) — hardware first,
+/// software fallback. Two shapes: `compress_segment` drives the whole
+/// workload as one segment batch through the in-flight ring (default — the
+/// zfile segment insertion shape, the one that hides the chip's request
+/// latency); `KAE_NATIVE_SHAPE=block` keeps the per-block synchronous loop
+/// (the correctness/fallback reference, latency-bound by construction).
+/// Without a ZIP device the cell runs the soft engine end to end and says
+/// so in the note (`mode=soft`) instead of failing.
 fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     let req_size = block.min(uacce::MAX_LZ77_REQ);
     let mut nat = match crate::KaeNative::open_with(req_size) {
@@ -1738,6 +1738,10 @@ fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
             return EXIT_OPEN_FAIL;
         }
     };
+    if std::env::var("KAE_NATIVE_SHAPE").as_deref() != Ok("block") {
+        return bench_nativesw_segment_compress(a, &mut nat, data, block, nblocks);
+    }
+
     let out_bytes_warm = match warm_up_compress(a, data, block, nblocks, |s, d| {
         nat.compress(s, d).map_err(|e| e.to_string())
     }) {
@@ -1783,7 +1787,84 @@ fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
         in_bytes: (nblocks as u64) * (block as u64) * st.passes,
         out_bytes: out_bytes_warm * st.passes,
         ratio_pct: out_bytes_warm as f64 / ((nblocks as u64) * (block as u64)) as f64 * 100.0,
-        note: &nativesw_note(&nat, req_size),
+        note: &nativesw_note(&nat, req_size, "block"),
+    });
+    EXIT_OK
+}
+
+/// The segment batch shape: one `compress_segment` call per timed pass over
+/// the whole workload — whole blocks through the in-flight ring, any tail
+/// and any fallbacking block through the software engine. Sample capture
+/// and the ratio come from the untimed warm-up call, exactly like the sync
+/// benches.
+fn bench_nativesw_segment_compress(
+    a: &WorkerArgs,
+    nat: &mut crate::KaeNative,
+    data: &[u8],
+    block: usize,
+    nblocks: usize,
+) -> i32 {
+    let segment = &data[..nblocks * block];
+    let in_bytes_one = (nblocks as u64) * (block as u64);
+
+    let mut packed: Vec<u8> = Vec::with_capacity(segment.len() / 2);
+    let lens = match nat.compress_segment(segment, block, &mut packed) {
+        Ok(l) => l,
+        Err(e) => {
+            println!(
+                "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=warmup err={}",
+                block,
+                flat(&e.to_string())
+            );
+            return EXIT_COMPRESS_FAIL;
+        }
+    };
+    if !a.sample_out.is_empty() {
+        if let Err(e) = write_sample(&a.sample_out, block, &lens, &packed, nblocks) {
+            eprintln!("worker: write sample: {e}");
+            return EXIT_USAGE;
+        }
+    }
+    let out_bytes_warm = packed.len() as u64;
+
+    let mut seg_err: Option<String> = None;
+    let st = timed_loop(
+        1,
+        |_| {
+            if seg_err.is_some() {
+                return 0;
+            }
+            match nat.compress_segment(segment, block, &mut packed) {
+                Ok(l) => l.iter().sum::<usize>(),
+                Err(e) => {
+                    seg_err = Some(e.to_string());
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = seg_err {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVESW,
+        op: "compress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: in_bytes_one * st.passes,
+        out_bytes: out_bytes_warm * st.passes,
+        ratio_pct: out_bytes_warm as f64 / in_bytes_one as f64 * 100.0,
+        note: &nativesw_note(nat, block.min(uacce::MAX_LZ77_REQ), "segment"),
     });
     EXIT_OK
 }
@@ -1860,26 +1941,30 @@ fn bench_nativesw_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks:
         in_bytes,
         out_bytes,
         ratio_pct: 0.0,
-        note: &nativesw_note(&nat, req_size),
+        note: &nativesw_note(&nat, req_size, "block"),
     });
     EXIT_OK
 }
 
 /// The row note for the nativesw cells: which mode the handle took, the
-/// request size, and the hardware/software request split — on a machine
-/// without the device the split reads hw=0 and the mode says soft.
-fn nativesw_note(nat: &crate::KaeNative, req_size: usize) -> String {
+/// shape, the request size, and the hardware/software request split — on a
+/// machine without the device the split reads hw=0 and the mode says soft.
+fn nativesw_note(nat: &crate::KaeNative, req_size: usize, shape: &str) -> String {
     let mode = match nat.backend() {
         Backend::Native => "native",
         _ => "soft",
     };
     let mut note = format!(
-        "nativesw,mode={},req_size={},hw={},sw={},decode=lz4rip",
+        "nativesw,mode={},shape={},req_size={},hw={},sw={},decode=lz4rip",
         mode,
+        shape,
         req_size,
         nat.hw_requests(),
         nat.sw_requests(),
     );
+    if nat.stuck() {
+        note.push_str(",stuck=1");
+    }
     if let Some(e) = nat.last_hw_error() {
         note.push_str(&format!(",last_hw_fallback={}", flat(e)));
     }

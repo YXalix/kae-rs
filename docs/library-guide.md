@@ -104,12 +104,24 @@ Semantics:
 - **Inputs below 16 bytes** (and remainders that would leave such a tail
   request) go to software whole: the engine's lz77 parse programs
   `in_len - 12`.
+- **Segment batch is the throughput shape**: `compress_segment(&segment,
+  block, &mut packed)` drives the whole segment's blocks through the
+  in-flight ring (depth from `KAE_NATIVE_DEPTH`, default 8) in one call —
+  the depth is what hides the engine's per-request latency, which the
+  per-block `compress` loop structurally cannot (it always drains before
+  the next block). Packing and returned lengths mirror
+  `AsyncBatch::compress_segment`: concatenated block bytes in order, the
+  tail last, one length per entry. Any block whose requests fail goes to
+  software whole; the tail always does.
 - **Decompression is software in every mode** — the engine has no LZ4
   decode direction (the driver rejects it), so the read path is lz4rip
   regardless of the backend.
+- **A wedged queue sticks**: a timed-out request or a stuck ring sets
+  `stuck()`, and every further block goes to software until the handle is
+  reopened. A per-request hardware status error only fails its own block.
 - `Send`, not `Sync`, like `AsyncBatch`: move one handle to the worker
-  thread that owns it; one block in flight per handle, scale by handing
-  each worker thread its own (each opens its own queue).
+  thread that owns it; scale by handing each worker thread its own (each
+  opens its own queue).
 
 ## Segment-level async batch (`AsyncBatch`)
 

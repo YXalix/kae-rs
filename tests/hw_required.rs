@@ -195,6 +195,49 @@ fn nativesw_output_roundtrips_through_stock_liblz4() {
     }
 }
 
+/// The segment batch shape on hardware: whole blocks through the in-flight
+/// ring, the tail through software, and every block decodable by the stock
+/// library — the production read path consumes exactly this byteshape.
+#[test]
+#[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
+fn nativesw_hw_segment_roundtrip() {
+    require_hw();
+    let sw = KaeLz4::open_sw().expect("stock system liblz4");
+    let mut nat = KaeNative::open_with(4096).expect("native open");
+    assert_eq!(nat.backend(), Backend::Native);
+
+    for block in [4096, 65536, 131072] {
+        let segment = make_mixed(8 * block + 100);
+        let mut packed = Vec::new();
+        let lens = nat
+            .compress_segment(&segment, block, &mut packed)
+            .expect("compress_segment");
+        assert_eq!(lens.len(), 9, "block {block}: 8 whole + tail");
+        assert_eq!(lens.iter().sum::<usize>(), packed.len());
+
+        let mut off = 0;
+        for (i, l) in lens.iter().enumerate() {
+            let plain_len = if i < 8 { block } else { 100 };
+            let mut restored = vec![0u8; plain_len];
+            let n = sw
+                .decompress(&packed[off..off + l], &mut restored)
+                .unwrap_or_else(|e| panic!("block {block} entry {i}: stock decode: {e}"));
+            assert_eq!(n, plain_len, "block {block} entry {i}");
+            assert_eq!(
+                &restored[..n],
+                &segment[i * block..i * block + plain_len],
+                "block {block} entry {i}: bit-exact"
+            );
+            off += l;
+        }
+    }
+
+    // 24 whole blocks + one software tail per segment shape
+    assert!(nat.hw_requests() >= 24, "hw={}", nat.hw_requests());
+    assert_eq!(nat.sw_requests(), 3, "one tail per block size: {nat:?}");
+    assert!(!nat.stuck());
+}
+
 #[test]
 #[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
 fn async_batch_segment_roundtrip() {

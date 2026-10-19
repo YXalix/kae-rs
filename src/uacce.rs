@@ -605,7 +605,9 @@ impl Queue {
     /// length) and return its sequence triples — the rebuild input for the
     /// cross-validation sample and for [`crate::native`]'s per-block path.
     /// Idle queue only, outside the timed loop; `timeout_s` bounds the
-    /// completion wait.
+    /// completion wait, spent in `poll` on the uacce fd when the queue was
+    /// opened for it (the sweep measured equal throughput at a quarter of
+    /// spin's CPU) and spinning otherwise.
     fn request(&mut self, input: &[u8], batch: usize, timeout_s: f64) -> Result<Lz77Sample, String> {
         if self.outstanding != 0 {
             return Err("queue_busy".into());
@@ -626,24 +628,57 @@ impl Queue {
         slot_buf[..input.len()].copy_from_slice(input);
         let idx = self.sq_tail;
         self.submit_len(batch.max(1), 1, input.len());
+        if let Err(e) = self.wait_idle(timeout_s) {
+            return Err(e);
+        }
+        self.read_result(idx as usize, input.len())
+    }
+
+    /// Harvest until nothing is outstanding: `poll` on the uacce fd when
+    /// the queue waits that way (the CQ doorbell's IRQ-arm flag, rung by
+    /// every reaping harvest, wakes it), spinning otherwise. `timeout_s`
+    /// bounds the whole wait.
+    fn wait_idle(&mut self, timeout_s: f64) -> Result<(), String> {
         let t0 = now_s();
         while self.outstanding > 0 {
-            self.harvest();
+            let reaped = self.harvest();
+            if reaped == 0 && self.c_flag != 0 {
+                self.poll_once(100);
+            }
             if now_s() - t0 > timeout_s {
                 return Err("request_did_not_complete_in_time".into());
             }
         }
-        let sqe = unsafe { &*(self.sq.add(idx as usize * QM_ZIP_SQE_SIZE) as *const Sqe) };
+        Ok(())
+    }
+
+    /// Sleep on the queue's fd for a completion IRQ (no-op timeout expiry
+    /// is fine; the caller re-harvests either way).
+    fn poll_once(&self, timeout_ms: c_int) {
+        let mut fd = PollFd {
+            fd: self.file.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        unsafe { poll(&mut fd, 1, timeout_ms) };
+    }
+
+    /// Read one completed request's sample off its SQE and output slot.
+    /// `ring` is the SQE ring index the request was submitted at, `in_len`
+    /// the input length it was programmed with.
+    fn read_result(&self, ring: usize, in_len: usize) -> Result<Lz77Sample, String> {
+        let sqe = unsafe { &*(self.sq.add(ring * QM_ZIP_SQE_SIZE) as *const Sqe) };
         let status = u32::from_le(sqe.dw3) & HZ_STATUS_MASK;
         if status != 0 {
             return Err(format!("hw_status_0x{status:x}"));
         }
         let lit = u32::from_le(sqe.comp_data_length) as usize;
         let ntriples = u32::from_le(sqe.produced) as usize;
-        let lit_cap = lz77_lit_area(input.len());
+        let lit_cap = lz77_lit_area(in_len);
         if lit > lit_cap || ntriples * 8 + 32 > self.ocap - lit_cap {
             return Err(format!("lz77_output_insanity_lit={lit}_seqs={ntriples}"));
         }
+        let slot = ring % self.src.len();
         let (optr, _) = self.out[slot];
         let seq_area = unsafe { optr.add(lit_cap) };
         let ck = u32::from_le(sqe.checksum);
@@ -898,6 +933,78 @@ impl NativePump {
     /// request to its software fallback instead of hanging.
     pub fn request_triples(&mut self, input: &[u8], timeout_s: f64) -> Result<Lz77Sample, String> {
         self.queues[0].request(input, self.batch, timeout_s)
+    }
+
+    /// Run `chunks` (each within the request size) through queue 0 as a
+    /// ring of in-flight requests — waves of the queue depth, every wave
+    /// waited out (poll when the queue was opened for it) before its
+    /// results are read — and return one result per chunk, in chunk order.
+    /// The queue must be idle at entry (`&mut self` callers guarantee it).
+    /// A chunk that cannot complete within `timeout_s` fails itself and
+    /// every later chunk; completed chunks keep their samples, so the
+    /// caller can soft-fallback exactly the failed requests' blocks.
+    pub fn request_batch(
+        &mut self,
+        chunks: &[&[u8]],
+        timeout_s: f64,
+    ) -> Vec<Result<Lz77Sample, String>> {
+        if chunks.is_empty() {
+            return Vec::new();
+        }
+        let q = &mut self.queues[0];
+        if q.outstanding != 0 {
+            return (0..chunks.len())
+                .map(|_| Err("queue_busy".into()))
+                .collect();
+        }
+        let depth = q.src.len();
+        let mut out: Vec<Result<Lz77Sample, String>> = Vec::with_capacity(chunks.len());
+        let mut k = 0usize;
+        while k < chunks.len() {
+            let n = (chunks.len() - k).min(depth);
+            let start = q.sq_tail as usize;
+            let wave = &chunks[k..k + n];
+            if wave.iter().any(|c| c.len() > q.req_size) {
+                // caller bug: fail this wave and everything after it
+                while out.len() < chunks.len() {
+                    out.push(Err("chunk_over_request_size".into()));
+                }
+                return out;
+            }
+            for (j, chunk) in wave.iter().enumerate() {
+                let slot = (start + j) % depth;
+                let (sptr, _) = q.src[slot];
+                let slot_buf = unsafe { std::slice::from_raw_parts_mut(sptr, q.req_size) };
+                slot_buf[..chunk.len()].copy_from_slice(chunk);
+                q.submit_len(self.batch.max(1), 1, chunk.len());
+            }
+            // wait the wave out; on timeout fail this wave and the rest
+            let t0 = now_s();
+            let mut timed_out = false;
+            while q.outstanding > 0 {
+                let reaped = q.harvest();
+                if reaped == 0 && q.c_flag != 0 {
+                    q.poll_once(100);
+                }
+                if now_s() - t0 > timeout_s {
+                    timed_out = true;
+                    break;
+                }
+            }
+            if timed_out {
+                while out.len() < chunks.len() {
+                    out.push(Err("request_did_not_complete_in_time".into()));
+                }
+                return out;
+            }
+            for (j, chunk) in wave.iter().enumerate() {
+                // the SQE ring wraps at QM_Q_DEPTH, the slot ring at depth
+                let ring = (start + j) % QM_Q_DEPTH;
+                out.push(q.read_result(ring, chunk.len()));
+            }
+            k += n;
+        }
+        out
     }
 
     fn poll_once(&self, timeout_ms: c_int) {
