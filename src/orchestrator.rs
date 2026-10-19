@@ -91,11 +91,14 @@ usage: kae-bench [options]
   --input FILE      benchmark against a real file (e.g. an exported VM memory image) instead of the synthetic mixed dataset
   --size MIB        synthetic dataset size, MiB (default 64)
   --blocks LIST     comma-separated block sizes (default {DEFAULT_BLOCKS})
-  --impl LIST       implementations: sw,hw,hwasync,native (default: all present;
-                    hwasync = segment-level async batch, compress only; native =
-                    the crate's own uacce engine path (compress: the raw lz77
-                    pump; decompress: in-crate software decode of the rebuilt
-                    blocks), no C library in the process)
+  --impl LIST       implementations: sw,hw,hwasync,native,soft,nativesw (default: all
+                    present; hwasync = segment-level async batch, compress only;
+                    native = the crate's own uacce engine path (compress: the raw
+                    lz77 pump; decompress: lz4rip decode of the rebuilt blocks), no
+                    C library in the process; soft = the pure-Rust lz4rip engine,
+                    any machine; nativesw = the production per-block engine path
+                    with per-request software fallback — runs everywhere, degrading
+                    to soft without a ZIP device)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
                     --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's
                     library thread pool (KAE_LZ4_ASYNC_THREAD_NUM)
@@ -128,10 +131,15 @@ fn parse_impl_list(s: &str) -> Result<Vec<String>, String> {
     let impls = parse_list(s);
     for imp in &impls {
         match imp.as_str() {
-            worker::IMPL_SW | worker::IMPL_HW | worker::IMPL_HWASYNC | worker::IMPL_NATIVE => {}
+            worker::IMPL_SW
+            | worker::IMPL_HW
+            | worker::IMPL_HWASYNC
+            | worker::IMPL_NATIVE
+            | worker::IMPL_SOFT
+            | worker::IMPL_NATIVESW => {}
             other => {
                 return Err(format!(
-                    "unknown --impl {other} (expected sw|hw|hwasync|native)"
+                    "unknown --impl {other} (expected sw|hw|hwasync|native|soft|nativesw)"
                 ))
             }
         }
@@ -173,6 +181,8 @@ fn parse_config(args: &[String]) -> Result<Config, String> {
             worker::IMPL_HW.into(),
             worker::IMPL_HWASYNC.into(),
             worker::IMPL_NATIVE.into(),
+            worker::IMPL_SOFT.into(),
+            worker::IMPL_NATIVESW.into(),
         ],
         ops: OPS.iter().map(|s| s.to_string()).collect(),
         workers: 1,
@@ -342,8 +352,11 @@ struct Cell<'a> {
 }
 
 fn run_row(exe: &Path, cfg: &Config, cell: &Cell<'_>) -> Row {
-    // the native cells carry no library (their engine path is in-crate)
-    let (lib, preload) = if cell.impl_name == worker::IMPL_NATIVE {
+    // the native and soft cells carry no library (their engine is in-crate)
+    let (lib, preload) = if matches!(
+        cell.impl_name,
+        worker::IMPL_NATIVE | worker::IMPL_SOFT | worker::IMPL_NATIVESW
+    ) {
         (String::new(), String::new())
     } else if cell.impl_name == worker::IMPL_SW {
         (cfg.sw_lib.clone(), String::new())

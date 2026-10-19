@@ -2,17 +2,21 @@
 name = "kae"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
-description = "Rust bindings for Kunpeng KAE2 hardware LZ4 (synchronous drop-in, runtime dlopen of the patched liblz4, zero build-time dependencies); bundles the kae-bench benchmark tool"
+rust-version = "1.85"
+description = "Kunpeng KAE2 hardware LZ4 (runtime dlopen of the patched liblz4, in-crate uacce engine path, lz4rip software engine); bundles the kae-bench benchmark tool"
 license = "Apache-2.0"
 readme = "README.md"
 keywords = ["lz4", "compression", "hardware-acceleration", "ffi"]
 categories = ["compression", "api-bindings", "hardware-support"]
 
 # AgentENV zfile integration: this crate has no build-time dependency on any
-# KAE headers or libraries, so it can be introduced as an optional feature;
-# at runtime KaeLz4::open() probes for hardware and falls back to the system
-# liblz4 when absent.
+# KAE headers or C libraries, so it can be introduced as an optional feature;
+# at runtime KaeLz4::open() probes for hardware and falls back to software.
+# lz4rip is the one dependency: pure Rust, no C — the software engine behind
+# KaeNative's fallback and the soft bench cells.
+
+[dependencies]
+lz4rip = "0.11"
 
 # The library's unit tests run under cargo test; excluding the lib (and the
 # bin, which has no tests) from cargo bench makes `cargo bench -- <args>`

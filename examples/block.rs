@@ -27,6 +27,8 @@ fn main() -> Result<(), kae::KaeError> {
     match lz4.backend() {
         Backend::Hw => println!("=> patched liblz4 loaded (KAE compress path)"),
         Backend::Sw => println!("=> system liblz4 (software baseline)"),
+        // unreachable from KaeLz4 — these are KaeNative's modes
+        Backend::Native | Backend::Soft => println!("=> {:?}", lz4.backend()),
     }
 
     // The policy alternative: hardware only, no silent fallback — when this
@@ -66,6 +68,25 @@ fn main() -> Result<(), kae::KaeError> {
     assert_eq!(m, block.len());
     assert_eq!(&restored[..m], &block[..]);
     println!("roundtrip OK: {m} bytes restored bit-exact");
+
+    // The zero-C alternative: the crate's own engine path, hardware first
+    // with per-request software fallback; without a ZIP device it opens in
+    // software mode (lz4rip) and says so in its note. Decompression is
+    // software here in every mode (the engine has no LZ4 decode).
+    let mut nat = kae::KaeNative::open()?;
+    println!(
+        "native:       {:?} ({}) hw={} sw={}",
+        nat.backend(),
+        nat.note(),
+        nat.hw_requests(),
+        nat.sw_requests()
+    );
+    let native_compressed = nat.compress_vec(&block)?;
+    let mut restored2 = vec![0u8; block.len()];
+    let m2 = nat.decompress(&native_compressed, &mut restored2)?;
+    assert_eq!(m2, block.len());
+    assert_eq!(&restored2[..m2], &block[..]);
+    println!("native roundtrip OK: {m2} bytes restored bit-exact");
 
     Ok(())
 }

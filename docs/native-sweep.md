@@ -14,6 +14,45 @@ cargo build --release
 
 About ten minutes. The file is the deliverable — send it back as is.
 
+## The verdict, from the 2026-10-19 run
+
+The first full green sweep (`rev 0b3b7ab`, host `debian-auto`, 2×
+`hisi_zip` + 2× `hisi_sec2`, `perf_mode=1`, sustained 2 s windows,
+synthetic mixed data) answered the question. Every row verified OK —
+including the 256K/1M blocks whose sample rebuild used to trip the seam
+fold-credit bug fixed in `ca34e71` — so every number below is backed by
+a decodable LZ4 sample.
+
+- **The engine is faster than the C stack; the plateau was userspace.**
+  One queue sustains **6.40 GB/s** from depth 4 up (lz77 view) — 3.7×
+  the same run's `hw` sync cell (1.74 GB/s at 64K) and 1.6× its
+  `hwasync` batch (4.02 GB/s) — while software compresses at 8.41 GB/s.
+- **The depth ladder saturates at depth 4**: d1 2.92 → d4 6.39 → flat
+  6.40 through d256. Depth 1 is latency-bound; four slots hide the
+  service time.
+- **Queues double once, then flatten at 64K**: 1q 6.40 → 2q 12.79 → 4q
+  12.80 GB/s. At 8K requests — the per-queue sweet spot at 11.6–11.8
+  GB/s — the doubling is clean: **2 queues × 8K = 23.20 GB/s** vs 11.57
+  at one queue.
+- **`poll` wins the wait side**: equal throughput to `spin` (6.39 vs
+  6.40 GB/s) at 0.040 vs 0.160 cpu s/GB, `nvcsw` 64839 vs 0 — the
+  sleep-until-IRQ design works end to end through uacce.
+- **The doorbell tax is not measurable at 64K**: `db_batch=1` matches
+  the full-depth batch at 6.40 GB/s.
+- **Sustained small blocks, one queue**: 4K 9.3–10.4, 8K 11.6–11.8, 16K
+  7.98, 64K 6.40, 128K 6.19 GB/s.
+- **The LZ4-view reading** — engine time plus the measured rebuild cost
+  (`rebuild_s_per_gb` 0.027–0.038; estimate `1/(1/GB/s + rebuild)`,
+  submit-side copies not modeled): a two-queue native pipeline lands at
+  ~9.4 GB/s at 64K blocks and ~13.5 GB/s at 8K, above software's 8.41 /
+  8.94 on the same box, and with `poll` waiting its pump+rebuild CPU
+  (~0.07 s/GB) undercuts software's 0.11–0.17. For compression, the
+  native backend is worth finishing.
+- **The open gap is decode**: the in-crate decoder runs 1.4 GB/s where
+  the C libraries decompress at 5.5–10.7 GB/s on the same box — the
+  native read path needs decoder work before it can replace the
+  library.
+
 ## The file's shape
 
 - Leading `#` comment block: the machine context every number was taken

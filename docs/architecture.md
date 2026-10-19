@@ -70,10 +70,15 @@ Three deliberate design points:
 
 | Module | Role |
 |---|---|
-| `lib.rs` | Public handle `KaeLz4` (open/probe/compress/decompress), `Backend`, `KaeError`, `hw_available()`, `hw_lib_path()`, probe-path and preload-path constants, the shared `open_lib()` preload-retry helper |
+| `lib.rs` | Public handles `KaeLz4` and `KaeNative`, `Backend`, `KaeError`, `hw_available()`, `native_available()`, `hw_lib_path()`, probe-path and preload-path constants, the shared `open_lib()` preload-retry helper |
 | `loader.rs` | `dlopen` wrapper (`Lib`): open with `RTLD_NOW`/`RTLD_GLOBAL`, symbol lookup, dependency preloading |
 | `lz4.rs` | `Lz4Fns`: the three standard block-ABI function pointers plus `PROBE_SYMBOLS` (standard ABI + KAE async surface) used by `kae-bench --probe` |
 | `batch.rs` | `AsyncBatch`: segment-level async compression over `LZ4_compress_async` (see below) |
+| `uacce.rs` | The native ZIP-engine driver behind `--impl native`: uacce queue ABI (open/ioctl/mmap), SQE fill, doorbell stores, CQE harvest, the depth / doorbell-batch / wait-policy knobs, and the synchronous one-request primitive (`request_triples`) the production path builds on |
+| `rebuild.rs` | LZ77-triple → standard-LZ4-block rebuild (the native path's LZ4 view) plus the per-request triple audit behind failed-sample dumps |
+| `soft.rs` | The pure-Rust lz4rip engine wrapper (`bound`/`compress`/`decompress`): the `soft` bench cells and every decode in the zero-C stack |
+| `native.rs` | `KaeNative`: the production per-block handle — engine first (synchronous load/submit/wait/rebuild per request), lz4rip fallback when no device is present, the queue stalls past `KAE_NATIVE_TIMEOUT_MS`, or a request completes with a hardware error; never a mixed block |
+| `lz4dec.rs` | Independent pure-Rust LZ4 block decoder — no longer a timed path: the rebuild self-check oracle whose per-rule errors localize a rebuild bug, and the `lz4dec`-vs-lz4rip cross-check in the unit tests |
 | `sysres.rs` | `getrusage`/`clock_gettime` FFI and the adaptive `timed_loop` the bench is built on |
 | `data.rs` | Deterministic synthetic dataset (mixed: 50% zero / 20% random / 30% text, 4K-page interleaved, fixed-seed xorshift64*) |
 | `worker.rs` | `--_worker` subprocess mode: opens exactly one liblz4, runs one cell, prints `RESULT`/`VERIFY`/`PROBE` line-protocol records; captures cross-validation samples |
@@ -82,10 +87,10 @@ Three deliberate design points:
 The `benches/throughput.rs` entry point calls `orchestrator::main()` directly,
 so `cargo bench -- <args>` and the `kae-bench` binary are the same tool.
 Visibility follows the usage: only `lib.rs`'s root items (`KaeLz4`,
-`AsyncBatch`, `Backend`, `KaeError`, `hw_available()`, `hw_lib_path()`, the
-path constants) are public library API; every module above except
-`orchestrator` (published for the bin/bench targets to call `main()`) is
-`pub(crate)`.
+`KaeNative`, `AsyncBatch`, `Backend`, `KaeError`, `hw_available()`,
+`native_available()`, `hw_lib_path()`, the path constants) are public
+library API; every module above except `orchestrator` (published for the
+bin/bench targets to call `main()`) is `pub(crate)`.
 
 ## The synchronous handle (`KaeLz4`)
 

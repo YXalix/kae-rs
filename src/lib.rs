@@ -18,6 +18,8 @@
 //! match lz4.backend() {
 //!     Backend::Hw => { /* zfile worker takes the hardware compress path */ }
 //!     Backend::Sw => { /* keep the existing lz4-sys software path */ }
+//!     // KaeLz4 never opens these — they are KaeNative's modes
+//!     Backend::Native | Backend::Soft => { /* KaeNative::open() handles them */ }
 //! }
 //! let block = vec![0u8; 4096]; // 4K per block, zfile granularity
 //! let compressed = lz4.compress_vec(&block).expect("compress_vec");
@@ -48,12 +50,15 @@ mod loader;
 mod lz4;
 mod lz4dec;
 pub mod orchestrator;
+mod native;
 mod rebuild;
+mod soft;
 mod sysres;
 mod uacce;
 mod worker;
 
 pub use batch::AsyncBatch;
+pub use native::KaeNative;
 use lz4::Lz4Fns;
 use std::path::Path;
 
@@ -91,6 +96,13 @@ pub enum Backend {
     Hw,
     /// System liblz4: pure software.
     Sw,
+    /// The crate's own ZIP-engine driver: compression on hardware with
+    /// per-request software fallback; no C library in the process
+    /// ([`KaeNative`]).
+    Native,
+    /// The pure-Rust lz4rip engine ([`KaeNative`] with no device, or its
+    /// per-request fallback target).
+    Soft,
 }
 
 /// Every error variant of this crate. String payloads carry the underlying
@@ -133,6 +145,14 @@ impl std::error::Error for KaeError {}
 /// imply that [`KaeLz4::open`] fails (the software fallback remains).
 pub fn hw_available() -> bool {
     hw_lib_path().is_some() && uacce_devices().iter().any(|n| n.starts_with("hisi_zip"))
+}
+
+/// Whether this machine has a ZIP-engine device node the native path
+/// ([`KaeNative`]) could drive — no patched library involved. A false
+/// result does not make [`KaeNative::open`] fail: it opens in software
+/// mode instead.
+pub fn native_available() -> bool {
+    uacce_devices().iter().any(|n| n.starts_with("hisi_zip"))
 }
 
 /// The uacce device names present on this machine (e.g. `hisi_sec2-0`,

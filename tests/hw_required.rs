@@ -4,7 +4,7 @@
 //! machines; on the target machine run: `cargo test -- --ignored` (or
 //! `--include-ignored` for both suites).
 
-use kae::{AsyncBatch, Backend, KaeLz4};
+use kae::{AsyncBatch, Backend, KaeLz4, KaeNative};
 
 fn require_hw() {
     assert!(
@@ -118,6 +118,77 @@ fn hw_output_roundtrips_through_stock_liblz4() {
             let n = hw
                 .decompress(&packed, &mut restored)
                 .expect("patched decompress of stock output");
+            assert_eq!(n, size, "{name}/{size}: decompressed length");
+            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
+fn nativesw_hw_roundtrip_and_software_fallback_accounting() {
+    require_hw();
+    let mut nat = KaeNative::open_with(4096).expect("native open on a KAE machine");
+    assert_eq!(nat.backend(), Backend::Native, "device present: native mode");
+    assert!(nat.note().contains("mode=native"), "note: {}", nat.note());
+
+    for size in [4096, 8192, 65536, 131072, 200_000] {
+        for (name, block) in [
+            ("zeros", vec![0u8; size]),
+            ("random", make_random(size, 0xDEAD_BEEF ^ size as u64)),
+            ("mixed", make_mixed(size)),
+        ] {
+            let compressed = nat.compress_vec(&block).expect("compress_vec");
+            assert!(
+                compressed.len() <= nat.bound(size),
+                "{name}/{size}: compressed size exceeds bound"
+            );
+            let mut restored = vec![0u8; size];
+            let n = nat.decompress(&compressed, &mut restored).expect("decompress");
+            assert_eq!(n, size, "{name}/{size}: decompressed length");
+            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+        }
+    }
+
+    // every block went through the engine (hw count), and none fell back —
+    // all sizes here sit above the 16B software floor
+    assert!(nat.hw_requests() >= 15, "hw={}", nat.hw_requests());
+    assert_eq!(nat.sw_requests(), 0, "no fallback expected: {nat:?}");
+    assert!(nat.last_hw_error().is_none());
+
+    // a block below the 16B floor goes to software by design
+    let tiny = vec![7u8; 10];
+    let packed = nat.compress_vec(&tiny).expect("tiny compress");
+    let mut restored = vec![0u8; 10];
+    let n = nat.decompress(&packed, &mut restored).expect("tiny decompress");
+    assert_eq!(&restored[..n], &tiny[..]);
+    assert_eq!(nat.sw_requests(), 1);
+}
+
+/// The production read path: native-compressed blocks decode on the stock
+/// library (the on-disk format is unchanged) and lz4rip decodes both
+/// engines' output — the decompress side of KaeNative is software in every
+/// mode.
+#[test]
+#[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
+fn nativesw_output_roundtrips_through_stock_liblz4() {
+    require_hw();
+    // Stock handle first: once liblz4.so.1 (the patched library's SONAME)
+    // is loaded, a soname dlopen resolves to it.
+    let sw = KaeLz4::open_sw().expect("stock system liblz4");
+    let mut nat = KaeNative::open_with(4096).expect("native open");
+    assert_eq!(nat.backend(), Backend::Native);
+
+    for size in [4096, 65536] {
+        for (name, block) in [
+            ("mixed", make_mixed(size)),
+            ("random", make_random(size, 0xABCD ^ size as u64)),
+        ] {
+            let packed = nat.compress_vec(&block).expect("native compress");
+            let mut restored = vec![0u8; size];
+            let n = sw
+                .decompress(&packed, &mut restored)
+                .expect("stock decompress of native output");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
             assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
         }

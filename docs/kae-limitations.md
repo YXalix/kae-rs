@@ -28,7 +28,7 @@ uacce devices):
 | compress ratio        | 0.4%       | 1.6%      | 1.6%      |
 | decompress throughput | 6.01 GB/s  | 16.01 GB/s| unsupported|
 
-By the documented bench criteria (`src/orchestrator.rs:26` — speedup
+By the documented bench criteria (`src/orchestrator.rs:30` — speedup
 > 1.1x is an outright win, cpu <= 50% of software counts as offload
 value, large-block fallback needs >= 1.5x), every measured data profile
 (all-zero, mixed, incompressible) prints **NO-GO** for the synchronous
@@ -62,12 +62,12 @@ path.
 - **Async decompression does not exist.** `hwasync` decompress rows
   report `UNSUPPORTED async_compress_only`: decompression inside the
   patched library is software regardless of implementation, so there is
-  nothing to batch (`src/worker.rs:180`).
+  nothing to batch (`src/worker.rs:224`).
 
 ## The CPU accounting is not a measurement bug
 
 CPU time is `getrusage(RUSAGE_SELF)` user+sys, taken as a delta around
-the adaptive timing loop (`src/sysres.rs:66`, `src/sysres.rs:99`) — the
+the adaptive timing loop (`src/sysres.rs:67`, `src/sysres.rs:110`) — the
 standard method, covering every thread in the worker process. The
 counterintuitive part (hardware "offload" showing *higher* CPU per GB
 than software) has a mechanical explanation:
@@ -207,7 +207,9 @@ sharpens the criticism:
 - **Wait side**: sleep on the uacce fd instead of spinning —
   `wd_recv_sync` (v1) or `wd_ctx_wait` + `WD_COMP_EPOLL_EN=1` (v2). The
   kernel IRQ machinery is already there. Sensible once requests are
-  large enough that an occasional 10 µs wake is noise.
+  large enough that an occasional 10 µs wake is noise. (Demonstrated
+  end to end by the native driver's `poll` mode: equal throughput at
+  0.040 vs 0.160 cpu s/GB through uacce.)
 - **Pool side**: bound the number of spinning harvesters
   (`KAE_LZ4_ASYNC_THREAD_NUM`), or make pool threads sleep when the
   hardware queue is drained mid-batch rather than spinning to the next
@@ -218,10 +220,49 @@ sharpens the criticism:
 - **Capacity side**: spread queues across both SEC2 devices; the ~4 GB/s
   async plateau is a submit-path limit, not an engine limit.
 - **Accounting side**: quantify the spin with `ru_nvcsw`/`ru_nivcsw` —
-  already declared in `src/sysres.rs`'s `Rusage` struct, currently
-  unused. A spinning loop shows near-zero context switches; a sleeping
-  design shows high voluntary switches. This is the one-number check
-  that a wait-side change actually worked.
+  `switch_counts()` (`src/sysres.rs:81`); the native rows already print
+  `nvcsw`/`nivcsw` in their notes, and the spin-vs-poll check reads as
+  expected: 0 voluntary switches spinning, 64839 sleeping, at equal
+  throughput. This is the one-number check that a wait-side change
+  actually worked.
+
+## The engine is not the ceiling
+
+The native uacce path (`--impl native`) removes the C stack and drives
+the ZIP engine directly. Its `perf_mode=1` sweep (2026-10-19, `rev
+0b3b7ab`, same box, mixed data, 64K blocks unless noted) re-opens the
+case the tables above close:
+
+| path | GB/s | cpu s/GB |
+|---|---|---|
+| sw (system liblz4, one thread) | 8.41 | 0.12 |
+| hw sync (patched liblz4) | 1.74 | 0.58 |
+| hw async batch (12-thread library pool) | 4.02 | 3.08 |
+| native, 1 queue (lz77 view) | 6.40 | 0.16 spin / 0.04 poll |
+| native, 2 queues | 12.79 | one pump thread |
+| native, 2 queues, 8K requests | 23.20 | 0.04 |
+
+One queue at depth ≥4 sustains 6.40 GB/s — 3.7× the sync path and 1.6×
+the async batch of the shipped stack on the same box — so the ~4 GB/s
+plateau is the userspace stack, not the engine. Sleeping on the uacce fd
+is measured, not proposed: equal throughput at a quarter of the pump
+CPU. Adding the measured rebuild cost (`rebuild_s_per_gb` 0.027–0.038,
+the triple→LZ4 conversion an end-to-end native pipeline performs) to the
+engine time estimates ~9.4 GB/s at 2 queues × 64K and ~13.5 GB/s at
+2 queues × 8K — above software on the same box — with pump+rebuild CPU
+(~0.07 s/GB under `poll`) below software's 0.11–0.17.
+
+So the NO-GO verdict for the *shipped* path stands, but the conclusion
+it feeds has changed: the engine justifies a native backend; the silicon
+was never the problem. The decode side, the other native gap, is closed
+by adoption rather than invention: the crate's own decoder managed
+1.4 GB/s where the C libraries decompress at 5.5–10.7 GB/s, and the
+pure-Rust lz4rip engine decodes the same corpus faster than the C
+libraries on an aarch64 dev box (blocks produced by `LZ4_compress_default`
+verified block-by-block). The native decompress cell and every
+`KaeNative` read path now decode through lz4rip (`src/soft.rs`); the
+authoritative on-target numbers are one `--impl native,nativesw,sw`
+run away. Full readings: [native-sweep.md](native-sweep.md).
 
 ## Reproducing
 

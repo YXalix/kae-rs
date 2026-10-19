@@ -17,6 +17,7 @@ machine).
 | `KaeLz4::open_sw()` | System liblz4, software baseline. |
 | `KaeLz4::open_path(lib, preload, backend)` | Open an explicit library; `backend` is a label only. |
 | `AsyncBatch::open()` / `open_path()` | Hardware async batch only — the system liblz4 has no async symbols, so a stock library fails with `KaeError::Symbol` rather than degrading. |
+| `KaeNative::open()` / `open_with(req)` | The crate's own engine path: hardware first, lz4rip software fallback — no C library, and the fallback is automatic (mode visible via `backend()`/`note()`). Decompression is lz4rip in every mode. |
 
 Related probes:
 
@@ -67,6 +68,48 @@ Notes:
   handle.
 - A `KaeLz4` is opened once and shared freely: the block API has no interior
   mutable state and the C functions are reentrant.
+
+## The zero-C handle with software fallback (`KaeNative`)
+
+The crate's own engine path wraps the uacce ZIP driver in the same
+block-level API shape — hardware first, pure-Rust software fallback, no C
+library in either mode:
+
+```rust
+use kae::{native_available, Backend, KaeNative};
+
+let mut nat = KaeNative::open()?;          // request size = 4096 (zfile granularity)
+match nat.backend() {
+    Backend::Native => { /* engine path; note() carries the knobs */ }
+    Backend::Soft => { /* no /dev/hisi_zip-* or queue open failed: lz4rip throughout */ }
+    _ => unreachable!(),
+}
+let packed = nat.compress_vec(&block)?;    // standard LZ4 block out
+let n = nat.decompress(&packed, &mut restored)?;  // software in every mode
+```
+
+Semantics:
+
+- **Open-time fallback**: without a device (or when the queue cannot be
+  opened) `open` succeeds in software mode; `backend()`/`note()` say which
+  mode came up and why. `kae::native_available()` reports device presence
+  without opening anything.
+- **Per-request fallback on hardware**: each block compresses through the
+  engine synchronously (one request per ≤128K slice, rebuilt into one LZ4
+  block). A request that stalls past `KAE_NATIVE_TIMEOUT_MS` (default
+  500) or completes with a hardware error fails the whole block over to
+  the lz4rip engine — a block always comes from one engine, never a
+  splice. `hw_requests()`/`sw_requests()` count the split and
+  `last_hw_error()` names the most recent fallback cause.
+- **Inputs below 16 bytes** (and remainders that would leave such a tail
+  request) go to software whole: the engine's lz77 parse programs
+  `in_len - 12`.
+- **Decompression is software in every mode** — the engine has no LZ4
+  decode direction (the driver rejects it), so the read path is lz4rip
+  regardless of the backend.
+- `Send`, not `Sync`, like `AsyncBatch`: move one handle to the worker
+  thread that owns it; one block in flight per handle, scale by handing
+  each worker thread its own (each opens its own queue).
 
 ## Segment-level async batch (`AsyncBatch`)
 
@@ -136,6 +179,8 @@ All failures surface as `kae::KaeError` (implements `std::error::Error` +
 | `KAE_LZ4_LEVEL` | async engine init | Compression level |
 | `KAE_LZ4_ASYNC_THREAD_NUM` | async engine init | Library thread pool size |
 | `KAE_LZ4_ASYNC_DC_THREAD_NUM` | libkaelz4 | Additional libkaelz4 tuning (not set by `configure`) |
+| `KAE_NATIVE_TIMEOUT_MS` | `KaeNative::open` | Per-request engine completion wait before the block falls back to software (default 500) |
+| `KAE_NATIVE_DEPTH` / `KAE_NATIVE_DB_BATCH` / `KAE_NATIVE_WAIT` / `KAE_NATIVE_ALG` | the bench worker | Native bench pump knobs (see [native-bench.md](native-bench.md)) |
 
 ## Integration shape (AgentENV zfile WorkerPool)
 
@@ -145,6 +190,11 @@ With `kae` as an optional dependency, the natural insertion points are:
   once; per 4K block call `compress(&src, &mut dst)` (reuse the `dst`
   buffer, sized via `bound`). Check `backend()` once to decide whether the
   hardware path is actually in effect.
+- **Per block (zero-C):** the same loop shape over `KaeNative::open()` —
+  one handle per worker thread (`Send`), `compress`/`decompress` per 4K
+  block. The hardware/software split needs no policy code: `backend()`
+  reports the mode, `hw_requests()`/`sw_requests()` report what actually
+  happened, and read-side blocks decode with lz4rip in every mode.
 - **Per segment (async):** in each worker thread, open one `AsyncBatch`,
   then per segment call `compress_segment(&segment, 4096, &mut packed)` and
   split `packed` by the returned lengths. Errors are explicit — the

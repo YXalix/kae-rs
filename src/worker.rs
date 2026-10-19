@@ -14,6 +14,7 @@
 use crate::lz4::PROBE_SYMBOLS;
 use crate::lz4dec;
 use crate::rebuild;
+use crate::soft;
 use crate::sysres::{now_s, timed_loop, timed_pool_loop, LoopStats};
 use crate::uacce;
 use crate::{AsyncBatch, Backend, KaeLz4};
@@ -25,6 +26,8 @@ pub(crate) const IMPL_SW: &str = "sw";
 pub(crate) const IMPL_HW: &str = "hw";
 pub(crate) const IMPL_HWASYNC: &str = "hwasync";
 pub(crate) const IMPL_NATIVE: &str = "native";
+pub(crate) const IMPL_SOFT: &str = "soft";
+pub(crate) const IMPL_NATIVESW: &str = "nativesw";
 
 /// Upper bound on --workers, matching the AgentENV zfile WorkerPool cap
 /// (keeps a typo from spawning thousands of threads).
@@ -131,7 +134,7 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
         }
         i += 1;
     }
-    if a.lib.is_empty() && a.impl_name != IMPL_NATIVE {
+    if a.lib.is_empty() && !matches!(a.impl_name.as_str(), IMPL_NATIVE | IMPL_SOFT | IMPL_NATIVESW) {
         return Err("worker: --lib required".into());
     }
     if a.workers > POOL_WORKERS_MAX {
@@ -143,11 +146,11 @@ fn parse_args(args: &[String]) -> Result<WorkerArgs, String> {
     // probe mode never passes --impl
     if !a.probe {
         match a.impl_name.as_str() {
-            IMPL_SW | IMPL_HW | IMPL_HWASYNC | IMPL_NATIVE => {}
+            IMPL_SW | IMPL_HW | IMPL_HWASYNC | IMPL_NATIVE | IMPL_SOFT | IMPL_NATIVESW => {}
             "" => return Err("worker: --impl required".into()),
             other => {
                 return Err(format!(
-                    "worker: unknown --impl {other} (expected sw|hw|hwasync|native)"
+                    "worker: unknown --impl {other} (expected sw|hw|hwasync|native|soft|nativesw)"
                 ))
             }
         }
@@ -231,7 +234,7 @@ pub fn run(args: &[String]) -> i32 {
 
     // native uacce engine path (no C library in the process): compress
     // drives the raw lz77 pump, decompress decodes the rebuilt LZ4 blocks
-    // with the in-crate decoder (decompression is software in every impl)
+    // with the lz4rip engine (decompression is software in every impl)
     if a.impl_name == IMPL_NATIVE {
         match a.op.as_str() {
             "compress" => return bench_native(&a, &data, block, nblocks),
@@ -244,6 +247,41 @@ pub fn run(args: &[String]) -> i32 {
                 return EXIT_USAGE;
             }
         }
+    }
+
+    // the pure-Rust lz4rip engine: no C library, no hardware — the software
+    // baseline every machine can run
+    if a.impl_name == IMPL_SOFT {
+        return match a.op.as_str() {
+            "compress" if a.workers > 1 => bench_soft_compress(&a, &data, block, nblocks),
+            "decompress" if a.workers > 1 => bench_soft_decompress(&a, &data, block, nblocks),
+            "compress" => bench_soft_compress(&a, &data, block, nblocks),
+            "decompress" => bench_soft_decompress(&a, &data, block, nblocks),
+            other => {
+                println!(
+                    "RESULT status=UNSUPPORTED impl=soft op={} note=soft_compress_decompress_only",
+                    other
+                );
+                EXIT_USAGE
+            }
+        };
+    }
+
+    // the production per-block engine path with software fallback: the
+    // same KaeNative API the zfile worker loop would drive — on this
+    // machine without a ZIP device it runs the soft engine and says so
+    if a.impl_name == IMPL_NATIVESW {
+        return match a.op.as_str() {
+            "compress" => bench_nativesw_compress(&a, &data, block, nblocks),
+            "decompress" => bench_nativesw_decompress(&a, &data, block, nblocks),
+            other => {
+                println!(
+                    "RESULT status=UNSUPPORTED impl=nativesw op={} note=nativesw_compress_decompress_only",
+                    other
+                );
+                EXIT_USAGE
+            }
+        };
     }
 
     // --workers >1 turns sw/hw into the threaded block pool form (the
@@ -273,10 +311,10 @@ pub fn run(args: &[String]) -> i32 {
             bench_pool_compress(&a, &kae, &data, block, bound, nblocks, &note)
         }
         "decompress" if a.workers > 1 => {
-            bench_pool_decompress(&a, &kae, &data, block, bound, nblocks, &note)
+            bench_pool_decompress(&a, &kae, &data, block, nblocks, &note)
         }
         "compress" => bench_compress(&a, &kae, &data, block, bound, nblocks, &note),
-        "decompress" => bench_decompress(&a, &kae, &data, block, bound, nblocks, &note),
+        "decompress" => bench_decompress(&a, &kae, &data, block, nblocks, &note),
         "verify" => verify_sample(&a, &kae, &data, block),
         other => {
             eprintln!("worker: unknown --op {other}");
@@ -804,17 +842,18 @@ fn engine_dead(block: usize, st: &uacce::NativeStats) -> i32 {
 }
 
 /// `native` decompress: decode the standard LZ4 blocks the native pipeline
-/// produces, with the in-crate decoder (`src/lz4dec.rs`) — no C library in
-/// the process, and the same software-decode work every other
+/// produces, with the pure-Rust lz4rip engine (`src/soft.rs`) — no C
+/// library in the process, and the same software-decode work every other
 /// implementation's decompress cell measures (KAE accelerates compression
-/// only; sw/hw decode is liblz4's software instead of this). Setup
+/// only; sw/hw decode is liblz4's software instead). `src/lz4dec.rs` stays
+/// in the tree as the untimed self-check oracle: its per-rule errors and
+/// independent implementation are what localize a rebuild bug. Setup
 /// (untimed): one lz77 request per `req_size` slice rebuilds every block
 /// into standard LZ4 (the compress cell's sample path, over all blocks),
-/// then a warm-up self-check decodes each block and requires the original
-/// bytes back. The timed loop and the accounting match [`bench_decompress`]:
-/// decompressed bytes / wall clock, user+sys per GB. Needs the lz77 dialect
-/// (the deflate output is not LZ4) and blocks that are request-size
-/// multiples.
+/// each block required to decode back to its input before any timing. The
+/// timed loop and the accounting match [`bench_decompress`]: decompressed
+/// bytes / wall clock, user+sys per GB. Needs the lz77 dialect (the deflate
+/// output is not LZ4) and blocks that are request-size multiples.
 fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
     if std::env::var("KAE_NATIVE_ALG").as_deref() == Ok("deflate") {
         println!(
@@ -915,7 +954,7 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
                 return 0;
             }
             let (off, len) = extents[b];
-            match lz4dec::decode_block(&blob[off..off + len], &mut plain) {
+            match soft::decompress(&blob[off..off + len], &mut plain) {
                 Ok(n) if n == block => n,
                 Ok(_) => {
                     decode_err = Some("size_mismatch".into());
@@ -941,7 +980,7 @@ fn bench_native_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
     }
     let in_bytes = (nblocks as u64) * (block as u64) * st.passes; // decompressed bytes
     let note = format!(
-        "native,alg=lz77,depth={},wait={},req_size={},decode=rust,rebuild_reqs={}",
+        "native,alg=lz77,depth={},wait={},req_size={},decode=lz4rip,rebuild_reqs={}",
         depth,
         if wait_poll { "poll" } else { "spin" },
         req_size,
@@ -1037,24 +1076,27 @@ fn write_sample(
     std::fs::write(path, buf)
 }
 
-/// The untimed warm-up pass shared by the sync and pool compress benches:
-/// pre-faults pages, totals the compressed output (the ratio source), and
-/// captures the cross-validation sample file. On failure the RESULT line is
-/// printed here and the worker exit code is returned as Err.
+/// The untimed warm-up pass shared by the sync and pool compress benches
+/// (lib, soft and nativesw alike): pre-faults pages, totals the compressed
+/// output (the ratio source), and captures the cross-validation sample
+/// file. On failure the RESULT line is printed here and the worker exit
+/// code is returned as Err.
 fn warm_up_compress(
     a: &WorkerArgs,
-    kae: &KaeLz4,
     data: &[u8],
     block: usize,
     nblocks: usize,
+    mut compress: impl FnMut(&[u8], &mut [u8]) -> Result<usize, String>,
 ) -> Result<u64, i32> {
-    let mut dst = vec![0u8; kae.bound(block)];
+    // sized by the larger of the two engines' worst-case bounds; valid for
+    // both (a bound is a worst case, more capacity never hurts)
+    let mut dst = vec![0u8; soft::bound(block)];
     let sample_blocks = sample_block_count(block, nblocks);
     let mut sample = Vec::with_capacity(SAMPLE_CAP_BYTES + SAMPLE_SLACK_BYTES);
     push_sample_header(&mut sample, block, sample_blocks);
     let mut out_bytes_warm: u64 = 0;
     for b in 0..nblocks {
-        let n = match kae.compress(&data[b * block..(b + 1) * block], &mut dst) {
+        let n = match compress(&data[b * block..(b + 1) * block], &mut dst) {
             Ok(n) => n,
             Err(e) => {
                 println!(
@@ -1062,7 +1104,7 @@ fn warm_up_compress(
                     a.impl_name,
                     block,
                     b,
-                    flat(&e.to_string())
+                    flat(&e)
                 );
                 return Err(EXIT_COMPRESS_FAIL);
             }
@@ -1090,7 +1132,9 @@ fn bench_compress(
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let out_bytes_warm = match warm_up_compress(a, kae, data, block, nblocks) {
+    let out_bytes_warm = match warm_up_compress(a, data, block, nblocks, |s, d| {
+        kae.compress(s, d).map_err(|e| e.to_string())
+    }) {
         Ok(n) => n,
         Err(code) => return code,
     };
@@ -1150,29 +1194,30 @@ struct DecompressInput {
     out_bytes: u64,
 }
 
-/// The untimed preparation shared by the sync and pool decompress benches:
-/// compress all blocks into a contiguous blob (not counted in decompress
-/// timing) and run the single-threaded warm-up self-check (this library
-/// decompresses what it compressed). On failure the RESULT line is printed
-/// here and the exit code comes back as Err.
+/// The untimed preparation shared by the sync and pool decompress benches
+/// (lib, soft and nativesw alike): compress all blocks into a contiguous
+/// blob (not counted in decompress timing) and run the single-threaded
+/// warm-up self-check (this engine decompresses what it compressed). On
+/// failure the RESULT line is printed here and the exit code comes back as
+/// Err.
 fn prepare_decompress(
     a: &WorkerArgs,
-    kae: &KaeLz4,
     data: &[u8],
     block: usize,
-    bound: usize,
     nblocks: usize,
+    mut compress: impl FnMut(&[u8], &mut [u8]) -> Result<usize, String>,
+    mut decompress: impl FnMut(&[u8], &mut [u8]) -> Result<usize, String>,
 ) -> Result<DecompressInput, i32> {
     // compress all blocks first (not counted in decompress timing)
     let mut blob: Vec<u8> = Vec::with_capacity(data.len() + nblocks * BOUND_SLACK_PER_BLOCK);
     let mut extents: Vec<(usize, usize)> = Vec::with_capacity(nblocks); // (off, len) into the compressed stream
-    let mut tmp = vec![0u8; bound];
+    let mut tmp = vec![0u8; soft::bound(block)];
     let mut out_bytes: u64 = 0;
     for b in 0..nblocks {
-        let n = match kae.compress(&data[b * block..(b + 1) * block], &mut tmp) {
+        let n = match compress(&data[b * block..(b + 1) * block], &mut tmp) {
             Ok(n) => n,
             Err(e) => {
-                println!("RESULT status=COMPRESS_FAIL impl={} op=decompress block={} at={} err={}", a.impl_name, block, b, flat(&e.to_string()));
+                println!("RESULT status=COMPRESS_FAIL impl={} op=decompress block={} at={} err={}", a.impl_name, block, b, flat(&e));
                 return Err(EXIT_COMPRESS_FAIL);
             }
         };
@@ -1181,17 +1226,17 @@ fn prepare_decompress(
         out_bytes += block as u64;
     }
 
-    // warm-up + self-check (this library decompresses what it compressed)
+    // warm-up + self-check (this engine decompresses what it compressed)
     let mut plain = vec![0u8; block];
     for b in 0..nblocks {
         let (off, len) = extents[b];
         let expect = &data[b * block..(b + 1) * block];
-        match kae.decompress(&blob[off..off + len], &mut plain) {
+        match decompress(&blob[off..off + len], &mut plain) {
             Ok(n) if n == block && plain.as_slice() == expect => {}
             other => {
                 let err = other
                     .err()
-                    .map(|e| flat(&e.to_string()))
+                    .map(|e| flat(&e))
                     .unwrap_or_else(|| "size_mismatch".into());
                 println!("RESULT status=DECOMPRESS_MISMATCH impl={} op=decompress block={} at={} err={}", a.impl_name, block, b, err);
                 return Err(EXIT_VERIFY_FAIL);
@@ -1210,16 +1255,20 @@ fn bench_decompress(
     kae: &KaeLz4,
     data: &[u8],
     block: usize,
-    bound: usize,
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let DecompressInput { blob, extents, out_bytes } =
-        match prepare_decompress(a, kae, data, block, bound, nblocks)
-        {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+    let DecompressInput { blob, extents, out_bytes } = match prepare_decompress(
+        a,
+        data,
+        block,
+        nblocks,
+        |s, d| kae.compress(s, d).map_err(|e| e.to_string()),
+        |s, d| kae.decompress(s, d).map_err(|e| e.to_string()),
+    ) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
 
     // timed decompress loop; throughput counts the decompressed bytes;
     // a mid-loop failure fails the cell instead of silently deflating them
@@ -1295,7 +1344,9 @@ fn bench_pool_compress(
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let out_bytes_warm = match warm_up_compress(a, kae, data, block, nblocks) {
+    let out_bytes_warm = match warm_up_compress(a, data, block, nblocks, |s, d| {
+        kae.compress(s, d).map_err(|e| e.to_string())
+    }) {
         Ok(n) => n,
         Err(code) => return code,
     };
@@ -1364,16 +1415,20 @@ fn bench_pool_decompress(
     kae: &KaeLz4,
     data: &[u8],
     block: usize,
-    bound: usize,
     nblocks: usize,
     note: &str,
 ) -> i32 {
-    let DecompressInput { blob, extents, out_bytes } =
-        match prepare_decompress(a, kae, data, block, bound, nblocks)
-        {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+    let DecompressInput { blob, extents, out_bytes } = match prepare_decompress(
+        a,
+        data,
+        block,
+        nblocks,
+        |s, d| kae.compress(s, d).map_err(|e| e.to_string()),
+        |s, d| kae.decompress(s, d).map_err(|e| e.to_string()),
+    ) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
     let workers = a.workers.min(nblocks);
     let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
     let failed = AtomicBool::new(false);
@@ -1431,6 +1486,404 @@ fn bench_pool_decompress(
         note: &pool_note(note, a.workers),
     });
     EXIT_OK
+}
+
+/// `soft` compress: the pure-Rust lz4rip engine — no C library, no
+/// hardware, runnable on any machine. The software baseline the hardware
+/// paths are measured against, and the engine `nativesw` degrades to.
+/// Accounting matches [`bench_compress`]; `--workers >1` pools the timed
+/// loop the same way (each thread into its own dst).
+fn bench_soft_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let out_bytes_warm = match warm_up_compress(a, data, block, nblocks, soft::compress) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+    let bound = soft::bound(block);
+
+    if a.workers > 1 {
+        let workers = a.workers.min(nblocks);
+        let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
+        let failed = AtomicBool::new(false);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let st = timed_pool_loop(
+            workers,
+            nblocks,
+            |_| vec![0u8; bound],
+            |t, b, dst| {
+                if failed.load(Ordering::Relaxed) {
+                    return 0;
+                }
+                match soft::compress(&data[b * block..(b + 1) * block], dst) {
+                    Ok(_) => {
+                        counts[t].fetch_add(1, Ordering::Relaxed);
+                        block
+                    }
+                    Err(e) => {
+                        fail_cell(&first_err, &failed, e);
+                        0
+                    }
+                }
+            },
+            a.min_sec,
+            a.passes_min,
+            a.passes_max,
+        );
+        if let Some(e) = first_err.into_inner().unwrap() {
+            println!(
+                "RESULT status=COMPRESS_FAIL impl=soft op=compress block={} at=timed_pool err={}",
+                block,
+                flat(&e)
+            );
+            return EXIT_COMPRESS_FAIL;
+        }
+        let blocks_done: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        emit_ok(OkResult {
+            impl_name: IMPL_SOFT,
+            op: "compress",
+            block,
+            lib: &a.lib,
+            blocks: nblocks,
+            st: &st,
+            in_bytes: blocks_done * block as u64,
+            out_bytes: out_bytes_warm * blocks_done / nblocks as u64,
+            ratio_pct: out_bytes_warm as f64 / ((nblocks as u64) * (block as u64)) as f64 * 100.0,
+            note: &pool_note("", a.workers),
+        });
+        return EXIT_OK;
+    }
+
+    let mut dst = vec![0u8; bound];
+    let mut compress_err: Option<String> = None;
+    let st = timed_loop(
+        nblocks,
+        |b| {
+            if compress_err.is_some() {
+                return 0;
+            }
+            match soft::compress(&data[b * block..(b + 1) * block], &mut dst) {
+                Ok(n) => n,
+                Err(e) => {
+                    compress_err = Some(e);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = compress_err {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl=soft op=compress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    emit_ok(OkResult {
+        impl_name: IMPL_SOFT,
+        op: "compress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: (nblocks as u64) * (block as u64) * st.passes,
+        out_bytes: out_bytes_warm * st.passes,
+        ratio_pct: out_bytes_warm as f64 / ((nblocks as u64) * (block as u64)) as f64 * 100.0,
+        note: "engine=lz4rip",
+    });
+    EXIT_OK
+}
+
+/// `soft` decompress: the lz4rip engine decoding standard LZ4 blocks. This
+/// is the same decode work the native decompress cell measures through
+/// [`bench_native_decompress`]; here the blocks come from lz4rip's own
+/// compression. Accounting matches [`bench_decompress`]; `--workers >1`
+/// pools the timed loop.
+fn bench_soft_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let DecompressInput { blob, extents, out_bytes } = match prepare_decompress(
+        a,
+        data,
+        block,
+        nblocks,
+        soft::compress,
+        soft::decompress,
+    ) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    if a.workers > 1 {
+        let workers = a.workers.min(nblocks);
+        let counts: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
+        let failed = AtomicBool::new(false);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let st = timed_pool_loop(
+            workers,
+            nblocks,
+            |_| vec![0u8; block],
+            |t, b, plain| {
+                if failed.load(Ordering::Relaxed) {
+                    return 0;
+                }
+                let (off, len) = extents[b];
+                match soft::decompress(&blob[off..off + len], plain) {
+                    Ok(n) if n == block => {
+                        counts[t].fetch_add(1, Ordering::Relaxed);
+                        block
+                    }
+                    other => {
+                        let err = other
+                            .err()
+                            .unwrap_or_else(|| "size_mismatch".into());
+                        fail_cell(&first_err, &failed, err);
+                        0
+                    }
+                }
+            },
+            a.min_sec,
+            a.passes_min,
+            a.passes_max,
+        );
+        if let Some(e) = first_err.into_inner().unwrap() {
+            println!(
+                "RESULT status=DECOMPRESS_MISMATCH impl=soft op=decompress block={} at=timed_pool err={}",
+                block,
+                flat(&e)
+            );
+            return EXIT_VERIFY_FAIL;
+        }
+        let blocks_done: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        emit_ok(OkResult {
+            impl_name: IMPL_SOFT,
+            op: "decompress",
+            block,
+            lib: &a.lib,
+            blocks: nblocks,
+            st: &st,
+            in_bytes: blocks_done * block as u64,
+            out_bytes,
+            ratio_pct: 0.0,
+            note: &pool_note("", a.workers),
+        });
+        return EXIT_OK;
+    }
+
+    let mut plain = vec![0u8; block];
+    let mut decompress_err: Option<String> = None;
+    let st = timed_loop(
+        nblocks,
+        |b| {
+            if decompress_err.is_some() {
+                return 0;
+            }
+            let (off, len) = extents[b];
+            match soft::decompress(&blob[off..off + len], &mut plain) {
+                Ok(n) if n == block => n,
+                Ok(_) => {
+                    decompress_err = Some("size_mismatch".into());
+                    0
+                }
+                Err(e) => {
+                    decompress_err = Some(e);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = decompress_err {
+        println!(
+            "RESULT status=DECOMPRESS_MISMATCH impl=soft op=decompress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_VERIFY_FAIL;
+    }
+    let in_bytes = (nblocks as u64) * (block as u64) * st.passes; // decompressed bytes
+    emit_ok(OkResult {
+        impl_name: IMPL_SOFT,
+        op: "decompress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes,
+        out_bytes,
+        ratio_pct: 0.0,
+        note: "engine=lz4rip",
+    });
+    EXIT_OK
+}
+
+/// `nativesw`: the production per-block engine path (`KaeNative`) —
+/// hardware first, software fallback per request. Without a ZIP device the
+/// cell runs the soft engine end to end and says so in the note
+/// (`mode=soft`) instead of failing; with one, every block goes through the
+/// engine synchronously and the note carries the fallback accounting
+/// (`hw=N,sw=M`). Accounting matches [`bench_compress`]; the timed loop is
+/// single-threaded (the production shape: one handle per worker thread,
+/// scale by threads).
+fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let req_size = block.min(uacce::MAX_LZ77_REQ);
+    let mut nat = match crate::KaeNative::open_with(req_size) {
+        Ok(n) => n,
+        Err(e) => {
+            println!(
+                "RESULT status=OPEN_FAIL impl=nativesw op=compress err={}",
+                flat(&e.to_string())
+            );
+            return EXIT_OPEN_FAIL;
+        }
+    };
+    let out_bytes_warm = match warm_up_compress(a, data, block, nblocks, |s, d| {
+        nat.compress(s, d).map_err(|e| e.to_string())
+    }) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+
+    let mut dst = vec![0u8; nat.bound(block)];
+    let mut compress_err: Option<String> = None;
+    let st = timed_loop(
+        nblocks,
+        |b| {
+            if compress_err.is_some() {
+                return 0;
+            }
+            match nat.compress(&data[b * block..(b + 1) * block], &mut dst) {
+                Ok(n) => n,
+                Err(e) => {
+                    compress_err = Some(e.to_string());
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = compress_err {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVESW,
+        op: "compress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: (nblocks as u64) * (block as u64) * st.passes,
+        out_bytes: out_bytes_warm * st.passes,
+        ratio_pct: out_bytes_warm as f64 / ((nblocks as u64) * (block as u64)) as f64 * 100.0,
+        note: &nativesw_note(&nat, req_size),
+    });
+    EXIT_OK
+}
+
+/// `nativesw` decompress: the read path of the production handle — lz4rip
+/// in every mode (the engine has no LZ4 decode). The blocks are compressed
+/// by the same handle first, so on a hardware machine the cell decodes
+/// engine-rebuilt blocks exactly as a production reader would see them.
+fn bench_nativesw_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let req_size = block.min(uacce::MAX_LZ77_REQ);
+    let mut nat = match crate::KaeNative::open_with(req_size) {
+        Ok(n) => n,
+        Err(e) => {
+            println!(
+                "RESULT status=OPEN_FAIL impl=nativesw op=decompress err={}",
+                flat(&e.to_string())
+            );
+            return EXIT_OPEN_FAIL;
+        }
+    };
+    let DecompressInput { blob, extents, out_bytes } = match prepare_decompress(
+        a,
+        data,
+        block,
+        nblocks,
+        |s, d| nat.compress(s, d).map_err(|e| e.to_string()),
+        soft::decompress,
+    ) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+
+    let mut plain = vec![0u8; block];
+    let mut decompress_err: Option<String> = None;
+    let st = timed_loop(
+        nblocks,
+        |b| {
+            if decompress_err.is_some() {
+                return 0;
+            }
+            let (off, len) = extents[b];
+            match nat.decompress(&blob[off..off + len], &mut plain) {
+                Ok(n) if n == block => n,
+                Ok(_) => {
+                    decompress_err = Some("size_mismatch".into());
+                    0
+                }
+                Err(e) => {
+                    decompress_err = Some(e.to_string());
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = decompress_err {
+        println!(
+            "RESULT status=DECOMPRESS_MISMATCH impl=nativesw op=decompress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_VERIFY_FAIL;
+    }
+    let in_bytes = (nblocks as u64) * (block as u64) * st.passes; // decompressed bytes
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVESW,
+        op: "decompress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes,
+        out_bytes,
+        ratio_pct: 0.0,
+        note: &nativesw_note(&nat, req_size),
+    });
+    EXIT_OK
+}
+
+/// The row note for the nativesw cells: which mode the handle took, the
+/// request size, and the hardware/software request split — on a machine
+/// without the device the split reads hw=0 and the mode says soft.
+fn nativesw_note(nat: &crate::KaeNative, req_size: usize) -> String {
+    let mode = match nat.backend() {
+        Backend::Native => "native",
+        _ => "soft",
+    };
+    let mut note = format!(
+        "nativesw,mode={},req_size={},hw={},sw={},decode=lz4rip",
+        mode,
+        req_size,
+        nat.hw_requests(),
+        nat.sw_requests(),
+    );
+    if let Some(e) = nat.last_hw_error() {
+        note.push_str(&format!(",last_hw_fallback={}", flat(e)));
+    }
+    note
 }
 
 /// Decode the sample file with the current library (expected to be the

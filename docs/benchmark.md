@@ -14,7 +14,7 @@ mean about the hardware path — weaknesses and their root causes — see
 ```bash
 cargo build --release
 ./target/release/kae-bench --probe     # environment & symbol probe, then exit
-./target/release/kae-bench             # full scan: sw / hw / hwasync / native (~2 min)
+./target/release/kae-bench             # full scan: sw / hw / hwasync / native / soft / nativesw (~3 min)
 ./target/release/kae-bench --sweep     # the whole native experiment series into ./kae-sweep.tsv
 ```
 
@@ -42,7 +42,7 @@ Common invocations:
 | `--input FILE` | — | Benchmark a real file instead of synthetic data (dataset label becomes `input`) |
 | `--size MIB` | 64 | Synthetic dataset size |
 | `--blocks LIST` | `4096,8192,65536,262144,1048576` | Block sizes to scan |
-| `--impl LIST` | `sw,hw,hwasync,native` | `sw`, `hw`, `hwasync` (compress only), `native` (the crate's own uacce engine path; its decompress cell decodes in software, in-crate — see [native-bench.md](native-bench.md)) |
+| `--impl LIST` | `sw,hw,hwasync,native,soft,nativesw` | `sw`, `hw`, `hwasync` (compress only), `native` (the crate's own uacce engine path; its decompress cell decodes with lz4rip — see [native-bench.md](native-bench.md)), `soft` (the bare pure-Rust lz4rip engine, any machine), `nativesw` (`KaeNative`: the production per-block engine path with per-request software fallback; runs everywhere, degrading to `soft` without a ZIP device) |
 | `--workers N` | 1 | Threads per sw/hw cell: 1 is the sync drop-in, >1 the threaded pool form (see below); for `hwasync`, values >1 set the library's internal async thread pool (`KAE_LZ4_ASYNC_THREAD_NUM`); for `native`, N is the number of hardware queues |
 | `--ops LIST` | `compress,decompress` | Operations to run |
 | `--sw-lz4-lib P` | `liblz4.so.1` | Software library path |
@@ -140,7 +140,7 @@ LZ4 blocks, the view that kae-vs-sw comparisons are read on. When the
 sample rebuild fails, the timed engine numbers stand: the row keeps
 `OK`, `ratio_pct` falls back to the pre-rebuild engine output and the
 note records `sample=failed:<cause>` (and no verify runs). The native
-decompress row is in-crate software decode of those rebuilt blocks —
+decompress row is lz4rip software decode of those rebuilt blocks —
 liblz4's job in the other implementations, just without the C library.
 
 - **`status`** — `OK`, or a failure tag: `OPEN_FAIL` (library could not be

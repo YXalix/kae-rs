@@ -151,7 +151,7 @@ The bench prints a warning in exactly this situation.
 | `RESULT status=ASYNC_FAIL ... TASK_QUEUE_FULL` | The KAE task queue was full with nothing in flight from this batch — another process is hogging the queue. Retry when the co-tenant finishes, or lower concurrency. |
 | `RESULT status=WORKER_ERR` in a cell | The worker subprocess died; the note carries the first words of its stderr. Re-run that single cell (narrow `--blocks/--impl`) to see the full output. |
 | gcc (`cc1`) or `readelf` suddenly broken host-wide | Someone violated a hard rule — the patched library is on the global loader path. Remove `/usr/local/kae*` from `LD_LIBRARY_PATH` / `ld.so.conf.d` / `/usr/local/lib`. |
-| `GLIBC_2.34 not found` when copying the binary to another host | The binary was built on a newer glibc. Build on the target machine (`cargo build --release` needs nothing beyond rustc 1.70+ — the crate has zero dependencies) or verify requirements with `objdump -T kae-bench \| grep GLIBC \| sort -u`. |
+| `GLIBC_2.34 not found` when copying the binary to another host | The binary was built on a newer glibc. Build on the target machine (`cargo build --release` needs nothing beyond rustc 1.85+ — the crate's one dependency, lz4rip, is pure Rust) or verify requirements with `objdump -T kae-bench \| grep GLIBC \| sort -u`. |
 
 ## Library behavior guarantees to rely on
 

@@ -40,6 +40,12 @@ across 12 spinning threads. If the native path with `k` in-flight requests
 per queue exceeds both by a wide margin, the plateau is a userspace-stack
 artifact and a thin native backend is worth finishing; if it does not,
 the engine itself is the limit and the placement verdict is final.
+**The `perf_mode=1` sweep of 2026-10-19 answered it — the first branch
+holds.** One queue sustains 6.40 GB/s from depth 4, two queues 12.79 GB/s
+at 64K requests and 23.20 GB/s at 8K requests, against the same run's
+kaelz4 cells at 1.74 (sync) and 4.02 GB/s (async batch): the plateau is a
+userspace-stack artifact, and the native backend is worth finishing (full
+readings: [native-sweep.md](native-sweep.md)).
 
 ## What is different from the kaelz4 cells
 
@@ -112,8 +118,8 @@ Knobs (environment variables read by the native worker):
 | var | default | meaning |
 |---|---|---|
 | `KAE_NATIVE_DEPTH` | 8 | in-flight requests per queue (max 1024, the engine's queue depth; throughput saturates at 4) |
-| `KAE_NATIVE_DB_BATCH` | = depth | SQEs per doorbell store (1 reproduces the per-request ring) |
-| `KAE_NATIVE_WAIT` | `spin` | `spin` harvests the CQ in a tight loop; `poll` sleeps on the uacce fd (the IRQ-arm path) |
+| `KAE_NATIVE_DB_BATCH` | = depth | SQEs per doorbell store (1 reproduces the per-request ring; measured flat at 64K — both 6.40 GB/s) |
+| `KAE_NATIVE_WAIT` | `spin` | `spin` harvests the CQ in a tight loop; `poll` sleeps on the uacce fd (the IRQ-arm path) — measured: equal throughput at 0.040 vs 0.160 cpu s/GB |
 | `KAE_NATIVE_ALG` | `lz77` | `deflate` runs the deflate dialect instead — the plumbing-check algorithm, without the 128K input cap |
 
 `--workers N` selects the number of hardware queues, round-robin over all
@@ -157,6 +163,11 @@ number taken under it is a floor.
 
 ## Reading the results
 
+Resolved for `perf_mode=1` on 2026-10-19 — engine faster than the C
+stack, `poll` delivers the wait-side win (see
+[native-sweep.md](native-sweep.md)). The rules below stand for any
+re-run:
+
 - **Depth ladder saturates well above 4 GB/s** → the engine is faster
   than the C stack; the kaelz4 async plateau is submit/harvest overhead,
   and finishing the native backend is worth it.
@@ -176,12 +187,15 @@ number taken under it is a floor.
 
 - Stateless flat requests only, window fixed at 16K for lz77 (kaelz4's
   defaults). Compress times the engine's lz77 parse; decompress times
-  in-crate software decoding (`src/lz4dec.rs`) of the rebuilt standard
-  LZ4 blocks — the decode side is software in every implementation (KAE
-  accelerates compression only; the patched library decompresses in
-  software too), and the native path keeps a C library out of the
-  process entirely. The decompress cell needs the lz77 dialect (deflate
-  output is not LZ4) and blocks that are request-size multiples.
+  lz4rip decoding (`src/soft.rs`) of the rebuilt standard LZ4 blocks —
+  the decode side is software in every implementation (KAE accelerates
+  compression only; the patched library decompresses in software too),
+  and the native path keeps a C library out of the process entirely. The
+  decompress cell needs the lz77 dialect (deflate output is not LZ4) and
+  blocks that are request-size multiples. The `soft` and `nativesw` cells
+  run the same lz4rip decode on the other side of the fence: `soft`
+  decodes lz4rip's own compression, `nativesw` decodes the production
+  handle's engine-rebuilt blocks (or its own, in software mode).
 - The decompress setup rebuilds **every** block from live hardware
   triples (one request per `req_size` slice, untimed, one walk per
   block) and bit-checks each block's rebuilt bytes against its original

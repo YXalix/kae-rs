@@ -1,21 +1,24 @@
 # kae
 
 Rust bindings for Kunpeng KAE2 hardware LZ4, targeting the AgentENV zfile
-pipeline (LZ4 block format, per-block `LZ4_compress_default`): **zero
-build-time dependencies** (nothing is linked, no KAE headers needed); at
-runtime it dlopens the patched `/usr/local/kaelz4/lib/liblz4.so.1.9.4` — a
-standard LZ4 ABI that internally forwards libkaelz4.so.2.2.0 → libwd → the
-uacce ZIP engine. Decompression remains a software implementation inside the
-patched library (KAE only accelerates compression); this crate wraps it as
-well so the drop-in stays complete.
+pipeline (LZ4 block format, per-block `LZ4_compress_default`): **no
+build-time C dependencies** (nothing linked, no KAE headers; the one
+dependency, `lz4rip`, is pure Rust); at runtime it dlopens the patched
+`/usr/local/kaelz4/lib/liblz4.so.1.9.4` — a standard LZ4 ABI that
+internally forwards libkaelz4.so.2.2.0 → libwd → the uacce ZIP engine.
+KAE only accelerates compression, so decompression is software in every
+backend: the C-library drop-in wraps liblz4's decoder, and the crate's own
+zero-C stack (`KaeNative`) decodes with the pure-Rust lz4rip engine —
+which also serves as the software fallback when the hardware is absent or
+stalls (see the production path below).
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — the acceleration chain,
   runtime loading model, module map, async batch internals
 - [docs/library-guide.md](docs/library-guide.md) — open strategies, block
-  and async batch APIs, error handling, environment variables,
-  AgentENV integration shape
+  and async batch APIs, the native handle with software fallback, error
+  handling, environment variables, AgentENV integration shape
 - [docs/benchmark.md](docs/benchmark.md) — kae-bench options, methodology,
   metrics, verdict criteria, output formats
 - [docs/kae-limitations.md](docs/kae-limitations.md) — measured weaknesses
@@ -135,7 +138,7 @@ the device are marked `#[ignore]` (`tests/hw_required.rs`) and run only with
 ```bash
 cargo build --release
 ./target/release/kae-bench --probe        # environment & symbol probe (incl. the async surface)
-./target/release/kae-bench                # full scan: sw / hw / hwasync / native (~2 min)
+./target/release/kae-bench                # full scan: sw / hw / hwasync / native / soft / nativesw (~3 min)
 ./target/release/kae-bench --input /path/to/memory.img \
     --blocks 4096,65536,1048576 --ops compress
 ./target/release/kae-bench --impl sw,hw,hwasync --workers 8 \
@@ -143,12 +146,13 @@ cargo build --release
 cargo bench -- --ops compress             # bench entry point (same logic)
 ```
 
-- Every (block size × sw/hw × compress/decompress) combination runs
+- Every (block size × impl × compress/decompress) combination runs
   in a **subprocess**: the patched library and the system library share the
   SONAME liblz4.so.1 and would pollute each other inside one process. The
-  `native` cells carry no library at all (in-crate uacce engine path);
-  their lz77 triples are rebuilt into standard LZ4 blocks in the worker,
-  so the same LZ4 cross-validation sample applies to them.
+  `native`/`soft`/`nativesw` cells carry no library at all (in-crate uacce
+  engine path or the lz4rip engine); the native lz77 triples are rebuilt
+  into standard LZ4 blocks in the worker, so the same LZ4 cross-validation
+  sample applies to them.
 - `--workers N` with N > 1 turns the sw/hw cells into N-threaded block
   pools — the AgentENV zfile WorkerPool shape (each thread compresses its
   interleaved share of the file's blocks) — so `--impl sw,hw --workers 8`
@@ -172,17 +176,19 @@ cargo bench -- --ops compress             # bench entry point (same logic)
 Compile on a dev machine and copy to production: the binary's highest glibc
 symbol is GLIBC_2.34 (fine on Debian 12); verify with
 `objdump -T kae-bench | grep GLIBC | sort -u`, and if that is not satisfied
-just `cargo build --release` on the target machine (rustc 1.70+ suffices,
-zero dependencies).
+just `cargo build --release` on the target machine (rustc 1.85+ suffices —
+the one crate dependency, `lz4rip`, is pure Rust with no C and no build-time
+linking).
 
 ## Native uacce engine path
 
 `src/uacce.rs` drives the ZIP engine directly over the uacce queue ABI —
 ioctl setup, mmap'd SQ/CQ rings, doorbell stores, CQE harvest, DMA from
 the kernel-allocated SS share region — with **no libwd, no libkaelz4 and
-no patched liblz4 in the process**, and still zero crate dependencies
-(the FFI is hand-bound like the getrusage shim in sysres). The bench
-exposes it as a fourth implementation:
+no patched liblz4 in the process**. The FFI is hand-bound like the
+getrusage shim in sysres; the one crate dependency (`lz4rip`, the
+pure-Rust software engine behind `soft`/`nativesw` and every decode) is
+itself C-free. The bench exposes four in-crate implementations:
 
 ```bash
 ./target/release/kae-bench --impl native                       # engine ceiling cells
@@ -204,17 +210,54 @@ Two views, two questions — keep them apart when reading numbers:
   produces; its GB/s answers "how fast is the hardware with the C stack
   removed", not "how fast is an LZ4 compressor".
 
+On the target box (2× ZIP devices, `perf_mode=1`, October 2026) the
+sweep settled the placement question: one queue sustains 6.4 GB/s
+(lz77 view, saturating at depth 4), two queues 12.8 GB/s at 64K requests
+and 23.2 GB/s at 8K — against 1.7 (sync) / 4.0 (async batch) GB/s from
+the kaelz4 stack on the same box — and `poll`-the-fd waiting matches
+spin throughput at a quarter of the pump CPU. Full readings:
+[docs/native-sweep.md](docs/native-sweep.md).
+
 In-flight depth, doorbell batching and spin-vs-poll waiting are all knobs
 here, so the same tool that measures the engine's true ceiling doubles as
 the testbed for the policies the C stack never had (deep pipelining,
 batched doorbells, sleep-until-IRQ). Compress times the raw lz77 engine;
-decompress times in-crate software decoding (`src/lz4dec.rs`) of the
-rebuilt standard LZ4 blocks — the decode side is software everywhere, the
-native path just also drops the C library from the process. QM v3
-devices; `/dev/hisi_zip-*` required (cells skip with a printed reason
-otherwise).
+decompress times lz4rip decoding (`src/soft.rs`) of the rebuilt standard
+LZ4 blocks — the decode side is software everywhere (the engine has no LZ4
+decode direction), the native path just also drops the C library from the
+process. QM v3 devices; `/dev/hisi_zip-*` required (cells skip with a
+printed reason otherwise). `src/lz4dec.rs` stays in the tree as the
+untimed self-check oracle: an independent second decoder whose per-rule
+errors localize a rebuild bug.
 See [docs/native-bench.md](docs/native-bench.md) for the full matrix, the
 two-view reading rules, and the ceiling-interpretation framework.
+
+## The production path: hardware first, software on fallback
+
+`src/native.rs` wraps the engine in the block-level API the zfile worker
+loop would drive: [`KaeNative::open`] probes for a ZIP engine and degrades
+to the lz4rip software engine when none is present or the queue cannot be
+opened; on a live queue every block compresses through the engine
+synchronously (load slot → submit → wait → rebuild), and a request that
+stalls past `KAE_NATIVE_TIMEOUT_MS` (default 500) or completes with a
+hardware error fails that whole block over to software — never a mixed
+block — with the split counted in `hw_requests()`/`sw_requests()`. No C
+library in either mode. The bench cell is `nativesw` (it runs everywhere,
+saying `mode=soft` in its note without a device); `soft` is the bare
+lz4rip baseline.
+
+```rust
+use kae::{native_available, Backend, KaeNative};
+
+let mut nat = KaeNative::open()?;          // hardware first, software fallback
+match nat.backend() {
+    Backend::Native => { /* engine path; hw_requests()/sw_requests() report the split */ }
+    Backend::Soft => { /* no device (or queue open failed): pure-Rust lz4rip */ }
+    _ => unreachable!(),
+}
+let packed = nat.compress_vec(&block)?;    // standard LZ4 block out
+let n = nat.decompress(&packed, &mut restored)?;  // lz4rip in every mode
+```
 
 ## Operational hard rules
 

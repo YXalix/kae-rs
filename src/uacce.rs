@@ -601,29 +601,36 @@ impl Queue {
     }
 
     /// Run one lz77 request on the next ring slot carrying exactly `input`
-    /// (req_size bytes) and return its sequence triples — the rebuild input
-    /// for the cross-validation sample. Idle queue only, outside the timed
-    /// loop.
-    fn sample_triples(&mut self, input: &[u8], batch: usize) -> Result<Lz77Sample, String> {
+    /// (up to the request size; a shorter input programs its own parse
+    /// length) and return its sequence triples — the rebuild input for the
+    /// cross-validation sample and for [`crate::native`]'s per-block path.
+    /// Idle queue only, outside the timed loop; `timeout_s` bounds the
+    /// completion wait.
+    fn request(&mut self, input: &[u8], batch: usize, timeout_s: f64) -> Result<Lz77Sample, String> {
         if self.outstanding != 0 {
             return Err("queue_busy".into());
         }
         if self.alg != NativeAlg::Lz77 {
             return Err("sample_is_lz77_only".into());
         }
-        if input.len() != self.req_size {
-            return Err(format!("sample_input_{}B_req_{}B", input.len(), self.req_size));
+        if input.len() > self.req_size {
+            return Err(format!(
+                "request_input_{}B_req_{}B",
+                input.len(),
+                self.req_size
+            ));
         }
         let slot = self.sq_tail as usize % self.src.len();
         let (sptr, _) = self.src[slot];
-        unsafe { std::slice::from_raw_parts_mut(sptr, self.req_size) }.copy_from_slice(input);
+        let slot_buf = unsafe { std::slice::from_raw_parts_mut(sptr, self.req_size) };
+        slot_buf[..input.len()].copy_from_slice(input);
         let idx = self.sq_tail;
-        self.submit(batch.max(1), 1);
+        self.submit_len(batch.max(1), 1, input.len());
         let t0 = now_s();
         while self.outstanding > 0 {
             self.harvest();
-            if now_s() - t0 > 10.0 {
-                return Err("sample_request_did_not_complete".into());
+            if now_s() - t0 > timeout_s {
+                return Err("request_did_not_complete_in_time".into());
             }
         }
         let sqe = unsafe { &*(self.sq.add(idx as usize * QM_ZIP_SQE_SIZE) as *const Sqe) };
@@ -633,7 +640,7 @@ impl Queue {
         }
         let lit = u32::from_le(sqe.comp_data_length) as usize;
         let ntriples = u32::from_le(sqe.produced) as usize;
-        let lit_cap = lz77_lit_area(self.req_size);
+        let lit_cap = lz77_lit_area(input.len());
         if lit > lit_cap || ntriples * 8 + 32 > self.ocap - lit_cap {
             return Err(format!("lz77_output_insanity_lit={lit}_seqs={ntriples}"));
         }
@@ -659,9 +666,17 @@ impl Queue {
         self.stats.doorbells += 1;
     }
 
-    /// Fill up to `budget` SQEs; rings the doorbell every `batch` fills and
-    /// at every ring-wrap boundary so one doorbell never spans the wrap.
+    /// Fill up to `budget` SQEs at the queue's request size; rings the
+    /// doorbell every `batch` fills and at every ring-wrap boundary so one
+    /// doorbell never spans the wrap.
     fn submit(&mut self, batch: usize, budget: usize) -> usize {
+        self.submit_len(batch, budget, self.req_size)
+    }
+
+    /// [`Queue::submit`] with the programmed parse input length explicit —
+    /// a request carrying less than the slot's capacity programs its own
+    /// length (the lz77 parse is `in_len - MFLIMIT`).
+    fn submit_len(&mut self, batch: usize, budget: usize, in_len: usize) -> usize {
         // device status: value 1 in the last DUS word means a hardware
         // error happened (uadk v1 qm_tx_update reads it before every send)
         if self.dus_len > QM_DS_TX_AT_END {
@@ -686,8 +701,8 @@ impl Queue {
             let (_optr, odma) = self.out[slot];
             let sqe = unsafe { &mut *(self.sq.add(i as usize * QM_ZIP_SQE_SIZE) as *mut Sqe) };
             match self.alg {
-                NativeAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, self.req_size, self.ocap),
-                NativeAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, self.req_size, self.ocap),
+                NativeAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, in_len, self.ocap),
+                NativeAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, in_len, self.ocap),
             }
             sqe.tag_l = i as u32;
             self.sq_tail = (i + 1) % QM_Q_DEPTH as u16;
@@ -871,10 +886,18 @@ impl NativePump {
     }
 
     /// Compress one lz77 request on queue 0 and return its sequence
-    /// triples; `input` must be exactly the request size. For the
-    /// cross-validation sample, after a run has drained.
+    /// triples; `input` may fill the request size up to full capacity. For
+    /// the cross-validation sample, after a run has drained; the 10 s
+    /// wait bounds a wedged ring instead of timing a live request.
     pub fn sample_triples(&mut self, input: &[u8]) -> Result<Lz77Sample, String> {
-        self.queues[0].sample_triples(input, self.batch)
+        self.request_triples(input, 10.0)
+    }
+
+    /// [`NativePump::sample_triples`] with the completion wait explicit —
+    /// the per-block engine path times out on `timeout_s` and fails the
+    /// request to its software fallback instead of hanging.
+    pub fn request_triples(&mut self, input: &[u8], timeout_s: f64) -> Result<Lz77Sample, String> {
+        self.queues[0].request(input, self.batch, timeout_s)
     }
 
     fn poll_once(&self, timeout_ms: c_int) {
