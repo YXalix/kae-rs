@@ -760,6 +760,15 @@ impl Queue {
     /// interrupt-arm flag) rings once per call, matching uadk's
     /// per-recv-call rx_update granularity.
     fn harvest(&mut self) -> usize {
+        self.harvest_rings(None)
+    }
+
+    /// [`Queue::harvest`] that also reports each completion's SQE ring
+    /// index (the CQE's `sq_head`) — completions are NOT in submission
+    /// order (a zero-page request finishes faster than a random-page one),
+    /// so callers that read per-request results must match on this, never
+    /// on position.
+    fn harvest_rings(&mut self, mut rings: Option<&mut Vec<usize>>) -> usize {
         let mut reaped = 0;
         while self.outstanding > 0 {
             let cqe = unsafe { &*(self.cq.add(self.cq_head as usize * QM_CQE_SIZE) as *const Cqe) };
@@ -806,6 +815,9 @@ impl Queue {
             self.stats.bytes_in += self.req_size as u64;
             self.stats.reqs_done += 1;
             reaped += 1;
+            if let Some(v) = rings.as_deref_mut() {
+                v.push(sq_head);
+            }
         }
         if reaped > 0 {
             let pri = self.c_flag;
@@ -978,11 +990,16 @@ impl NativePump {
                 slot_buf[..chunk.len()].copy_from_slice(chunk);
                 q.submit_len(self.batch.max(1), 1, chunk.len());
             }
-            // wait the wave out; on timeout fail this wave and the rest
+            // wait the whole wave out, collecting completions by their SQE
+            // ring index; a timeout fails this wave and everything after it
+            let wave_start = start % QM_Q_DEPTH;
+            let mut done: Vec<usize> = Vec::with_capacity(n);
+            let mut results_wave: Vec<Option<Result<Lz77Sample, String>>> =
+                (0..n).map(|_| None).collect();
             let t0 = now_s();
             let mut timed_out = false;
             while q.outstanding > 0 {
-                let reaped = q.harvest();
+                let reaped = q.harvest_rings(Some(&mut done));
                 if reaped == 0 && q.c_flag != 0 {
                     q.poll_once(100);
                 }
@@ -997,10 +1014,21 @@ impl NativePump {
                 }
                 return out;
             }
-            for (j, chunk) in wave.iter().enumerate() {
-                // the SQE ring wraps at QM_Q_DEPTH, the slot ring at depth
-                let ring = (start + j) % QM_Q_DEPTH;
-                out.push(q.read_result(ring, chunk.len()));
+            for sq_head in done.drain(..) {
+                // the wave's rings sit within [wave_start, wave_start + n)
+                // modulo the ring size; anything else is a foreign
+                // completion and means the bookkeeping is broken
+                let pos = (sq_head + QM_Q_DEPTH - wave_start) % QM_Q_DEPTH;
+                if pos >= n {
+                    out.push(Err(format!(
+                        "completion_outside_wave ring={sq_head} wave_start={wave_start}"
+                    )));
+                    continue;
+                }
+                results_wave[pos] = Some(q.read_result(sq_head, wave[pos].len()));
+            }
+            for r in results_wave {
+                out.push(r.unwrap_or_else(|| Err("completion_lost".into())));
             }
             k += n;
         }
