@@ -31,7 +31,10 @@ const ML_BITS: usize = 4;
 const ML_MASK: usize = 15;
 
 /// Rebuild one request's triples (`seqs*8` bytes) against its original
-/// `input` into `out` (cleared first); returns the LZ4 block length.
+/// `input` into `out` (cleared first); returns the LZ4 block length. The
+/// test-side reference for the walk [`lz77_block_from_requests`] applies
+/// per request.
+#[cfg(test)]
 pub(crate) fn lz77_block(input: &[u8], seqs: &[u8], out: &mut Vec<u8>) -> Result<usize, String> {
     if seqs.len() % 8 != 0 {
         return Err(format!("triple area is {}B, not a multiple of 8", seqs.len()));
@@ -350,6 +353,29 @@ pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
     lines.join("\n")
 }
 
+/// Walk one request's triples exactly the way the rebuild does and
+/// report the consumed end and the fold-row count — the numbers a failed
+/// rebuild check needs to judge each request's boundary charge. The
+/// pending fold credit rides into the next match (or the next request),
+/// so it is not part of the consumed end.
+pub(crate) fn walk_stats(seqs: &[u8]) -> (usize, usize) {
+    let mut pending = 0usize;
+    let mut ip = 0usize;
+    let mut folds = 0usize;
+    for t in seqs.chunks_exact(8) {
+        let lit = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+        let ml_base = u16::from_le_bytes(t[6..8].try_into().unwrap()) as usize;
+        if ml_base == 0 {
+            pending += lit + 3;
+            folds += 1;
+            continue;
+        }
+        ip += lit + pending + ml_base + 3;
+        pending = 0;
+    }
+    (ip, folds)
+}
+
 /// 255-style extension bytes after a saturating 4-bit token nibble.
 fn push_extension(out: &mut Vec<u8>, mut n: usize) {
     while n >= 255 {
@@ -612,6 +638,15 @@ mod tests {
         }
         seqs.extend(triple(256, 0, 101));
         roundtrip(&input, &seqs);
+    }
+
+    /// `walk_stats` mirrors the rebuild's accounting: folds pile credit
+    /// without advancing, matches consume literals plus match length.
+    #[test]
+    fn walk_stats_mirrors_the_rebuild_walk() {
+        let seqs = [triple(1, 1, 0), triple(8, 6, 3)].concat();
+        assert_eq!(walk_stats(&seqs), (16, 1));
+        assert_eq!(walk_stats(&[]), (0, 0));
     }
 
     /// The trace walks triples exactly like `lz77_block`: same fold

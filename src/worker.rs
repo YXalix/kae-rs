@@ -608,59 +608,84 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// A failed rebuilt-block check: the message for the row plus the first
+/// diverging offset, which maps the failure onto its request.
+struct CheckFail {
+    msg: String,
+    at: Option<usize>,
+}
+
 /// Decode one rebuilt block and require the original bytes back; the
 /// error names the first diverging byte so a dump can be read against it.
-fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), String> {
+fn check_rebuilt_request(input: &[u8], block: &[u8]) -> Result<(), CheckFail> {
     let mut dst = vec![0u8; input.len()];
     match lz4dec::decode_block(block, &mut dst) {
         Ok(n) if n == input.len() && dst.as_slice() == input => Ok(()),
-        Ok(n) => match dst[..n].iter().zip(input).position(|(a, b)| a != b) {
-            Some(d) => Err(format!(
-                "first diff at {d}B: got 0x{:02x} want 0x{:02x}",
-                dst[d], input[d]
-            )),
-            None => Err(format!("decoded {n}B of {}B", input.len())),
-        },
-        Err(e) => Err(e),
+        Ok(n) => {
+            let at = dst[..n].iter().zip(input).position(|(a, b)| a != b);
+            let msg = match at {
+                Some(d) => format!(
+                    "first diff at {d}B: got 0x{:02x} want 0x{:02x}",
+                    dst[d], input[d]
+                ),
+                None => format!("decoded {n}B of {}B", input.len()),
+            };
+            Err(CheckFail { msg, at })
+        }
+        Err(e) => Err(CheckFail { msg: e, at: None }),
     }
 }
 
-/// The full evidence for one failed rebuild check: on stderr and in a
-/// dump file next to the run (the sweep file notes their count; the
-/// console line may be lost). The audit verdict names the side at fault:
-/// a violated rule means the request's triples are inconsistent (match
-/// bytes or literal area), `Ok` means the triples are fine and the LZ4
-/// encoding is.
+/// The full evidence for one failed rebuild check: the per-request
+/// verdicts on stderr (compact) and every request's triples, literal
+/// areas, the input and the rebuilt block in a dump file next to the run.
+/// Each verdict names the side at fault for that request: a violated
+/// audit rule means its triples are inconsistent (match bytes or literal
+/// area), `consistent` means its triples are fine and the fault in its
+/// range is the boundary assembly or the LZ4 encoding.
+#[allow(clippy::too_many_arguments)]
 fn dump_rebuild_check(
     label: &str,
-    sample: &uacce::Lz77Sample,
+    e: &str,
+    primary: usize,
+    verdicts: &[String],
+    req_size: usize,
+    off: usize,
+    samples: &[uacce::Lz77Sample],
     input: &[u8],
     block: &[u8],
-    e: &str,
-    audit: &Result<(), String>,
 ) {
-    let verdict = match audit {
-        Ok(()) => "triples self-consistent (match bytes and literal area agree): \
-                   the LZ4 encoding is at fault"
-            .to_string(),
-        Err(a) => a.clone(),
-    };
-    let lines = vec![
-        format!("native: {label} rebuild check failed: {e}"),
-        format!(
-            "native: lit={} ll_overflow_cnt={} ll_overflow_pos={} overflow={} seqs={}",
+    let mut lines = vec![format!("native: {label} rebuild check failed: {e}")];
+    for (r, v) in verdicts.iter().enumerate() {
+        let sample = &samples[r];
+        let (walk_end, folds) = rebuild::walk_stats(&sample.seqs);
+        lines.push(format!(
+            "native: {v} (walk_end {walk_end}, tail {}, lit_area {}, triples {}, folds {folds})",
+            req_size.saturating_sub(walk_end),
             sample.lit,
+            sample.seqs.len() / 8,
+        ));
+    }
+    lines.push(format!(
+        "native: first diff is in request {primary}'s data range ({}..{}); its triples:",
+        off + primary * req_size,
+        off + (primary + 1) * req_size,
+    ));
+    lines.push(format!("native: triples: {}", hex(&samples[primary].seqs)));
+    // the byte-level evidence stays out of the console: the input alone is
+    // hundreds of KB of hex and truncates terminal capture
+    for (r, sample) in samples.iter().enumerate() {
+        lines.push(format!("native: request {r} triples: {}", hex(&sample.seqs)));
+        lines.push(format!(
+            "native: request {r} lits: {} (ll_overflow_cnt={} ll_overflow_pos={} overflow={})",
+            hex(&sample.lits),
             sample.ll_overflow_cnt,
             sample.ll_overflow_pos,
-            hex(&sample.overflow),
-            sample.seqs.len() / 8
-        ),
-        format!("native: audit: {verdict}"),
-        format!("native: triples: {}", hex(&sample.seqs)),
-        format!("native: block: {}", hex(block)),
-        format!("native: lits: {}", hex(&sample.lits)),
-        format!("native: input: {}", hex(input)),
-    ];
+            hex(&sample.overflow)
+        ));
+    }
+    lines.push(format!("native: block: {}", hex(block)));
+    lines.push(format!("native: input: {}", hex(input)));
     for l in &lines {
         eprintln!("{l}");
     }
@@ -676,10 +701,10 @@ fn dump_rebuild_check(
 /// walk over the concatenated inputs and triples — a finished LZ4 block
 /// is not composable (its closing literal run is a parser-level end
 /// marker), so streams are never spliced. The rebuilt block must decode
-/// to the original bytes; on a mismatch every request's triples are
-/// audited and the first inconsistent one is dumped
-/// (`rebuild::audit_triples` names the side at fault). `rebuild_s`
-/// accumulates the pure triple-to-LZ4 conversion time. Returns the
+/// to the original bytes; on a mismatch EVERY request's triples are
+/// audited (`rebuild::audit_triples` names the side at fault per request)
+/// and the request holding the first decode diff leads the report.
+/// `rebuild_s` accumulates the pure triple-to-LZ4 conversion time. Returns the
 /// rebuilt block's length in `stream`.
 fn rebuild_block(
     pump: &mut uacce::NativePump,
@@ -692,43 +717,78 @@ fn rebuild_block(
     rebuild_s: &mut f64,
 ) -> Result<usize, String> {
     let block_input = &data[off..off + block];
-    let mut seqs = Vec::new();
     let mut samples = Vec::new();
     for r in 0..(block / req_size) {
         let roff = off + r * req_size;
         let sample = pump
             .sample_triples(&data[roff..roff + req_size])
             .map_err(|e| format!("triples: {e} (block {label} request {r})"))?;
-        seqs.extend_from_slice(&sample.seqs);
         samples.push(sample);
     }
     let t0 = now_s();
-    let rebuilt = rebuild::lz77_block(block_input, &seqs, stream);
+    // each request's parse leaves its MFLIMIT tail (>=12B) unparsed, so a
+    // plain concatenated walk applies every later request `tail` bytes
+    // early: literals stay self-consistent and the first offset-based
+    // match after non-uniform data copies from before its true source.
+    // The walk charges each request's unconsumed tail into the next
+    // match's literal run instead.
+    let requests: Vec<(&[u8], usize)> = samples
+        .iter()
+        .map(|s| (s.seqs.as_slice(), req_size))
+        .collect();
+    let rebuilt = rebuild::lz77_block_from_requests(block_input, &requests, stream);
     *rebuild_s += now_s() - t0;
     let n = rebuilt.map_err(|e| format!("rebuild: {e} (block {label})"))?;
-    if let Err(e) = check_rebuilt_request(block_input, &stream[..n]) {
-        let mut verdict =
-            "triples self-consistent in every request: the LZ4 encoding is at fault".to_string();
+    if let Err(fail) = check_rebuilt_request(block_input, &stream[..n]) {
+        // audit every request before judging: the rebuild reads its
+        // literals from the input, so a literal-area fault never touches
+        // the rebuilt stream — the first audit failure is not necessarily
+        // the request the decode diff points at
+        let mut verdicts: Vec<String> = Vec::with_capacity(samples.len());
+        let mut first_bad: Option<usize> = None;
         for (r, sample) in samples.iter().enumerate() {
             let roff = off + r * req_size;
-            if let Err(a) = rebuild::audit_triples(
+            match rebuild::audit_triples(
                 &data[roff..roff + req_size],
                 &sample.seqs,
                 Some(&sample.lits),
             ) {
-                verdict = format!("request {r}: {a}");
-                dump_rebuild_check(
-                    &format!("block {label} request {r} (data {roff}..{})", roff + req_size),
-                    sample,
-                    &data[roff..roff + req_size],
-                    &stream[..n],
-                    &e,
-                    &Err(a.clone()),
-                );
-                break;
+                Ok(()) => verdicts.push(format!("request {r}: triples consistent")),
+                Err(a) => {
+                    if first_bad.is_none() {
+                        first_bad = Some(r);
+                    }
+                    verdicts.push(format!("request {r}: {a}"));
+                }
             }
         }
-        return Err(format!("block_check: {e}; audit: {}", flat(&verdict)));
+        let primary = fail
+            .at
+            .map(|d| (d / req_size).min(samples.len() - 1))
+            .or(first_bad)
+            .unwrap_or(0);
+        dump_rebuild_check(
+            &format!("block {label} (data {off}..{})", off + block),
+            &fail.msg,
+            primary,
+            &verdicts,
+            req_size,
+            off,
+            &samples,
+            block_input,
+            &stream[..n],
+        );
+        let mut ordered = vec![verdicts[primary].clone()];
+        for (r, v) in verdicts.iter().enumerate() {
+            if r != primary {
+                ordered.push(v.clone());
+            }
+        }
+        return Err(format!(
+            "block_check: {}; audit: {}",
+            fail.msg,
+            flat(&ordered.join("; "))
+        ));
     }
     Ok(n)
 }

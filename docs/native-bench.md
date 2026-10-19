@@ -76,14 +76,19 @@ the engine itself is the limit and the placement verdict is final.
   numbers stand, the row stays `OK`, and the note records
   `sample=failed:<cause>` (the row's err= and the worker's stderr also
   surface in the summary/TSV note). A failed block's check runs the
-  triple audit on every request it spans (`rebuild::audit_triples`: each
+  triple audit on EVERY request it spans (`rebuild::audit_triples`: each
   match's bytes must equal the bytes at `position - offset`, and the
-  engine's literal area must equal the walk's literal spans) — the first
-  inconsistent request's verdict lands in the note and dump and names
-  the side at fault: a violated rule means the engine's triples are
-  inconsistent, all-clean means the LZ4 encoding is. The full evidence
-  (triples, rebuilt bytes, literal area, input) lands on stderr and in
-  `native-fail-<request>.txt` in the worker's working directory. The
+  engine's literal area must equal the walk's literal spans) — the
+  request holding the first decode diff leads the note, and every
+  request carries its own verdict: a violated rule names that request's
+  engine output inconsistent, while a `triples consistent` verdict on
+  the failing range points at the boundary assembly. A literal-area
+  fault never explains a decode diff (the rebuild reads its literals
+  from the input), which is exactly why the audit must not stop at the
+  first inconsistent request. The full evidence (every request's
+  triples and literal areas, the rebuilt block, the input) lands in
+  `native-fail-<block>.txt` next to the run; the console keeps the
+  verdicts and the failing request's triples. The
   decompress cell depends on the rebuild and fails its cell instead —
   the decode has nothing to decode.
 
