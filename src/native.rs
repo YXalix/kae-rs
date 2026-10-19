@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use crate::lz4dec;
 use crate::rebuild;
 use crate::soft;
 use crate::uacce::{self, NativeAlg, NativePump};
@@ -39,6 +40,31 @@ fn soft_block(src: &[u8], dst: &mut [u8], hw_cause: Option<String>) -> Result<us
 /// hardware status error, which only fails its own block.
 fn is_wedge(err: &str) -> bool {
     err.contains("queue_busy") || err.contains("in_time")
+}
+
+/// Whether the ring-debug knob is on: per-wave completion logging plus a
+/// decode-verify of every hardware block, so one run localizes a misbuild
+/// to its wave and chunk.
+fn debug_ring() -> bool {
+    std::env::var("KAE_NATIVE_DEBUG_RING").as_deref() == Ok("1")
+}
+
+/// Decode-verify one rebuilt block against its input; the report names the
+/// chunk holding the first divergence, never the bytes themselves.
+fn verify_debug(input: &[u8], block: &[u8], b: usize, req_size: usize) {
+    let mut plain = vec![0u8; input.len()];
+    match lz4dec::decode_block(block, &mut plain) {
+        Ok(m) if &plain[..m] == input => {}
+        Ok(m) => {
+            let d = plain[..m].iter().zip(input).position(|(a, b)| a != b);
+            eprintln!(
+                "native: block {b} ({}, decoded {m}B) first diff at {d:?} (chunk {})",
+                block.len(),
+                d.map(|d| d / req_size).unwrap_or(usize::MAX),
+            );
+        }
+        Err(e) => eprintln!("native: block {b} ({}B) fails to decode: {e}", block.len()),
+    }
 }
 
 /// A hardware-first LZ4 block compressor with automatic software fallback.
@@ -259,6 +285,7 @@ impl KaeNative {
         let nblocks = segment.len() / block;
         packed.clear();
         let mut lens = Vec::with_capacity(nblocks + 1);
+        let debug = debug_ring();
 
         // hardware eligibility per block, and the flat chunk list of every
         // eligible block — ONE ring pass for the whole segment, waved at
@@ -316,6 +343,9 @@ impl KaeNative {
                         .collect();
                     match rebuild::lz77_block_from_requests(blk, &requests, &mut self.scratch) {
                         Ok(n) => {
+                            if debug {
+                                verify_debug(blk, &self.scratch[..n], b, req_size);
+                            }
                             packed.extend_from_slice(&self.scratch[..n]);
                             self.hw_requests += 1;
                             lens.push(n);

@@ -764,10 +764,10 @@ impl Queue {
     }
 
     /// [`Queue::harvest`] that also reports each completion's SQE ring
-    /// index (the CQE's `sq_head`) — completions are NOT in submission
-    /// order (a zero-page request finishes faster than a random-page one),
-    /// so callers that read per-request results must match on this, never
-    /// on position.
+    /// index (the CQE's `sq_head`) as arrived. The vendor stack treats
+    /// completions as FIFO and matches responses by CQ position alone;
+    /// the ring logging keeps that assumption checkable against the
+    /// hardware's own words.
     fn harvest_rings(&mut self, mut rings: Option<&mut Vec<usize>>) -> usize {
         let mut reaped = 0;
         while self.outstanding > 0 {
@@ -990,12 +990,15 @@ impl NativePump {
                 slot_buf[..chunk.len()].copy_from_slice(chunk);
                 q.submit_len(self.batch.max(1), 1, chunk.len());
             }
-            // wait the whole wave out, collecting completions by their SQE
-            // ring index; a timeout fails this wave and everything after it
+            // wait the whole wave out. Completions are FIFO on one queue
+            // (the vendor stack matches responses by CQ position alone),
+            // so wave position j reads the ring submitted at j — the ring
+            // logging under KAE_NATIVE_DEBUG_RING exists to re-examine
+            // that assumption from the hardware's own words if a block
+            // ever misbuilds again.
             let wave_start = start % QM_Q_DEPTH;
+            let debug_ring = std::env::var("KAE_NATIVE_DEBUG_RING").as_deref() == Ok("1");
             let mut done: Vec<usize> = Vec::with_capacity(n);
-            let mut results_wave: Vec<Option<Result<Lz77Sample, String>>> =
-                (0..n).map(|_| None).collect();
             let t0 = now_s();
             let mut timed_out = false;
             while q.outstanding > 0 {
@@ -1014,21 +1017,23 @@ impl NativePump {
                 }
                 return out;
             }
-            for sq_head in done.drain(..) {
-                // the wave's rings sit within [wave_start, wave_start + n)
-                // modulo the ring size; anything else is a foreign
-                // completion and means the bookkeeping is broken
-                let pos = (sq_head + QM_Q_DEPTH - wave_start) % QM_Q_DEPTH;
-                if pos >= n {
-                    out.push(Err(format!(
-                        "completion_outside_wave ring={sq_head} wave_start={wave_start}"
-                    )));
-                    continue;
-                }
-                results_wave[pos] = Some(q.read_result(sq_head, wave[pos].len()));
+            if debug_ring {
+                let in_order = done
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r == (wave_start + i) % QM_Q_DEPTH);
+                eprintln!(
+                    "native: wave rings {}..{} ({} reqs): completions in_order={} arrival={:?}",
+                    wave_start,
+                    (wave_start + n) % QM_Q_DEPTH,
+                    n,
+                    in_order,
+                    done
+                );
             }
-            for r in results_wave {
-                out.push(r.unwrap_or_else(|| Err("completion_lost".into())));
+            for (j, chunk) in wave.iter().enumerate() {
+                let ring = (wave_start + j) % QM_Q_DEPTH;
+                out.push(q.read_result(ring, chunk.len()));
             }
             k += n;
         }

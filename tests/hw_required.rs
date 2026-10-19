@@ -44,6 +44,20 @@ fn make_mixed(n: usize) -> Vec<u8> {
     v
 }
 
+/// Bit-exact assertion with a compact failure: the label, the first
+/// diverging offset and byte pair — never the full buffers.
+fn assert_bit_exact(label: &str, got: &[u8], want: &[u8]) {
+    if got.len() != want.len() {
+        panic!("{label}: decoded {}B of {}B", got.len(), want.len());
+    }
+    if let Some(d) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{label}: first diff at {d}B: got 0x{:02x} want 0x{:02x}",
+            got[d], want[d]
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
 fn hw_block_roundtrip_matrix() {
@@ -146,7 +160,7 @@ fn nativesw_hw_roundtrip_and_software_fallback_accounting() {
             let mut restored = vec![0u8; size];
             let n = nat.decompress(&compressed, &mut restored).expect("decompress");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
-            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+            assert_bit_exact(&format!("{name}/{size}"), &restored[..n], &block);
         }
     }
 
@@ -223,10 +237,10 @@ fn nativesw_hw_segment_roundtrip() {
                 .decompress(&packed[off..off + l], &mut restored)
                 .unwrap_or_else(|e| panic!("block {block} entry {i}: stock decode: {e}"));
             assert_eq!(n, plain_len, "block {block} entry {i}");
-            assert_eq!(
+            assert_bit_exact(
+                &format!("block {block} entry {i}"),
                 &restored[..n],
                 &segment[i * block..i * block + plain_len],
-                "block {block} entry {i}: bit-exact"
             );
             off += l;
         }
