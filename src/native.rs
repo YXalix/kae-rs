@@ -50,20 +50,53 @@ fn debug_ring() -> bool {
 }
 
 /// Decode-verify one rebuilt block against its input; the report names the
-/// chunk holding the first divergence, never the bytes themselves.
-fn verify_debug(input: &[u8], block: &[u8], b: usize, req_size: usize) {
+/// chunk holding the first divergence, never the bytes themselves. Three
+/// decoders judge (lz4dec, lz4rip, and — via the walk audit — the triple
+/// rules themselves), because a block that decodes under one and fails
+/// another names the violated rule exactly.
+fn verify_debug(
+    input: &[u8],
+    block: &[u8],
+    samples: &[Result<uacce::Lz77Sample, String>],
+    b: usize,
+    req_size: usize,
+) {
     let mut plain = vec![0u8; input.len()];
     match lz4dec::decode_block(block, &mut plain) {
-        Ok(m) if &plain[..m] == input => {}
-        Ok(m) => {
+        Err(e) => eprintln!("native: block {b} ({}B) lz4dec: {e}", block.len()),
+        Ok(m) if &plain[..m] != input => {
             let d = plain[..m].iter().zip(input).position(|(a, b)| a != b);
             eprintln!(
-                "native: block {b} ({}, decoded {m}B) first diff at {d:?} (chunk {})",
+                "native: block {b} ({}B) lz4dec: decodes {m}B, first diff at {d:?} (chunk {})",
                 block.len(),
                 d.map(|d| d / req_size).unwrap_or(usize::MAX),
             );
         }
-        Err(e) => eprintln!("native: block {b} ({}B) fails to decode: {e}", block.len()),
+        Ok(_) => {}
+    }
+    match soft::decompress(block, &mut plain) {
+        Err(e) => eprintln!("native: block {b} lz4rip: {e}"),
+        Ok(m) if &plain[..m] != input => {
+            let d = plain[..m].iter().zip(input).position(|(a, b)| a != b);
+            eprintln!(
+                "native: block {b} lz4rip: decodes {m}B, first diff at {d:?} (chunk {})",
+                d.map(|d| d / req_size).unwrap_or(usize::MAX),
+            );
+        }
+        Ok(_) => {}
+    }
+    for (r, s) in samples.iter().enumerate() {
+        let s = match s {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Err(a) = rebuild::audit_triples(
+            &input[r * req_size..(r + 1) * req_size],
+            &s.seqs,
+            Some(&s.lits),
+        ) {
+            eprintln!("native: block {b} chunk {r}: {a}");
+        }
     }
 }
 
@@ -344,7 +377,7 @@ impl KaeNative {
                     match rebuild::lz77_block_from_requests(blk, &requests, &mut self.scratch) {
                         Ok(n) => {
                             if debug {
-                                verify_debug(blk, &self.scratch[..n], b, req_size);
+                                verify_debug(blk, &self.scratch[..n], mine, b, req_size);
                             }
                             packed.extend_from_slice(&self.scratch[..n]);
                             self.hw_requests += 1;
