@@ -98,6 +98,47 @@ fn verify_debug(
             eprintln!("native: block {b} chunk {r}: {a}");
         }
     }
+    // the permissive decoders above decode past the stock library's
+    // last-match restrictions; name the offending sequence if the rebuilt
+    // block would fail the stock read path, and drop the triples for an
+    // offline replay (the input regenerates from the deterministic test
+    // generator)
+    if let Some(v) = rebuild::stock_rule_violation(input.len(), block) {
+        eprintln!("native: block {b} stock-rule walk: {v}");
+        for (r, s) in samples.iter().enumerate() {
+            let Ok(s) = s else { continue };
+            let len = req_size.min(input.len() - r * req_size);
+            let (walked, folds) = rebuild::walk_stats(&s.seqs);
+            eprintln!(
+                "native: block {b} chunk {r}: walk end {walked}/{len} (tail {}B), folds {folds}",
+                len - walked
+            );
+            let dir = format!("/tmp/kae_fail_block{b}");
+            let path = format!("{dir}/chunk{r}.txt");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::write(
+                    &path,
+                    format!(
+                        "input {len}B\nseqs {} triples: {}\nlits {}B: {}\n",
+                        s.seqs.len() / 8,
+                        hex(&s.seqs),
+                        s.lits.len(),
+                        hex(&s.lits),
+                    ),
+                );
+                eprintln!("native: block {b} chunk {r}: dumped {path}");
+            }
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// A hardware-first LZ4 block compressor with automatic software fallback.

@@ -22,8 +22,11 @@
 //! final literal run — the same arithmetic as kaelz4's own
 //! `kaelz4_triples_rebuild`, so the output decodes with the stock liblz4.
 //! The engine never parses the last 12 bytes of the input (the request
-//! programs `in_len - 12`; see uacce::MFLIMIT), so the tail run is always
-//! at least 12 bytes and the last-match restriction holds.
+//! programs `in_len - 12`; see uacce::MFLIMIT), but a match may still run
+//! onto the input end, so the walk peels the final stretch into the
+//! closing literal run: stock liblz4 rejects a match that ends within 5
+//! bytes of the block end or starts within 12, and the closing run keeps
+//! every block beyond both.
 
 /// LZ4 block-format constants.
 const RUN_MASK: usize = 15;
@@ -279,6 +282,17 @@ pub(crate) fn lz77_block_from_requests(
             let off = off_base + 1;
             let nib = ml_base - 1;
             let ml = nib + 4;
+            // The stock decoder rejects a match that ends within 5 bytes
+            // of the block end or starts within 12 (its closing-literal-
+            // run branch demands the input be exactly consumed once a
+            // literal run ends that close to the output end). The final
+            // request's parse can ride a match onto its input end, so the
+            // last stretch peels into the closing literal run — identical
+            // bytes, a stream stock liblz4 accepts.
+            if boundary == input.len() && ip + lit + ml > input.len().saturating_sub(12) {
+                push_literal_run(out, &input[ip..]);
+                return Ok(out.len());
+            }
             if ip + lit > input.len() {
                 return Err(format!(
                     "triple literals overrun the input (at {ip}+{lit}/{}B)",
@@ -382,6 +396,119 @@ pub(crate) fn walk_stats(seqs: &[u8]) -> (usize, usize) {
         pending = 0;
     }
     (ip, folds)
+}
+
+/// Walk a rebuilt block by stock liblz4's decoder rules and name the
+/// first sequence the stock library would reject — the permissive in-tree
+/// decoders decode past these, so a block that round-trips locally can
+/// still fail the stock read path. The rules (lz4 1.9.4
+/// LZ4_decompress_generic): a literal run ending within 12 bytes of the
+/// block end, or reaching within 8 of the stream end, must be the closing
+/// run consuming the stream exactly; a match may not end within 5 bytes
+/// of the block end ("last LASTLITERALS bytes must be literals"); a match
+/// offset may not reach before the block start; and the stream must end
+/// on that closing literal run. `Ok` from the walks plus a `Some` here
+/// means the sequence encoder itself, not the parse, is at fault.
+pub(crate) fn stock_rule_violation(input_len: usize, block: &[u8]) -> Option<String> {
+    let iend = block.len();
+    let mut ip = 0usize; // stream position
+    let mut op = 0usize; // decoded output position
+    loop {
+        let Some(&token) = block.get(ip) else {
+            return Some(format!(
+                "stream ends after {op}B of {input_len}B decoded with no closing literal run"
+            ));
+        };
+        let token_at = ip;
+        ip += 1;
+        let mut lit = (token >> 4) as usize;
+        if lit == 15 {
+            loop {
+                match block.get(ip) {
+                    Some(&255) => {
+                        lit += 255;
+                        ip += 1;
+                    }
+                    Some(&b) => {
+                        lit += b as usize;
+                        ip += 1;
+                        break;
+                    }
+                    None => {
+                        return Some(format!(
+                            "literal-length extension runs off the stream end (token at {token_at})"
+                        ))
+                    }
+                }
+            }
+        }
+        // stock's closing-literal-run branch: within 12 bytes of the
+        // output end or 8 of the stream end, the literals must consume
+        // the stream exactly and decode to the block end
+        if op + lit + 12 > input_len || ip + lit + 8 > iend {
+            if ip + lit != iend {
+                if ip + lit > iend {
+                    return Some(format!(
+                        "literal run (token at {token_at}) runs off the stream end with {op}B of {input_len}B decoded"
+                    ));
+                }
+                return Some(format!(
+                    "literal run (token at {token_at}) leaves {d}B of stream with {op}B of {input_len}B decoded — stock demands the closing run there",
+                    d = iend - ip - lit,
+                ));
+            }
+            if op + lit != input_len {
+                return Some(format!(
+                    "closing literal run decodes to {}B of {input_len}B",
+                    op + lit
+                ));
+            }
+            return None;
+        }
+        ip += lit;
+        op += lit;
+        if ip + 2 > iend {
+            return Some(format!(
+                "stream ends where a match offset belongs (token at {token_at})"
+            ));
+        }
+        let off = u16::from_le_bytes([block[ip], block[ip + 1]]) as usize;
+        ip += 2;
+        let mut nib = (token & 15) as usize;
+        if nib == 15 {
+            loop {
+                match block.get(ip) {
+                    Some(&255) => {
+                        nib += 255;
+                        ip += 1;
+                    }
+                    Some(&b) => {
+                        nib += b as usize;
+                        ip += 1;
+                        break;
+                    }
+                    None => {
+                        return Some(format!(
+                            "match-length extension runs off the stream end (token at {token_at})"
+                        ))
+                    }
+                }
+            }
+        }
+        let ml = nib + 4;
+        if off == 0 || off > op {
+            return Some(format!(
+                "match (token at {token_at}) at output {op} references offset {off}"
+            ));
+        }
+        if op + ml + 5 > input_len {
+            return Some(format!(
+                "match (token at {token_at}) ends {}B before the block end — stock keeps the last 5 bytes literal",
+                input_len.saturating_sub(op + ml)
+            ));
+        }
+        op += ml;
+    }
 }
 
 /// 255-style extension bytes after a saturating 4-bit token nibble.
@@ -709,6 +836,212 @@ mod tests {
             .decompress_block(&block, &mut dst)
             .expect("liblz4 rejected the rebuilt block");
         assert_eq!(&dst[..n], &input[..]);
+    }
+
+    /// The stock liblz4 decoder rejects a match that ends within the last
+    /// LASTLITERALS (5) bytes of the block ("last LASTLITERALS bytes must
+    /// be literals", lz4 1.9.4 LZ4_decompress_generic) and a match that
+    /// starts within the last MFLIMIT (12) — its closing-literal-run
+    /// branch fires the moment a literal run ends within 12 bytes of the
+    /// output end and demands the input be exactly consumed. The engine's
+    /// parse can ride a match onto its input end, so a request closing
+    /// the block that way produces a stream the stock library refuses
+    /// while permissive decoders decode it bit-exact. Pins the flip
+    /// point against the system library.
+    #[test]
+    fn stock_liblz4_rejects_matches_reaching_the_block_end() {
+        let Ok((lib, _)) = crate::open_lib("liblz4.so.1", &[]) else {
+            eprintln!("no system liblz4; skipped");
+            return;
+        };
+        let Ok(fns) = crate::lz4::Lz4Fns::load(&lib) else {
+            eprintln!("no LZ4_decompress_safe; skipped");
+            return;
+        };
+        // two triples over an RLE input: 2 literals + a 16-byte match at
+        // offset 1, then a zero-literal match at offset 1 whose length
+        // ends k bytes before the input end (k = 0 rides onto it)
+        for k in 0..16usize {
+            let len = 64usize;
+            let input = vec![b'x'; len];
+            let ml = len - 18 - k;
+            let seqs = [
+                triple(1, 2, 13),                  // 2 literals + 16-byte match
+                triple(1, 0, (ml - 3) as u16),     // ends at len - k
+            ]
+            .concat();
+            audit_triples(&input, &seqs, None)
+                .unwrap_or_else(|e| panic!("k={k}: parse audit: {e}"));
+            let block = rebuild(&input, &seqs);
+            let mut dst = vec![0u8; len];
+            let n = crate::lz4dec::decode_block(&block, &mut dst)
+                .unwrap_or_else(|e| panic!("k={k}: lz4dec rejected: {e}"));
+            assert_eq!(&dst[..n], &input, "k={k}: lz4dec content");
+            let stock = fns.decompress_block(&block, &mut dst);
+            if k < 5 {
+                assert!(stock.is_err(), "k={k}: stock accepted a match ending {k}B before the block end");
+            } else {
+                let n = stock.unwrap_or_else(|e| panic!("k={k}: stock rejected a legal block: {e}"));
+                assert_eq!(n, len, "k={k}: stock decoded length");
+            }
+        }
+        // and the 12-byte rule: a match STARTING within the last 12 bytes
+        // (59 literals then a 5-byte match) is rejected outright
+        let input = vec![b'x'; 64];
+        let seqs = [triple(1, 59, 2)].concat();
+        let block = rebuild(&input, &seqs);
+        let mut dst = vec![0u8; 64];
+        crate::lz4dec::decode_block(&block, &mut dst).expect("lz4dec decodes the near-end match");
+        assert!(
+            fns.decompress_block(&block, &mut dst).is_err(),
+            "stock accepted a match starting 5B before the block end"
+        );
+    }
+
+    /// The production shape the segment test exercises: the block's LAST
+    /// request ends with its parse riding a match onto the input end. The
+    /// join must peel that match into the closing literal run — the stock
+    /// library rejected the pre-peel stream while lz4dec decoded it
+    /// bit-exact.
+    #[test]
+    fn join_peels_a_final_request_that_rides_onto_its_input_end() {
+        let Ok((lib, _)) = crate::open_lib("liblz4.so.1", &[]) else {
+            eprintln!("no system liblz4; skipped");
+            return;
+        };
+        let Ok(fns) = crate::lz4::Lz4Fns::load(&lib) else {
+            eprintln!("no LZ4_decompress_safe; skipped");
+            return;
+        };
+        // request 1: a match with an unparsed tail; request 2 ends exactly
+        // on its final match (the empty-tail shape)
+        let input1 = vec![b'a'; 32];
+        let t1 = [triple(1, 4, 10)].concat(); // 4 literals + 13-byte match, 15B tail
+        let input2 = vec![b'b'; 48];
+        let t2 = [
+            triple(1, 4, 10),          // 4 literals + 13-byte match
+            triple(1, 0, 28),          // rides onto the input end (17 + 31 = 48B)
+        ]
+        .concat();
+        audit_triples(&input1, &t1, None).expect("request 1");
+        audit_triples(&input2, &t2, None).expect("request 2 rides onto its end");
+        let input = [input1.as_slice(), input2.as_slice()].concat();
+        let mut block = Vec::new();
+        let n = lz77_block_from_requests(
+            &input,
+            &[(&t1, input1.len()), (&t2, input2.len())],
+            &mut block,
+        )
+        .unwrap_or_else(|e| panic!("combined rebuild: {e}"));
+        let mut dst = vec![0u8; input.len()];
+        let m = crate::lz4dec::decode_block(&block[..n], &mut dst).expect("lz4dec");
+        assert_eq!(&dst[..m], &input);
+        let m = fns
+            .decompress_block(&block[..n], &mut dst)
+            .unwrap_or_else(|e| panic!("stock rejected the joined block: {e}"));
+        assert_eq!(&dst[..m], &input);
+    }
+
+    /// The property the stock read path stands on: joined random parses
+    /// rebuild to blocks the SYSTEM liblz4 decodes — empty tails (a match
+    /// landing exactly on the input end) included. Shares [`Gen`] with
+    /// the lz4dec-side property above.
+    #[test]
+    fn joined_random_parses_rebuild_to_blocks_stock_liblz4_accepts() {
+        let Ok((lib, _)) = crate::open_lib("liblz4.so.1", &[]) else {
+            eprintln!("no system liblz4; skipped");
+            return;
+        };
+        let Ok(fns) = crate::lz4::Lz4Fns::load(&lib) else {
+            eprintln!("no LZ4_decompress_safe; skipped");
+            return;
+        };
+        let mut g = Gen::new(0x5EED_2027);
+        let mut checked = 0usize;
+        let mut empty_tails = 0usize;
+        for _ in 0..300 {
+            let (ip1, t1) = g.parse(true);
+            let (_ip2, t2) = g.parse(true); // the closing request may ride onto its end
+            let input1 = g.input.clone();
+            let input2 = g.input.clone();
+            if ip1 == input1.len() {
+                empty_tails += 1;
+            }
+            let input = [input1.as_slice(), input2.as_slice()].concat();
+            let mut block = Vec::new();
+            let n = lz77_block_from_requests(
+                &input,
+                &[(&t1, input1.len()), (&t2, input2.len())],
+                &mut block,
+            )
+            .unwrap_or_else(|e| panic!("combined rebuild: {e}"));
+            let mut dst = vec![0u8; input.len()];
+            let m = fns
+                .decompress_block(&block[..n], &mut dst)
+                .unwrap_or_else(|e| panic!("stock rejected a joined block: {e}"));
+            assert_eq!(m, input.len());
+            assert_eq!(&dst[..m], &input);
+            checked += 1;
+        }
+        assert!(
+            checked > 100 && empty_tails > 0,
+            "checked {checked}, empty tails {empty_tails}"
+        );
+    }
+
+    /// The stock-rule stream walk names each fault class the stock
+    /// decoder enforces and clears the peeled join block.
+    #[test]
+    fn stock_rule_walk_judges_the_known_faults() {
+        let input = vec![b'x'; 64];
+
+        // a match ending on the block end: the stream after its literals
+        // is under 8 bytes, so stock's closing-run arm names it (the
+        // 5-byte arm never fires first — a match this close to the end
+        // always leaves under 8 bytes behind)
+        let seqs = [
+            triple(1, 2, 13),                   // 2 literals + 16-byte match
+            triple(1, 0, (64 - 18 - 3) as u16), // rides onto the input end
+        ]
+        .concat();
+        let block = rebuild(&input, &seqs);
+        let e = stock_rule_violation(input.len(), &block)
+            .expect("the riding match must be named");
+        assert!(
+            e.contains("stock demands the closing run") || e.contains("last 5 bytes literal"),
+            "{e}"
+        );
+
+        // a match starting within the last 12 bytes
+        let seqs = [triple(1, 59, 2)].concat();
+        let block = rebuild(&input, &seqs);
+        let e = stock_rule_violation(input.len(), &block)
+            .expect("the near-end match must be named");
+        assert!(e.contains("stock demands the closing run"), "{e}");
+
+        // a stream truncated before the closing run
+        let e = stock_rule_violation(input.len(), &block[..block.len() / 2])
+            .expect("truncation must be named");
+        assert!(e.contains("closing") || e.contains("off the stream"), "{e}");
+
+        // a legal stream clears
+        let t1 = [triple(1, 4, 10)].concat();
+        let input1 = vec![b'a'; 32];
+        let input2 = vec![b'b'; 48];
+        let t2 = [
+            triple(1, 4, 10),
+            triple(1, 0, 28), // rides onto the input end — the join peels it
+        ]
+        .concat();
+        let joined = [input1.as_slice(), input2.as_slice()].concat();
+        let mut block = Vec::new();
+        let n = lz77_block_from_requests(
+            &joined,
+            &[(&t1, input1.len()), (&t2, input2.len())],
+            &mut block,
+        )
+        .expect("joined rebuild");
+        assert_eq!(stock_rule_violation(joined.len(), &block[..n]), None);
     }
 
     /// A minimal greedy lz77 parser over the input, emitting triples in

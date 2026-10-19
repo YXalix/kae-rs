@@ -235,7 +235,9 @@ fn nativesw_hw_segment_roundtrip() {
             let mut restored = vec![0u8; plain_len];
             let n = sw
                 .decompress(&packed[off..off + l], &mut restored)
-                .unwrap_or_else(|e| panic!("block {block} entry {i}: stock decode: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("block {block} entry {i} ({l}B): stock decode: {e}")
+                });
             assert_eq!(n, plain_len, "block {block} entry {i}");
             assert_bit_exact(
                 &format!("block {block} entry {i}"),
