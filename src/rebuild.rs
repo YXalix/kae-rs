@@ -238,10 +238,13 @@ pub(crate) fn audit_triples(
 /// marker), so the per-request streams are never spliced: the triples
 /// walk ONCE over the whole block, and at each request boundary the
 /// previous request's unconsumed tail (its parse never covers the
-/// MFLIMIT bytes) is charged into the next match's literal length. That
-/// keeps every match sitting at `prior request lengths + its local
-/// position`, which is exactly where its offset references the same data
-/// it referenced inside its own request. Returns the block length.
+/// MFLIMIT bytes) is charged into the next match's literal length. A
+/// fold chain left dangling by the request's end is dropped there: its
+/// bytes sit inside that tail, so charging both would shift the next
+/// request's whole parse. That keeps every match sitting at `prior
+/// request lengths + its local position`, which is exactly where its
+/// offset references the same data it referenced inside its own
+/// request. Returns the block length.
 pub(crate) fn lz77_block_from_requests(
     input: &[u8],
     requests: &[(&[u8], usize)],
@@ -301,7 +304,11 @@ pub(crate) fn lz77_block_from_requests(
             }
             ip += ml;
         }
-        skip += boundary - ip;
+        // a fold chain open at the request's end claims bytes the tail
+        // charge below already covers; the per-request rebuild drops it
+        // into the closing tail run the same way
+        pending = 0;
+        skip += boundary.saturating_sub(ip);
     }
     if ip > input.len() {
         return Err(format!(
@@ -356,8 +363,9 @@ pub(crate) fn trace_triples(input_len: usize, seqs: &[u8]) -> String {
 /// Walk one request's triples exactly the way the rebuild does and
 /// report the consumed end and the fold-row count — the numbers a failed
 /// rebuild check needs to judge each request's boundary charge. The
-/// pending fold credit rides into the next match (or the next request),
-/// so it is not part of the consumed end.
+/// pending fold credit rides into the next match within the request and
+/// is dropped at the request's end (its bytes are tail bytes), so it is
+/// not part of the consumed end.
 pub(crate) fn walk_stats(seqs: &[u8]) -> (usize, usize) {
     let mut pending = 0usize;
     let mut ip = 0usize;
@@ -827,6 +835,40 @@ mod tests {
             }
             (ip, triples)
         }
+    }
+
+    /// A request that ends ON a fold must not carry its credit into the
+    /// next request: the fold's bytes sit inside the MFLIMIT tail the
+    /// boundary charge already covers, so carrying it shifts the whole
+    /// next request and every offset copies from before its true source.
+    #[test]
+    fn request_ending_on_a_fold_drops_its_credit_at_the_boundary() {
+        // request 1: a match to 10, then a fold whose credit claims
+        // 10..17 — all inside the 22-byte unparsed tail of the 32B input
+        let t1 = [triple(2, 2, 5), triple(0, 4, 0)].concat();
+        let input1 = b"abababababzzzzzzzzzzzzzzzzzzzzzz";
+        audit_triples(input1, &t1, None).expect("request 1 parse");
+
+        // request 2: a match at 4 (offset 3) whose source moves if the
+        // walk shifts by the 7-byte credit
+        let t2 = [triple(3, 4, 1)].concat();
+        let input2 = b"ABCDBCDBEFGHIJKLMNOPQRSTUVWXYZ012345";
+        audit_triples(input2, &t2, None).expect("request 2 parse");
+
+        let input = [input1.as_slice(), input2.as_slice()].concat();
+        let mut block = Vec::new();
+        let n = lz77_block_from_requests(
+            &input,
+            &[(&t1, input1.len()), (&t2, input2.len())],
+            &mut block,
+        )
+        .unwrap_or_else(|e| panic!("combined rebuild: {e}"));
+        let mut dst = vec![0u8; input.len()];
+        assert_eq!(
+            crate::lz4dec::decode_block(&block[..n], &mut dst).expect("combined decode"),
+            input.len()
+        );
+        assert_eq!(&dst, &input);
     }
 
     /// The property the bench's block assembly stands on: per-request
