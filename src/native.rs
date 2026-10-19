@@ -214,16 +214,9 @@ impl KaeNative {
     /// in [`KaeNative::last_hw_error`]. A wedged queue sticks the handle
     /// in software mode ([`KaeNative::stuck`]).
     pub fn compress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, KaeError> {
-        if self.pump.is_none() || self.stuck || src.len() < MIN_HW_INPUT {
+        if !self.hw_eligible(src) {
             self.sw_requests += 1;
             return soft_block(src, dst, self.stuck.then(|| "engine_unresponsive".into()));
-        }
-        // a remainder chunk below the minimum input would underflow the
-        // parse length: such a block goes to software whole
-        let remainder = src.len() % self.req_size;
-        if remainder != 0 && remainder < MIN_HW_INPUT {
-            self.sw_requests += 1;
-            return soft_block(src, dst, None);
         }
         match self.compress_hw(src, dst) {
             Ok(n) => {
@@ -239,14 +232,18 @@ impl KaeNative {
         }
     }
 
-    /// Compress a whole segment: the whole `block`-size blocks go through
-    /// the engine as a ring of in-flight requests (the depth knob), the
-    /// trailing partial block and any block whose requests fail go through
-    /// the software engine. `packed` (cleared first) receives the blocks'
-    /// compressed bytes concatenated in block order followed by the tail,
-    /// and the returned lengths match one-to-one (one entry per whole
-    /// block, the tail's length last) — the `AsyncBatch::compress_segment`
-    /// shape.
+    /// Compress a whole segment in ONE ring pass: every hardware-eligible
+    /// block's requests enter the in-flight ring together (waved at the
+    /// queue depth inside `request_batch` — the depth, not the call
+    /// granularity, is what hides the chip's per-request latency), then
+    /// each block rebuilds from its samples in one walk. The trailing
+    /// partial block, ineligible blocks, and any block whose requests fail
+    /// or misbuild go through the software engine whole — a finished LZ4
+    /// block always comes from one engine, never a splice. `packed`
+    /// (cleared first) receives the blocks' compressed bytes concatenated
+    /// in block order followed by the tail, and the returned lengths match
+    /// one-to-one (one entry per whole block, the tail's length last) —
+    /// the `AsyncBatch::compress_segment` shape.
     pub fn compress_segment(
         &mut self,
         segment: &[u8],
@@ -262,14 +259,84 @@ impl KaeNative {
         let nblocks = segment.len() / block;
         packed.clear();
         let mut lens = Vec::with_capacity(nblocks + 1);
+
+        // hardware eligibility per block, and the flat chunk list of every
+        // eligible block — ONE ring pass for the whole segment, waved at
+        // the queue depth inside request_batch (per-block batching would
+        // leave a req-size block one request deep, latency-bound again)
+        let req_size = self.req_size;
+        let hw: Vec<bool> = (0..nblocks)
+            .map(|b| self.hw_eligible(&segment[b * block..(b + 1) * block]))
+            .collect();
+        let mut chunks: Vec<&[u8]> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = vec![(0, 0); nblocks];
+        for b in 0..nblocks {
+            if !hw[b] {
+                continue;
+            }
+            let blk = &segment[b * block..(b + 1) * block];
+            let start = chunks.len();
+            let mut off = 0usize;
+            while off < blk.len() {
+                let len = (blk.len() - off).min(req_size);
+                chunks.push(&blk[off..off + len]);
+                off += len;
+            }
+            ranges[b] = (start, chunks.len() - start);
+        }
+        let results = match chunks.is_empty() {
+            true => Vec::new(),
+            false => {
+                let pump = self.pump.as_mut().expect("eligible blocks need a pump");
+                pump.request_batch(&chunks, self.timeout.as_secs_f64())
+            }
+        };
+        // a wedge-class failure sticks the handle: the queue stopped
+        // answering, so later segments should not retry it either
+        for r in &results {
+            if let Err(e) = r {
+                self.stuck |= is_wedge(e);
+                self.last_hw_error = Some(e.clone());
+            }
+        }
+
+        // rebuild every hw block from its samples in one walk; anything
+        // else (ineligible, failed requests, failed rebuild) goes to
+        // software whole — a block never mixes engines
         for b in 0..nblocks {
             let blk = &segment[b * block..(b + 1) * block];
-            let n = self.compress_block_into(blk, packed)?;
+            let n = if hw[b] {
+                let (start, count) = ranges[b];
+                let mine = &results[start..start + count];
+                if mine.iter().all(|r| r.is_ok()) {
+                    let requests: Vec<(&[u8], usize)> = mine
+                        .iter()
+                        .zip(blk.chunks(req_size))
+                        .map(|(r, c)| (r.as_ref().unwrap().seqs.as_slice(), c.len()))
+                        .collect();
+                    match rebuild::lz77_block_from_requests(blk, &requests, &mut self.scratch) {
+                        Ok(n) => {
+                            packed.extend_from_slice(&self.scratch[..n]);
+                            self.hw_requests += 1;
+                            lens.push(n);
+                            continue;
+                        }
+                        Err(e) => Some(e),
+                    }
+                } else {
+                    mine.iter()
+                        .find_map(|r| r.as_ref().err().cloned())
+                }
+            } else {
+                None
+            };
+            let n = self.soft_append(blk, packed, n)?;
             lens.push(n);
         }
         let tail = &segment[nblocks * block..];
         if !tail.is_empty() {
-            lens.push(self.compress_block_into(tail, packed)?);
+            let n = self.soft_append(tail, packed, None)?;
+            lens.push(n);
         }
         Ok(lens)
     }
@@ -288,15 +355,37 @@ impl KaeNative {
         soft::decompress(src, dst).map_err(KaeError::Decompress)
     }
 
-    /// One block through whichever engine takes it, appended to `packed`;
-    /// returns the byte count written. The unit behind both API shapes.
-    fn compress_block_into(&mut self, src: &[u8], packed: &mut Vec<u8>) -> Result<usize, KaeError> {
-        // cycle the staging buffer out so compress can borrow self
-        let mut dst = std::mem::take(&mut self.soft_dst);
-        let r = self.compress(src, &mut dst);
-        self.soft_dst = dst;
-        let n = r?;
+    /// Whether a block can go through the engine: a live, unstuck queue,
+    /// an input the parse can program, and no trailing remainder that would
+    /// underflow it.
+    fn hw_eligible(&self, src: &[u8]) -> bool {
+        if self.pump.is_none() || self.stuck || src.len() < MIN_HW_INPUT {
+            return false;
+        }
+        let remainder = src.len() % self.req_size;
+        remainder == 0 || remainder >= MIN_HW_INPUT
+    }
+
+    /// Software-compress `src` and append it to `packed`; `hw_cause`
+    /// prefixes the fallback reason when the block was diverted from the
+    /// engine. The staging buffer grows to the input's bound on first use.
+    fn soft_append(
+        &mut self,
+        src: &[u8],
+        packed: &mut Vec<u8>,
+        hw_cause: Option<String>,
+    ) -> Result<usize, KaeError> {
+        let need = soft::bound(src.len());
+        if self.soft_dst.len() < need {
+            self.soft_dst.resize(need, 0);
+        }
+        let n = soft::compress(src, &mut self.soft_dst)
+            .map_err(|e| match hw_cause {
+                Some(hw) => KaeError::Compress(format!("{e} (hw fallback cause: {hw})")),
+                None => KaeError::Compress(e),
+            })?;
         packed.extend_from_slice(&self.soft_dst[..n]);
+        self.sw_requests += 1;
         Ok(n)
     }
 
