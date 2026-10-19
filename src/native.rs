@@ -53,7 +53,10 @@ fn debug_ring() -> bool {
 /// chunk holding the first divergence, never the bytes themselves. Three
 /// decoders judge (lz4dec, lz4rip, and — via the walk audit — the triple
 /// rules themselves), because a block that decodes under one and fails
-/// another names the violated rule exactly.
+/// another names the violated rule exactly. Any content fault dumps the
+/// block's full replay kit (per-chunk triples + literal areas + the block
+/// bytes) under /tmp — the input regenerates from the deterministic test
+/// generator, so the triples are the only missing piece offline.
 fn verify_debug(
     input: &[u8],
     block: &[u8],
@@ -62,8 +65,12 @@ fn verify_debug(
     req_size: usize,
 ) {
     let mut plain = vec![0u8; input.len()];
+    let mut fault: Option<String> = None;
     match lz4dec::decode_block(block, &mut plain) {
-        Err(e) => eprintln!("native: block {b} ({}B) lz4dec: {e}", block.len()),
+        Err(e) => {
+            eprintln!("native: block {b} ({}B) lz4dec: {e}", block.len());
+            fault = Some(format!("lz4dec: {e}"));
+        }
         Ok(m) if &plain[..m] != input => {
             let d = plain[..m].iter().zip(input).position(|(a, b)| a != b);
             eprintln!(
@@ -71,17 +78,22 @@ fn verify_debug(
                 block.len(),
                 d.map(|d| d / req_size).unwrap_or(usize::MAX),
             );
+            fault = Some("lz4dec content diff".into());
         }
         Ok(_) => {}
     }
     match soft::decompress(block, &mut plain) {
-        Err(e) => eprintln!("native: block {b} lz4rip: {e}"),
+        Err(e) => {
+            eprintln!("native: block {b} lz4rip: {e}");
+            fault.get_or_insert_with(|| format!("lz4rip: {e}"));
+        }
         Ok(m) if &plain[..m] != input => {
             let d = plain[..m].iter().zip(input).position(|(a, b)| a != b);
             eprintln!(
                 "native: block {b} lz4rip: decodes {m}B, first diff at {d:?} (chunk {})",
                 d.map(|d| d / req_size).unwrap_or(usize::MAX),
             );
+            fault.get_or_insert("lz4rip content diff".into());
         }
         Ok(_) => {}
     }
@@ -98,38 +110,42 @@ fn verify_debug(
             eprintln!("native: block {b} chunk {r}: {a}");
         }
     }
-    // the permissive decoders above decode past the stock library's
-    // last-match restrictions; name the offending sequence if the rebuilt
-    // block would fail the stock read path, and drop the triples for an
-    // offline replay (the input regenerates from the deterministic test
-    // generator)
     if let Some(v) = rebuild::stock_rule_violation(input.len(), block) {
         eprintln!("native: block {b} stock-rule walk: {v}");
-        for (r, s) in samples.iter().enumerate() {
-            let Ok(s) = s else { continue };
-            let len = req_size.min(input.len() - r * req_size);
-            let (walked, folds) = rebuild::walk_stats(&s.seqs);
-            eprintln!(
-                "native: block {b} chunk {r}: walk end {walked}/{len} (tail {}B), folds {folds}",
-                len - walked
-            );
-            let dir = format!("/tmp/kae_fail_block{b}");
-            let path = format!("{dir}/chunk{r}.txt");
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let _ = std::fs::write(
-                    &path,
-                    format!(
-                        "input {len}B\nseqs {} triples: {}\nlits {}B: {}\n",
-                        s.seqs.len() / 8,
-                        hex(&s.seqs),
-                        s.lits.len(),
-                        hex(&s.lits),
-                    ),
-                );
-                eprintln!("native: block {b} chunk {r}: dumped {path}");
-            }
-        }
+        fault.get_or_insert(format!("stock rule: {v}"));
     }
+    let Some(v) = fault else { return };
+    eprintln!("native: block {b}: fault {v:?}; dumping replay kit");
+    let dir = format!("/tmp/kae_fail_block{b}");
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("native: block {b}: cannot create {dir}");
+        return;
+    }
+    let _ = std::fs::write(format!("{dir}/block.hex"), hex(block));
+    for (r, s) in samples.iter().enumerate() {
+        let Ok(s) = s else { continue };
+        let len = req_size.min(input.len() - r * req_size);
+        let (walked, folds) = rebuild::walk_stats(&s.seqs);
+        eprintln!(
+            "native: block {b} chunk {r}: walk end {walked}/{len} (tail {}B), folds {folds}, {} triples",
+            len.saturating_sub(walked),
+            s.seqs.len() / 8,
+        );
+        let _ = std::fs::write(
+            format!("{dir}/chunk{r}.txt"),
+            format!(
+                "input {len}B\nseqs {} triples: {}\nlits {}B: {}\n",
+                s.seqs.len() / 8,
+                hex(&s.seqs),
+                s.lits.len(),
+                hex(&s.lits),
+            ),
+        );
+    }
+    eprintln!(
+        "native: block {b}: kit in {dir} (block {}B, req_size {req_size}; input is the test's make_mixed segment)",
+        block.len()
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {
