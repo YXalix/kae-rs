@@ -82,7 +82,7 @@ fn hw_block_roundtrip_matrix() {
                 .decompress(&compressed, &mut restored)
                 .expect("decompress");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
-            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+            assert_bit_exact(&format!("{name}/{size}"), &restored[..n], &block);
         }
     }
 
@@ -122,7 +122,7 @@ fn hw_output_roundtrips_through_stock_liblz4() {
                 .decompress(&packed, &mut restored)
                 .expect("stock decompress of hw output");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
-            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+            assert_bit_exact(&format!("{name}/{size}"), &restored[..n], block);
         }
 
         // and stock-compressed output must decode on the patched library
@@ -133,7 +133,7 @@ fn hw_output_roundtrips_through_stock_liblz4() {
                 .decompress(&packed, &mut restored)
                 .expect("patched decompress of stock output");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
-            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+            assert_bit_exact(&format!("{name}/{size}"), &restored[..n], block);
         }
     }
 }
@@ -204,7 +204,7 @@ fn nativesw_output_roundtrips_through_stock_liblz4() {
                 .decompress(&packed, &mut restored)
                 .expect("stock decompress of native output");
             assert_eq!(n, size, "{name}/{size}: decompressed length");
-            assert_eq!(&restored[..n], &block[..], "{name}/{size}: bit-exact match");
+            assert_bit_exact(&format!("{name}/{size}"), &restored[..n], &block);
         }
     }
 }
@@ -277,8 +277,21 @@ fn nativesw_hw_segment_roundtrip() {
 
     // 24 whole blocks + one software tail per block size, plus the deep
     // segment whose blocks all went through the engine
-    assert!(nat.hw_requests() >= 24 + 2050, "hw={}", nat.hw_requests());
-    assert_eq!(nat.sw_requests(), 4, "one tail per block size: {nat:?}");
+    assert!(
+        nat.hw_requests() >= 24 + 2050,
+        "hw={} sw={} stuck={} last_hw_error={:?} engine={}",
+        nat.hw_requests(),
+        nat.sw_requests(),
+        nat.stuck(),
+        nat.last_hw_error(),
+        nat.engine_note()
+    );
+    assert_eq!(
+        nat.sw_requests(),
+        4,
+        "one tail per block size (last_hw_error={:?})",
+        nat.last_hw_error()
+    );
     assert!(!nat.stuck());
 }
 
@@ -320,7 +333,15 @@ fn nativesw_handle_pool_roundtrip() {
                         hi / block - t * per,
                         "handle {t}: one entry per share block"
                     );
-                    assert_eq!(nat.sw_requests(), 0, "handle {t}: no fallback");
+                    assert!(
+                        nat.sw_requests() == 0,
+                        "handle {t}: no fallback, got sw={} hw={} stuck={} last_hw_error={:?} engine={}",
+                        nat.sw_requests(),
+                        nat.hw_requests(),
+                        nat.stuck(),
+                        nat.last_hw_error(),
+                        nat.engine_note()
+                    );
                     Ok((lens, packed))
                 })
             })
@@ -465,9 +486,12 @@ fn hw_native_produce_segment_roundtrip() {
     }
     assert!(
         nat.hw_requests() > 0 && nat.sw_requests() == 0,
-        "every block rode the engine: hw={} sw={}",
+        "every block rode the engine: hw={} sw={} stuck={} last_hw_error={:?} engine={}",
         nat.hw_requests(),
-        nat.sw_requests()
+        nat.sw_requests(),
+        nat.stuck(),
+        nat.last_hw_error(),
+        nat.engine_note()
     );
 }
 

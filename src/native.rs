@@ -193,7 +193,7 @@ pub struct KaeNative {
     scratch: Vec<u8>,
     /// Per-input-buffer triples staging for the segment pass, reused
     /// across calls (sized to the pump's depth on first use).
-    stream_seqs: Vec<Vec<u8>>,
+    pass_seqs: Vec<Vec<u8>>,
     /// Streaming-submit doorbell batch (`KAE_NATIVE_DB_BATCH`, default the
     /// in-flight depth).
     db_batch: usize,
@@ -292,7 +292,7 @@ impl KaeNative {
                 timeout,
                 pump: None,
                 scratch: Vec::new(),
-                stream_seqs: Vec::new(),
+                pass_seqs: Vec::new(),
                 db_batch,
                 soft_dst: vec![0u8; soft::bound(req_size)],
                 hw_requests: 0,
@@ -317,7 +317,7 @@ impl KaeNative {
                     timeout,
                     pump: Some(pump),
                     scratch: Vec::new(),
-                    stream_seqs: Vec::new(),
+                    pass_seqs: Vec::new(),
                     db_batch,
                     soft_dst: vec![0u8; soft::bound(req_size)],
                     hw_requests: 0,
@@ -333,7 +333,7 @@ impl KaeNative {
                 timeout,
                 pump: None,
                 scratch: Vec::new(),
-                stream_seqs: Vec::new(),
+                pass_seqs: Vec::new(),
                 db_batch,
                 soft_dst: vec![0u8; soft::bound(req_size)],
                 hw_requests: 0,
@@ -547,8 +547,12 @@ impl KaeNative {
         // KAE_NATIVE_DEBUG_RING — the full sample of every chunk (literal
         // area included) for the verifier
         let depth = self.pump.as_ref().map(|p| p.depth()).unwrap_or(0);
-        if self.stream_seqs.len() != depth {
-            self.stream_seqs = (0..depth).map(|_| Vec::new()).collect();
+        // triples stage per CHUNK, never per slot: with out-of-order
+        // completions a released slot can be refilled and reaped again
+        // before an earlier block has rebuilt, and slot-keyed staging
+        // would hand that block the refiller's triples
+        if self.pass_seqs.len() != chunk_lens.len() {
+            self.pass_seqs = (0..chunk_lens.len()).map(|_| Vec::new()).collect();
         }
         let mut chunk_ring = vec![usize::MAX; chunk_lens.len()];
         let mut ring_chunk: Vec<Option<usize>> = vec![None; depth];
@@ -658,7 +662,7 @@ impl KaeNative {
                             }
                         }
                     } else {
-                        pump.read_seqs(ring, in_len, &mut self.stream_seqs[slot])
+                        pump.read_seqs(ring, in_len, &mut self.pass_seqs[c])
                     };
                     if matches!(source, PassSource::Slices(_)) {
                         pump.release(ring);
@@ -688,7 +692,7 @@ impl KaeNative {
                                 Some(v) => {
                                     v[c].as_ref().map(|s| s.seqs.as_slice()).unwrap_or(&[])
                                 }
-                                None => &self.stream_seqs[chunk_ring[c] % depth],
+                                None => &self.pass_seqs[c],
                             };
                             (seqs, chunk_lens[c])
                         })

@@ -1103,12 +1103,13 @@ impl NativePump {
                 slot_buf[..chunk.len()].copy_from_slice(chunk);
                 q.submit_len(self.batch.max(1), 1, chunk.len(), true);
             }
-            // wait the whole wave out. Completions are FIFO on one queue
-            // (the vendor stack matches responses by CQ position alone),
-            // so wave position j reads the ring submitted at j — the ring
-            // logging under KAE_NATIVE_DEBUG_RING exists to re-examine
-            // that assumption from the hardware's own words if a block
-            // ever misbuilds again.
+            // wait the whole wave out. Completions are NOT in submission
+            // order (cheaper requests finish first), so every result is
+            // paired by the CQE's `sq_head` — the completed SQE's ring
+            // index — and slotted back to its wave position; reading by
+            // position corrupts any wave whose requests cost differently.
+            // The ring logging under KAE_NATIVE_DEBUG_RING keeps the
+            // arrival order visible.
             let wave_start = start % QM_Q_DEPTH;
             let debug_ring = std::env::var("KAE_NATIVE_DEBUG_RING").as_deref() == Ok("1");
             let mut done: Vec<usize> = Vec::with_capacity(n);
@@ -1144,9 +1145,10 @@ impl NativePump {
                     done
                 );
             }
-            for (j, chunk) in wave.iter().enumerate() {
-                let ring = (wave_start + j) % QM_Q_DEPTH;
-                out.push(q.read_result(ring, chunk.len()));
+            out.extend((0..n).map(|_| Err("request_not_completed".into())));
+            for ring in done.drain(..) {
+                let j = (ring + QM_Q_DEPTH - wave_start) % QM_Q_DEPTH;
+                out[k + j] = q.read_result(ring, wave[j].len());
             }
             k += n;
         }
