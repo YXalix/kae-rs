@@ -105,11 +105,14 @@ Semantics:
   request) go to software whole: the engine's lz77 parse programs
   `in_len - 12`.
 - **Segment batch is the throughput shape**: `compress_segment(&segment,
-  block, &mut packed)` drives the whole segment's blocks through the
+  block, &mut packed)` streams the whole segment's blocks through the
   in-flight ring (depth from `KAE_NATIVE_DEPTH`, default 8) in one call —
-  the depth is what hides the engine's per-request latency, which the
-  per-block `compress` loop structurally cannot (it always drains before
-  the next block). Packing and returned lengths mirror
+  each completion frees its buffer and the next chunk refills it, so the
+  depth hides the engine's per-request latency across the whole segment,
+  which the per-block `compress` loop structurally cannot (it always
+  drains before the next block). Completions pair by the CQE's `sq_head`,
+  never by arrival order, and blocks pack in block order whatever the
+  arrival pattern. Packing and returned lengths mirror
   `AsyncBatch::compress_segment`: concatenated block bytes in order, the
   tail last, one length per entry. Any block whose requests fail goes to
   software whole; the tail always does.
@@ -192,7 +195,10 @@ All failures surface as `kae::KaeError` (implements `std::error::Error` +
 | `KAE_LZ4_ASYNC_THREAD_NUM` | async engine init | Library thread pool size |
 | `KAE_LZ4_ASYNC_DC_THREAD_NUM` | libkaelz4 | Additional libkaelz4 tuning (not set by `configure`) |
 | `KAE_NATIVE_TIMEOUT_MS` | `KaeNative::open` | Per-request engine completion wait before the block falls back to software (default 500) |
-| `KAE_NATIVE_DEPTH` / `KAE_NATIVE_DB_BATCH` / `KAE_NATIVE_WAIT` / `KAE_NATIVE_ALG` | the bench worker | Native bench pump knobs (see [native-bench.md](native-bench.md)) |
+| `KAE_NATIVE_DEPTH` | `KaeNative::open_with`, the bench worker | In-flight requests per queue (default 8) |
+| `KAE_NATIVE_DB_BATCH` | `KaeNative::open_with`, the bench worker | Doorbell batch (default: the depth) |
+| `KAE_NATIVE_WAIT` | `KaeNative::open_with`, the bench worker | Wait policy — `spin` for busy reaping, else `poll` (bench default spin, `KaeNative` default poll) |
+| `KAE_NATIVE_ALG` | the bench worker | Native bench pump knobs (see [native-bench.md](native-bench.md)) |
 
 ## Integration shape (AgentENV zfile WorkerPool)
 
@@ -211,3 +217,35 @@ With `kae` as an optional dependency, the natural insertion points are:
   then per segment call `compress_segment(&segment, 4096, &mut packed)` and
   split `packed` by the returned lengths. Errors are explicit — the
   crate never silently degrades the async path to software.
+- **Per segment, zero-C, pooled (`KaeNative`):** the scaling shape — one
+  `KaeNative` handle per worker thread, opened with
+  `KaeNative::open_on(thread_index, 4096)` (the index wraps over
+  `kae::native_device_count()`, spreading the handles round-robin over
+  the devices). Each handle's queue context is assigned at its own device
+  open, so every handle is one queue and the pool width is the worker
+  count — a device hosts many queues, so threads beyond the device count
+  still get their own queue on the wrapped device. Each handle streams
+  its shard with `compress_segment`; shard outputs concatenate in shard
+  order, which is the same byteshape a single-segment call returns.
+  Handles that fail to open a queue degrade to software (`backend()` /
+  the bench note's `mode=mixed` names it), which is what a pool wider
+  than the silicon's queue capacity looks like. `examples/native_pool.rs`
+  is the whole shape. The bench cell `--impl nativesw --workers N` measures
+  exactly this (`KAE_NATIVE_SHAPE=block` pins the single-handle loop).
+- **Per segment, zero-C, produced (`KaeNative::compress_segment_from`):**
+  the no-copy submit shape. The producer callback fills each claimed
+  input buffer — the engine's own DMA-visible slots — directly, so bytes
+  land where the chip reads them and the pump thread harvests and
+  rebuilds instead of memcpying: a producer that can target the handed
+  buffer (a `pread`, an upstream stage's output) removes the pump-side
+  copy `compress_segment` performs per chunk. `nblocks` blocks of
+  `block` bytes are consumed in stream order, whole fills only; the
+  lengths carry exactly `nblocks` entries (no tail counterpart). A
+  block's buffers stay claimed until the block resolves — until then
+  they hold the only copy of its bytes, and the rebuild reads the
+  literals back out of the slots it was parsed from. Failure semantics
+  are the segment pass's: a failing block stages itself (unsubmitted
+  chunks re-produced, submitted ones gathered from their slots) and goes
+  through the software engine whole. `examples/native_produce.rs` is the
+  shape with a pread producer; the bench cell `KAE_NATIVE_SHAPE=produce`
+  measures it with the memcpy control.

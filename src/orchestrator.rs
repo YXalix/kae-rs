@@ -97,13 +97,15 @@ usage: kae-bench [options]
                     lz77 pump; decompress: lz4rip decode of the rebuilt blocks), no
                     C library in the process; soft = the pure-Rust lz4rip engine,
                     any machine; nativesw = the production engine path
-                    (compress_segment batch through the in-flight ring,
-                    per-block software fallback; KAE_NATIVE_SHAPE=block
+                    (compress_segment streaming pass through the in-flight
+                    ring, per-block software fallback; KAE_NATIVE_SHAPE=block
                     keeps the per-block loop) — runs everywhere, degrading
                     to soft without a ZIP device)
   --workers N       threads per sw/hw cell (default 1 = the sync drop-in); >1 turns sw/hw into
-                    --workers-threaded block pools (the zfile WorkerPool shape) and sets hwasync's
-                    library thread pool (KAE_LZ4_ASYNC_THREAD_NUM)
+                    --workers-threaded block pools (the zfile WorkerPool shape), sets hwasync's
+                    library thread pool (KAE_LZ4_ASYNC_THREAD_NUM), and runs the nativesw segment
+                    cell as a one-handle-per-thread pool (one queue each, round-robin over the
+                    zip devices; KAE_NATIVE_SHAPE=block keeps the single-handle loop)
   --ops LIST        operations: compress,decompress (default both)
   --sw-lz4-lib P    software liblz4 path (default liblz4.so.1 via loader search)
   --hw-lz4-lib P    KAE patched liblz4 path (default: probe /usr/local/kaelz4/lib/)
@@ -980,8 +982,9 @@ fn sweep_context(cfg: &Config, exe: &Path) -> Vec<String> {
 }
 
 /// The experiment series: E1 baseline, the depth ladder, queue scaling,
-/// both wait policies at depth 8, the doorbell tax, and the sustained
-/// small-block scan. Every native run pins depth/batch/wait explicitly.
+/// both wait policies at depth 8, the doorbell tax, the sustained
+/// small-block scan, and the nativesw handle-pool ladder. Every native
+/// run pins depth/batch/wait explicitly.
 fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
     let base = || -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
@@ -1092,6 +1095,36 @@ fn sweep_experiments(cfg: &Config) -> Vec<SweepExp> {
         args: a,
         env: knobs(8, 8, "spin"),
     });
+    // the nativesw handle-pool ladder: one handle (one engine queue) per
+    // thread, round-robin over the devices — where extra queues stop
+    // paying is what sizes the zfile worker pool. Production wait policy:
+    // the handle defaults to poll, depth 8, doorbell batch = depth.
+    let pool = |workers: usize, blocks: &str| -> Vec<String> {
+        let mut a = base();
+        a.extend([
+            "--impl".to_string(),
+            "nativesw".to_string(),
+            "--workers".to_string(),
+            workers.to_string(),
+            "--blocks".to_string(),
+            blocks.to_string(),
+            "--min-sec".to_string(),
+            SWEEP_MIN_SEC.to_string(),
+        ]);
+        a
+    };
+    for q in [2usize, 4, 8] {
+        exps.push(SweepExp {
+            name: format!("e8-nativesw-q{q}"),
+            args: pool(q, &b64),
+            env: knobs(8, 8, "poll"),
+        });
+    }
+    exps.push(SweepExp {
+        name: "e9-nativesw-q4-8k".into(),
+        args: pool(4, "8192"),
+        env: knobs(8, 8, "poll"),
+    });
     exps
 }
 
@@ -1158,6 +1191,34 @@ fn sweep_readings(tsv_dir: &Path) -> Vec<String> {
             ),
             None => format!("2q at 8K: {:.2} GB/s", q2.gbps),
         });
+    }
+    let mut pool: Vec<(usize, f64)> = Vec::new();
+    if let Some(r) = read_tsv_rows(&tsv_dir.join("e1-base.tsv")).into_iter().find(
+        |r| {
+            r.op == "compress"
+                && r.status == "OK"
+                && r.impl_name == "nativesw"
+                && r.block == SWEEP_BLOCK as u64
+        },
+    ) {
+        pool.push((1, r.gbps));
+    }
+    for q in [2usize, 4, 8] {
+        if let Some(r) = ok_row(&format!("e8-nativesw-q{q}")) {
+            pool.push((q, r.gbps));
+        }
+    }
+    if pool.len() > 1 {
+        v.push(format!(
+            "nativesw handle pool (64K, poll d8): {}",
+            pool.iter()
+                .map(|(q, g)| format!("{q}q {g:.2}"))
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        ));
+    }
+    if let Some(r) = ok_row("e9-nativesw-q4-8k") {
+        v.push(format!("nativesw 4 handles at 8K: {:.2} GB/s", r.gbps));
     }
     v
 }

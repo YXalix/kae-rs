@@ -33,6 +33,55 @@ const RUN_MASK: usize = 15;
 const ML_BITS: usize = 4;
 const ML_MASK: usize = 15;
 
+/// The bytes one rebuilt block's literals are read from: the block
+/// contiguously ([`ContiguousBytes`], the caller's segment), or the
+/// streaming produce pass's claimed input slots ([`ScatteredBytes`]) —
+/// per-chunk buffers that concatenate, in request order, to exactly the
+/// bytes the engine parsed, and that stay held until the block resolves.
+pub(crate) trait BlockBytes {
+    /// The block length the source covers.
+    fn len(&self) -> usize;
+    /// Feed `start..end`'s bytes to `sink` as one or more contiguous
+    /// pieces (a scattered source splits at its chunk boundaries).
+    fn feed(&self, start: usize, end: usize, sink: &mut dyn FnMut(&[u8]));
+}
+
+/// A whole block in one slice.
+pub(crate) struct ContiguousBytes<'a>(pub &'a [u8]);
+
+impl BlockBytes for ContiguousBytes<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn feed(&self, start: usize, end: usize, sink: &mut dyn FnMut(&[u8])) {
+        sink(&self.0[start..end]);
+    }
+}
+
+/// A block scattered over per-chunk buffers, in request order.
+pub(crate) struct ScatteredBytes<'a> {
+    pub chunks: &'a [&'a [u8]],
+}
+
+impl BlockBytes for ScatteredBytes<'_> {
+    fn len(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
+    fn feed(&self, start: usize, end: usize, sink: &mut dyn FnMut(&[u8])) {
+        let mut pos = 0usize;
+        for chunk in self.chunks {
+            let chunk_end = pos + chunk.len();
+            if chunk_end > start && pos < end {
+                sink(&chunk[start.max(pos) - pos..end.min(chunk_end) - pos]);
+            }
+            pos = chunk_end;
+            if pos >= end {
+                break;
+            }
+        }
+    }
+}
+
 /// Rebuild one request's triples (`seqs*8` bytes) against its original
 /// `input` into `out` (cleared first); returns the LZ4 block length. The
 /// test-side reference for the walk [`lz77_block_from_requests`] applies
@@ -234,27 +283,33 @@ pub(crate) fn audit_triples(
     Ok(())
 }
 
-/// Rebuild one bench block from its requests' triples. The requests'
-/// inputs are consecutive slices of `input`; `requests` carries each
-/// request's (triples, input length) in order. A finished LZ4 block is
-/// not composable (its closing literal run is a parser-level end
-/// marker), so the per-request streams are never spliced: the triples
-/// walk ONCE over the whole block, and at each request boundary the
-/// previous request's unconsumed tail (its parse never covers the
-/// MFLIMIT bytes) is charged into the next match's literal length. A
-/// fold chain left dangling by the request's end is dropped there: its
-/// bytes sit inside that tail, so charging both would shift the next
-/// request's whole parse. That keeps every match sitting at `prior
-/// request lengths + its local position`, which is exactly where its
-/// offset references the same data it referenced inside its own
-/// request. Returns the block length.
-pub(crate) fn lz77_block_from_requests(
-    input: &[u8],
+/// Write one literal run: token, length bytes, then the run's `lit`
+/// bytes fed from `view` at `at` — one token covers the run whatever
+/// piece boundaries the feed splits it at. Returns the token position for
+/// the caller's match-length patch.
+fn push_literals(out: &mut Vec<u8>, view: &dyn BlockBytes, at: usize, lit: usize) -> usize {
+    let token = out.len();
+    out.push(0);
+    if lit >= RUN_MASK {
+        out[token] = (RUN_MASK << ML_BITS) as u8;
+        push_extension(out, lit - RUN_MASK);
+    } else {
+        out[token] = (lit << ML_BITS) as u8;
+    }
+    view.feed(at, at + lit, &mut |piece| out.extend_from_slice(piece));
+    token
+}
+
+/// The rebuild walk over any [`BlockBytes`] literal source —
+/// [`lz77_block_from_requests`] is the contiguous form.
+pub(crate) fn lz77_block_from_views(
+    view: &dyn BlockBytes,
     requests: &[(&[u8], usize)],
     out: &mut Vec<u8>,
 ) -> Result<usize, String> {
-    out.clear();
-    out.reserve(input.len() + input.len() / 255 + 16);
+    let input_len = view.len();
+    let base = out.len();
+    out.reserve(input_len + input_len / 255 + 16);
 
     let mut pending = 0usize;
     let mut ip = 0usize; // global walk position
@@ -289,17 +344,18 @@ pub(crate) fn lz77_block_from_requests(
             // request's parse can ride a match onto its input end, so the
             // last stretch peels into the closing literal run — identical
             // bytes, a stream stock liblz4 accepts.
-            if boundary == input.len() && ip + lit + ml > input.len().saturating_sub(12) {
-                push_literal_run(out, &input[ip..]);
-                return Ok(out.len());
+            if boundary == input_len && ip + lit + ml > input_len.saturating_sub(12) {
+                let at = ip;
+                push_literals(out, view, at, input_len - at);
+                return Ok(out.len() - base);
             }
-            if ip + lit > input.len() {
+            if ip + lit > input_len {
                 return Err(format!(
                     "triple literals overrun the input (at {ip}+{lit}/{}B)",
-                    input.len()
+                    input_len
                 ));
             }
-            let token = push_literal_run(out, &input[ip..ip + lit]);
+            let token = push_literals(out, view, ip, lit);
             ip += lit;
             if off > ip {
                 return Err(format!(
@@ -324,15 +380,39 @@ pub(crate) fn lz77_block_from_requests(
         pending = 0;
         skip += boundary.saturating_sub(ip);
     }
-    if ip > input.len() {
+    if ip > input_len {
         return Err(format!(
             "triples consume {}B of a {}B input",
-            ip,
-            input.len()
+            ip, input_len
         ));
     }
-    push_literal_run(out, &input[ip..]);
-    Ok(out.len())
+    push_literals(out, view, ip, input_len - ip);
+    Ok(out.len() - base)
+}
+
+/// Rebuild one LZ4 block from the whole block's requests: `input` is the
+/// block the engine parsed, `requests` its per-request (triples, input
+/// length) pairs in request order, `out` the append target (cleared by
+/// the caller when reused). Returns the block length appended.
+///
+/// A finished LZ4 block is not composable (its closing literal run is a
+/// parser-level end marker), so the per-request streams are never
+/// spliced: the triples walk ONCE over the whole block, and at each
+/// request boundary the previous request's unconsumed tail (its parse
+/// never covers the MFLIMIT bytes) is charged into the next match's
+/// literal length. A fold chain left dangling by the request's end is
+/// dropped there: its bytes sit inside that tail, so charging both would
+/// shift the next request's whole parse. That keeps every match sitting
+/// at `prior request lengths + its local position`, which is exactly
+/// where its offset references the same data it referenced inside its
+/// own request. Appends the block to `out` and returns its length — the
+/// caller owns clearing/reusing the buffer.
+pub(crate) fn lz77_block_from_requests(
+    input: &[u8],
+    requests: &[(&[u8], usize)],
+    out: &mut Vec<u8>,
+) -> Result<usize, String> {
+    lz77_block_from_views(&ContiguousBytes(input), requests, out)
 }
 
 /// Walk the triples exactly the way `lz77_block` does and return one line
@@ -523,6 +603,9 @@ fn push_extension(out: &mut Vec<u8>, mut n: usize) {
 /// One literal run: token (match nibble still 0, added by the caller),
 /// literal-length extension, then the literal bytes. Returns the token
 /// position.
+/// The contiguous literal-run writer — the test-side reference walk's
+/// (and the audit's) form of [`push_literals`].
+#[cfg(test)]
 fn push_literal_run(out: &mut Vec<u8>, lits: &[u8]) -> usize {
     let token = out.len();
     out.push(0);
@@ -550,6 +633,81 @@ mod tests {
         t[4..6].copy_from_slice(&(offset.saturating_sub(1) as u16).to_le_bytes());
         t[6..8].copy_from_slice(&ml_base.to_le_bytes());
         t
+    }
+
+    /// The scattered literal source must be byte-identical to the
+    /// contiguous one: same requests, same packed bytes (or the same
+    /// error) whatever chunk split the held slots induce, and every
+    /// `feed` range must reassemble the contiguous slice piece for piece.
+    #[test]
+    fn scattered_bytes_match_contiguous() {
+        let input: Vec<u8> = (0..3000usize).map(|i| (i % 251) as u8).collect();
+
+        // feed equivalence over ranges that straddle, touch, and miss
+        // every chunk boundary of several splits
+        for split in [
+            vec![input.len()],
+            vec![1, input.len() - 1],
+            vec![16, 16, 64, 512, 1000, input.len() - 1608],
+        ] {
+            let mut chunks = Vec::new();
+            let mut off = 0usize;
+            for &len in &split {
+                chunks.push(&input[off..off + len]);
+                off += len;
+            }
+            assert_eq!(off, input.len());
+            let scattered = ScatteredBytes { chunks: &chunks };
+            assert_eq!(scattered.len(), input.len());
+            for start in [0usize, 1, 15, 16, 17, 100, input.len() / 2, input.len() - 1] {
+                for end in [start, start + 1, start + 31, input.len()] {
+                    if end > input.len() {
+                        continue;
+                    }
+                    let mut pieces: Vec<Vec<u8>> = Vec::new();
+                    scattered.feed(start, end, &mut |p| pieces.push(p.to_vec()));
+                    let joined: Vec<u8> = pieces.concat();
+                    assert_eq!(
+                        joined,
+                        &input[start..end],
+                        "feed {start}..{end} over split {split:?}"
+                    );
+                }
+            }
+
+            // the walk consumes the same requests identically either way;
+            // the triples here exercise literal runs, matches, and folds —
+            // validity against the engine is not the property under test
+            let mut x = 0x1234_5678_ABCD_EF01u64;
+            let mut seqs = Vec::new();
+            for _ in 0..300 {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                let lit = (x % 60) as u32;
+                let ml_base = if x & 1 == 0 { 0u16 } else { ((x >> 8) % 30) as u16 + 1 };
+                let off = ((x >> 20) % 200) as usize + 1;
+                seqs.extend_from_slice(&triple(off, lit, ml_base));
+            }
+            let requests: Vec<(&[u8], usize)> = (0..6)
+                .map(|r| {
+                    let s = &seqs[r * 40 * 8..(r + 1) * 40 * 8];
+                    (s, split[r.min(split.len() - 1)])
+                })
+                .collect();
+            let mut from_contiguous = Vec::new();
+            let mut from_scattered = Vec::new();
+            let a = lz77_block_from_requests(&input, &requests, &mut from_contiguous);
+            let b = lz77_block_from_views(&scattered, &requests, &mut from_scattered);
+            match (a, b) {
+                (Ok(na), Ok(nb)) => {
+                    assert_eq!(na, nb);
+                    assert_eq!(&from_contiguous[..], &from_scattered[..]);
+                }
+                (Err(ea), Err(eb)) => assert_eq!(ea, eb, "same walk, same error"),
+                (a, b) => panic!("walks disagree: {a:?} vs {b:?}"),
+            }
+        }
     }
 
     fn rebuild(input: &[u8], seqs: &[u8]) -> Vec<u8> {

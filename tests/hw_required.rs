@@ -248,10 +248,112 @@ fn nativesw_hw_segment_roundtrip() {
         }
     }
 
-    // 24 whole blocks + one software tail per segment shape
-    assert!(nat.hw_requests() >= 24, "hw={}", nat.hw_requests());
-    assert_eq!(nat.sw_requests(), 3, "one tail per block size: {nat:?}");
+    // a segment far deeper than the 1024-entry SQ ring: thousands of
+    // refills cross the ring wrap and reuse every buffer many times
+    {
+        let block = 4096;
+        let nblocks = 2050;
+        let segment = make_mixed(nblocks * block);
+        let mut packed = Vec::new();
+        let lens = nat
+            .compress_segment(&segment, block, &mut packed)
+            .expect("deep compress_segment");
+        assert_eq!(lens.len(), nblocks);
+        let mut restored = vec![0u8; block];
+        let mut off = 0;
+        for (i, l) in lens.iter().enumerate() {
+            let n = sw
+                .decompress(&packed[off..off + l], &mut restored)
+                .unwrap_or_else(|e| panic!("deep entry {i}: stock decode: {e}"));
+            assert_eq!(n, block, "deep entry {i}");
+            assert_bit_exact(
+                &format!("deep entry {i}"),
+                &restored[..n],
+                &segment[i * block..(i + 1) * block],
+            );
+            off += l;
+        }
+    }
+
+    // 24 whole blocks + one software tail per block size, plus the deep
+    // segment whose blocks all went through the engine
+    assert!(nat.hw_requests() >= 24 + 2050, "hw={}", nat.hw_requests());
+    assert_eq!(nat.sw_requests(), 4, "one tail per block size: {nat:?}");
     assert!(!nat.stuck());
+}
+
+/// The worker-pool scaling shape on hardware: one handle per thread,
+/// opened round-robin over the zip devices (`KaeNative::open_on`), the
+/// segment sharded into contiguous shares and streamed concurrently —
+/// the shape that turns a second zip device into a second queue. Every
+/// packed entry must still decode on the stock library, in block order.
+#[test]
+#[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
+fn nativesw_handle_pool_roundtrip() {
+    require_hw();
+    let sw = KaeLz4::open_sw().expect("stock system liblz4");
+    let workers = 2.min(kae::native_device_count()).max(1);
+    let block = 4096;
+    let nblocks = 4096; // 16 MiB: deep enough to cross the ring wrap per share
+    let segment = make_mixed(nblocks * block);
+    let per = nblocks / workers;
+
+    type Share = Result<(Vec<usize>, Vec<u8>), String>;
+    let parts: Vec<Share> = std::thread::scope(|s| {
+        (0..workers)
+            .map(|t| {
+                let segment = &segment;
+                s.spawn(move || {
+                    let mut nat = KaeNative::open_on(t, block).expect("open_on");
+                    assert_eq!(nat.backend(), Backend::Native, "handle {t} must be native");
+                    let hi = if t + 1 == workers {
+                        nblocks * block
+                    } else {
+                        (t + 1) * per * block
+                    };
+                    let mut packed = Vec::new();
+                    let lens = nat
+                        .compress_segment(&segment[t * per * block..hi], block, &mut packed)
+                        .expect("share");
+                    assert_eq!(
+                        lens.len(),
+                        hi / block - t * per,
+                        "handle {t}: one entry per share block"
+                    );
+                    assert_eq!(nat.sw_requests(), 0, "handle {t}: no fallback");
+                    Ok((lens, packed))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|j| j.join().unwrap_or_else(|_| Err("worker panicked".into())))
+            .collect()
+    });
+
+    // concatenate in thread order — the AsyncBatch byteshape
+    let mut lens = Vec::with_capacity(nblocks);
+    let mut packed = Vec::new();
+    for p in parts {
+        let (l, p) = p.expect("share ok");
+        lens.extend_from_slice(&l);
+        packed.extend_from_slice(&p);
+    }
+    assert_eq!(lens.len(), nblocks);
+
+    let mut restored = vec![0u8; block];
+    let mut off = 0;
+    for (i, l) in lens.iter().enumerate() {
+        let n = sw
+            .decompress(&packed[off..off + l], &mut restored)
+            .unwrap_or_else(|e| panic!("pool entry {i}: stock decode: {e}"));
+        assert_eq!(n, block, "pool entry {i}");
+        assert_bit_exact(
+            &format!("pool entry {i}"),
+            &restored[..n],
+            &segment[i * block..(i + 1) * block],
+        );
+        off += l;
+    }
 }
 
 #[test]
@@ -315,4 +417,72 @@ fn async_batch_segment_roundtrip() {
         ),
         "empty segment must be rejected"
     );
+}
+
+/// The produce path on real silicon: the producer fills the claimed input
+/// buffers directly (memcpy here — a real producer reads/pipelines into
+/// them), the rebuild reads its literals back out of the held slots, and
+/// every block must decode bit-exact through the stock library.
+#[test]
+#[ignore = "requires a KAE machine: run with cargo test -- --ignored"]
+fn hw_native_produce_segment_roundtrip() {
+    require_hw();
+    let sw = KaeLz4::open_sw().expect("stock system liblz4");
+    let mut nat = KaeNative::open().expect("native open");
+    assert_eq!(nat.backend(), Backend::Native, "needs the uacce engine path");
+    eprintln!("engine={}", nat.engine_note());
+
+    let block = 4096;
+    for (name, nblocks) in [("mixed", 64), ("random", 9), ("small", 2)] {
+        let data = make_mixed(nblocks * block);
+        let mut produce = memcpy_producer(&data);
+        let mut packed = Vec::new();
+        let lens = nat
+            .compress_segment_from(nblocks, block, &mut packed, &mut produce)
+            .expect("produce pass");
+        assert_eq!(lens.len(), nblocks, "{name}: whole blocks only, no tail");
+        assert_eq!(
+            lens.iter().sum::<usize>(),
+            packed.len(),
+            "{name}: entries must pack contiguously"
+        );
+
+        let mut off = 0;
+        for (i, l) in lens.iter().enumerate() {
+            let mut restored = vec![0u8; block];
+            let n = sw
+                .decompress(&packed[off..off + l], &mut restored)
+                .expect("stock decompress of produce output");
+            assert_eq!(n, block, "{name}: block {i} length");
+            assert_bit_exact(
+                &format!("{name}: block {i}"),
+                &restored[..n],
+                &data[i * block..(i + 1) * block],
+            );
+            off += l;
+        }
+        assert_eq!(off, packed.len(), "{name}: all bytes consumed");
+    }
+    assert!(
+        nat.hw_requests() > 0 && nat.sw_requests() == 0,
+        "every block rode the engine: hw={} sw={}",
+        nat.hw_requests(),
+        nat.sw_requests()
+    );
+}
+
+/// A producer that walks `data` in chunk order and memcpy-fills every
+/// handed buffer.
+fn memcpy_producer<'d>(
+    data: &'d [u8],
+) -> impl FnMut(&mut [u8]) -> Result<(), kae::KaeError> + 'd {
+    let mut pos = 0usize;
+    move |buf: &mut [u8]| {
+        let end = pos + buf.len();
+        data.get(pos..end)
+            .ok_or_else(|| kae::KaeError::Compress("producer past the data end".into()))?;
+        buf.copy_from_slice(&data[pos..end]);
+        pos = end;
+        Ok(())
+    }
 }

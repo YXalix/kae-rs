@@ -102,6 +102,8 @@ and 6.4 GB/s at 2s).
 | `e5-db1` | the doorbell tax: `KAE_NATIVE_DB_BATCH=1` against the full-depth batch |
 | `e6-small` | sustained small-block scan: 4K, 8K, 16K, 64K, 128K requests |
 | `e7-queues2-8k` | queue scaling at the best small request size: does 8K double like 64K, or saturate the device pair earlier |
+| `e8-nativesw-q2`, `e8-nativesw-q4`, `e8-nativesw-q8` | the `nativesw` handle-pool ladder at 64K: one `KaeNative` handle (one engine queue) per thread, round-robin over the devices, production wait policy (poll, depth 8) — where extra queues stop paying sizes the zfile worker pool |
+| `e9-nativesw-q4-8k` | the pool at the best small request size, 4 handles at 8K |
 
 `--sweep` composes with the ordinary options where they make sense:
 `--input FILE` sweeps a real file instead of the synthetic dataset,

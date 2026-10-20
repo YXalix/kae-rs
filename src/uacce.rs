@@ -463,6 +463,12 @@ struct Queue {
     cq_phase: u16,
     outstanding: usize,
     unbelled: usize,
+    /// Streaming-submit occupancy per input buffer: set when a request
+    /// enters the buffer, held until its samples are read and the caller
+    /// releases the position ([`Queue::try_submit`] / [`Queue::release`]).
+    /// The drained paths ([`Queue::request`], `request_batch`) never touch
+    /// it — they own every buffer for their whole call.
+    held: Vec<bool>,
     c_flag: u8,
     alg: NativeAlg,
     req_size: usize,
@@ -576,6 +582,7 @@ impl Queue {
             cq_phase: 1,
             outstanding: 0,
             unbelled: 0,
+            held: vec![false; depth],
             c_flag: u8::from(wait_poll),
             alg,
             req_size,
@@ -627,7 +634,7 @@ impl Queue {
         let slot_buf = unsafe { std::slice::from_raw_parts_mut(sptr, self.req_size) };
         slot_buf[..input.len()].copy_from_slice(input);
         let idx = self.sq_tail;
-        self.submit_len(batch.max(1), 1, input.len());
+        self.submit_len(batch.max(1), 1, input.len(), true);
         if let Err(e) = self.wait_idle(timeout_s) {
             return Err(e);
         }
@@ -693,6 +700,30 @@ impl Queue {
         })
     }
 
+    /// Copy a completed request's triples into `seqs` (cleared first) —
+    /// the streaming counterpart of [`Queue::read_result`] that skips the
+    /// literal area: the rebuild reads literals from the input, so the
+    /// copy would be dead weight on every request of a segment pass (the
+    /// debug verifier uses [`Queue::read_result`]).
+    fn read_seqs(&self, ring: usize, in_len: usize, seqs: &mut Vec<u8>) -> Result<(), String> {
+        let sqe = unsafe { &*(self.sq.add(ring * QM_ZIP_SQE_SIZE) as *const Sqe) };
+        let status = u32::from_le(sqe.dw3) & HZ_STATUS_MASK;
+        if status != 0 {
+            return Err(format!("hw_status_0x{status:x}"));
+        }
+        let ntriples = u32::from_le(sqe.produced) as usize;
+        let lit_cap = lz77_lit_area(in_len);
+        if ntriples * 8 + 32 > self.ocap - lit_cap {
+            return Err(format!("lz77_output_insanity_seqs={ntriples}"));
+        }
+        let slot = ring % self.src.len();
+        let (optr, _) = self.out[slot];
+        let seq_area = unsafe { optr.add(lit_cap) };
+        seqs.clear();
+        seqs.extend_from_slice(unsafe { std::slice::from_raw_parts(seq_area, ntriples * 8) });
+        Ok(())
+    }
+
     fn doorbell(&mut self, cmd: u8, idx: u16, pri: u8) {
         // ring writes must be visible before the doorbell store
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -705,15 +736,27 @@ impl Queue {
     /// doorbell every `batch` fills and at every ring-wrap boundary so one
     /// doorbell never spans the wrap.
     fn submit(&mut self, batch: usize, budget: usize) -> usize {
-        self.submit_len(batch, budget, self.req_size)
+        self.submit_len(batch, budget, self.req_size, true)
     }
 
     /// [`Queue::submit`] with the programmed parse input length explicit —
     /// a request carrying less than the slot's capacity programs its own
     /// length (the lz77 parse is `in_len - MFLIMIT`).
-    fn submit_len(&mut self, batch: usize, budget: usize, in_len: usize) -> usize {
-        // device status: value 1 in the last DUS word means a hardware
-        // error happened (uadk v1 qm_tx_update reads it before every send)
+    fn submit_len(&mut self, batch: usize, budget: usize, in_len: usize, flush: bool) -> usize {
+        let mut submitted = 0;
+        while submitted < budget && self.outstanding < self.src.len() {
+            self.submit_one(in_len, batch);
+            submitted += 1;
+        }
+        if flush {
+            self.flush_doorbell();
+        }
+        submitted
+    }
+
+    /// The DUS device-status word before a send: a 1 means a hardware
+    /// error happened (uadk v1 qm_tx_update reads it before every send).
+    fn check_device_status(&mut self) {
         if self.dus_len > QM_DS_TX_AT_END {
             let ds = unsafe {
                 (self
@@ -728,32 +771,102 @@ impl Queue {
                 }
             }
         }
-        let mut submitted = 0;
-        while submitted < budget && self.outstanding < self.src.len() {
-            let i = self.sq_tail;
-            let slot = i as usize % self.src.len();
-            let (_sptr, sdma) = self.src[slot];
-            let (_optr, odma) = self.out[slot];
-            let sqe = unsafe { &mut *(self.sq.add(i as usize * QM_ZIP_SQE_SIZE) as *mut Sqe) };
-            match self.alg {
-                NativeAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, in_len, self.ocap),
-                NativeAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, in_len, self.ocap),
-            }
-            sqe.tag_l = i as u32;
-            self.sq_tail = (i + 1) % QM_Q_DEPTH as u16;
-            self.outstanding += 1;
-            submitted += 1;
-            self.unbelled += 1;
-            if self.unbelled >= batch || self.sq_tail == 0 {
-                self.doorbell(DOORBELL_CMD_SQ, self.sq_tail, 0);
-                self.unbelled = 0;
-            }
+    }
+
+    /// Fill the SQE at `sq_tail` for one request of `in_len`, advance the
+    /// tail, and defer the doorbell to `batch` policy.
+    fn submit_one(&mut self, in_len: usize, batch: usize) {
+        self.check_device_status();
+        let i = self.sq_tail;
+        let slot = i as usize % self.src.len();
+        let (_sptr, sdma) = self.src[slot];
+        let (_optr, odma) = self.out[slot];
+        let sqe = unsafe { &mut *(self.sq.add(i as usize * QM_ZIP_SQE_SIZE) as *mut Sqe) };
+        match self.alg {
+            NativeAlg::Lz77 => fill_lz77_sqe(sqe, sdma, odma, in_len, self.ocap),
+            NativeAlg::Deflate => fill_deflate_sqe(sqe, sdma, odma, in_len, self.ocap),
         }
+        sqe.tag_l = i as u32;
+        self.sq_tail = (i + 1) % QM_Q_DEPTH as u16;
+        self.outstanding += 1;
+        self.unbelled += 1;
+        if self.unbelled >= batch || self.sq_tail == 0 {
+            self.doorbell(DOORBELL_CMD_SQ, self.sq_tail, 0);
+            self.unbelled = 0;
+        }
+    }
+
+    /// Ring the SQ doorbell if streaming submits left requests unannounced
+    /// (`submit_len` with `flush=false` defers to the batch size); a
+    /// submitted request must never sit unbelled while its caller waits.
+    fn flush_doorbell(&mut self) {
         if self.unbelled > 0 {
             self.doorbell(DOORBELL_CMD_SQ, self.sq_tail, 0);
             self.unbelled = 0;
         }
-        submitted
+    }
+
+    /// Claim the queue's next ring position for one streaming request
+    /// (FIFO from `sq_tail`), or None when every input buffer is still
+    /// occupied — the caller re-tries after harvesting completions. The
+    /// position stays claimed until [`Queue::release`], which is what
+    /// lets a completion's buffer outlive its CQE until its caller has
+    /// read it — and, in the produce pass, until its block has rebuilt
+    /// from the input bytes the slot still holds.
+    fn claim_slot(&mut self) -> Option<usize> {
+        if self.outstanding >= self.src.len() {
+            return None;
+        }
+        let ring = self.sq_tail as usize;
+        let slot = ring % self.src.len();
+        if self.held[slot] {
+            return None;
+        }
+        self.held[slot] = true;
+        Some(ring)
+    }
+
+    /// The claimed position's input buffer (`req_size` wide): fill up to
+    /// the chunk length, then announce with [`Queue::submit_claimed`].
+    fn slot_buf_mut(&mut self, ring: usize) -> &mut [u8] {
+        let (sptr, _) = self.src[ring % self.src.len()];
+        unsafe { std::slice::from_raw_parts_mut(sptr, self.req_size) }
+    }
+
+    /// A still-claimed position's input as filled: its first `len` bytes.
+    /// Until the position is released nothing else writes the buffer, so
+    /// these are exactly the bytes the engine parsed.
+    fn slot_buf(&self, ring: usize, len: usize) -> &[u8] {
+        let (sptr, _) = self.src[ring % self.src.len()];
+        unsafe { std::slice::from_raw_parts(sptr, len) }
+    }
+
+    /// Announce a claimed position whose buffer the caller filled with
+    /// `len` bytes (within the request size; the lz77 parse programs
+    /// `len - MFLIMIT`): fill its SQE and defer the doorbell to `batch`
+    /// policy. Claims submit in FIFO order, so `ring` must be `sq_tail`.
+    fn submit_claimed(&mut self, ring: usize, len: usize, batch: usize) {
+        debug_assert!(self.held[ring % self.src.len()]);
+        debug_assert_eq!(ring, self.sq_tail as usize);
+        debug_assert!(len <= self.req_size);
+        self.submit_one(len, batch.max(1));
+    }
+
+    /// [`Queue::claim_slot`] plus the copy into the claimed position's
+    /// buffer and [`Queue::submit_claimed`] — the slice-mode streaming
+    /// submit, where the caller's bytes move on the pump thread.
+    fn try_submit(&mut self, batch: usize, chunk: &[u8]) -> Option<usize> {
+        let ring = self.claim_slot()?;
+        let buf = self.slot_buf_mut(ring);
+        buf[..chunk.len()].copy_from_slice(chunk);
+        self.submit_claimed(ring, chunk.len(), batch);
+        Some(ring)
+    }
+
+    /// Hand a streaming position back: the buffer at `ring` is refillable.
+    fn release(&mut self, ring: usize) {
+        let slot = ring % self.src.len();
+        self.held[slot] = false;
     }
 
     /// Reap every completed CQE. The CQ doorbell (advanced cq_head + the
@@ -988,7 +1101,7 @@ impl NativePump {
                 let (sptr, _) = q.src[slot];
                 let slot_buf = unsafe { std::slice::from_raw_parts_mut(sptr, q.req_size) };
                 slot_buf[..chunk.len()].copy_from_slice(chunk);
-                q.submit_len(self.batch.max(1), 1, chunk.len());
+                q.submit_len(self.batch.max(1), 1, chunk.len(), true);
             }
             // wait the whole wave out. Completions are FIFO on one queue
             // (the vendor stack matches responses by CQ position alone),
@@ -1038,6 +1151,94 @@ impl NativePump {
             k += n;
         }
         out
+    }
+
+    /// The streaming counterpart of [`NativePump::request_batch`]: claim
+    /// the queue's next ring position for `chunk` and submit it, returning
+    /// the SQE ring index it was submitted at, or None when every input
+    /// buffer is still occupied. Ring positions stay claimed until
+    /// [`NativePump::release`], so a completion's buffer survives until its
+    /// caller has read it — completions pair by the CQE's `sq_head`, never
+    /// by arrival order. The doorbell defers to `batch` policy; call
+    /// [`NativePump::flush_doorbell`] once per refill round.
+    pub fn try_submit(&mut self, batch: usize, chunk: &[u8]) -> Option<usize> {
+        self.queues[0].try_submit(batch, chunk)
+    }
+
+    /// The produce-pass counterpart of [`NativePump::try_submit`]: claim
+    /// the queue's next ring position and hand back its input buffer to
+    /// fill (up to the request size) — no byte moves on the pump side.
+    /// Announce with [`NativePump::submit_claimed`], or hand an
+    /// unsubmitted position back with [`NativePump::release`].
+    pub fn claim(&mut self) -> Option<(usize, &mut [u8])> {
+        let ring = self.queues[0].claim_slot()?;
+        let buf = self.queues[0].slot_buf_mut(ring);
+        Some((ring, buf))
+    }
+
+    /// Announce a claimed position whose buffer the caller filled with
+    /// `len` bytes; the doorbell defers to `batch` policy
+    /// ([`NativePump::flush_doorbell`] once per refill round).
+    pub fn submit_claimed(&mut self, ring: usize, len: usize, batch: usize) {
+        self.queues[0].submit_claimed(ring, len, batch)
+    }
+
+    /// A still-claimed position's input as filled — its first `len`
+    /// bytes. Until the position is released nothing rewrites the buffer,
+    /// so in the produce pass these are the only bytes the rebuild can
+    /// take the block's literals from.
+    pub fn slot_input(&self, ring: usize, len: usize) -> &[u8] {
+        self.queues[0].slot_buf(ring, len)
+    }
+
+    /// Hand a streaming position back: the buffer at `ring` is refillable.
+    pub fn release(&mut self, ring: usize) {
+        self.queues[0].release(ring)
+    }
+
+    /// Harvest every completed CQE, appending its SQE ring index to `rings`
+    /// in arrival order; returns the count. Non-blocking.
+    pub fn harvest_completions(&mut self, rings: &mut Vec<usize>) -> usize {
+        self.queues[0].harvest_rings(Some(rings))
+    }
+
+    /// Copy a completed request's triples into `seqs` (cleared first; the
+    /// literal area is not copied — see [`Queue::read_seqs`]).
+    pub fn read_seqs(&self, ring: usize, in_len: usize, seqs: &mut Vec<u8>) -> Result<(), String> {
+        self.queues[0].read_seqs(ring, in_len, seqs)
+    }
+
+    /// Copy a completed request's full sample (triples + literal area) —
+    /// the debug verifier's view of a streaming completion.
+    pub fn read_sample(&self, ring: usize, in_len: usize) -> Result<Lz77Sample, String> {
+        self.queues[0].read_result(ring, in_len)
+    }
+
+    /// Requests still in flight.
+    pub fn busy(&self) -> bool {
+        self.queues[0].outstanding != 0
+    }
+
+    /// Input buffers per queue — the width of a streaming session.
+    pub fn depth(&self) -> usize {
+        self.queues[0].src.len()
+    }
+
+    /// Announce streaming submits whose doorbell `batch` is still open.
+    pub fn flush_doorbell(&mut self) {
+        self.queues[0].flush_doorbell();
+    }
+
+    /// One wait step for a streaming loop: poll(2) on the queue fds in
+    /// poll mode (returns on the first completion or after the poll
+    /// timeout), a spin hint in spin mode. Call when requests are in
+    /// flight and the last harvest came up empty.
+    pub fn wait_once(&self) {
+        if self.queues[0].c_flag != 0 {
+            self.poll_once(100);
+        } else {
+            std::hint::spin_loop();
+        }
     }
 
     fn poll_once(&self, timeout_ms: c_int) {
@@ -1637,6 +1838,7 @@ mod tests {
             cq_phase: 1,
             outstanding: 0,
             unbelled: 0,
+            held: vec![false; 2],
             c_flag: 0,
             alg: NativeAlg::Lz77,
             req_size: 4096,

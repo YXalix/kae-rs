@@ -155,6 +155,15 @@ pub fn native_available() -> bool {
     uacce_devices().iter().any(|n| n.starts_with("hisi_zip"))
 }
 
+/// How many ZIP-engine devices a native handle pool spreads its handles
+/// over (the `KaeNative::open_on` round-robin width). This is the device
+/// spread, not the pool ceiling: every handle is its own queue and a
+/// device hosts many queues, so the pool scales to the worker-thread
+/// count. Zero without a device.
+pub fn native_device_count() -> usize {
+    uacce_devices().iter().filter(|n| n.starts_with("hisi_zip")).count()
+}
+
 /// The uacce device names present on this machine (e.g. `hisi_sec2-0`,
 /// `hisi_zip-4`; empty without the accelerator driver). The driver lists the
 /// engines under /sys/class/uacce and each entry is exposed as the matching

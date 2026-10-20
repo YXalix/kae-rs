@@ -272,6 +272,11 @@ pub fn run(args: &[String]) -> i32 {
     // machine without a ZIP device it runs the soft engine and says so
     if a.impl_name == IMPL_NATIVESW {
         return match a.op.as_str() {
+            // the pool form streams one handle per thread; KAE_NATIVE_SHAPE=block
+            // keeps the per-block loop as the single-handle reference
+            "compress" if a.workers > 1 && std::env::var("KAE_NATIVE_SHAPE").as_deref() != Ok("block") => {
+                bench_nativesw_pool_compress(&a, &data, block, nblocks)
+            }
             "compress" => bench_nativesw_compress(&a, &data, block, nblocks),
             "decompress" => bench_nativesw_decompress(&a, &data, block, nblocks),
             other => {
@@ -774,6 +779,7 @@ fn rebuild_block(
         .iter()
         .map(|s| (s.seqs.as_slice(), req_size))
         .collect();
+    stream.clear();
     let rebuilt = rebuild::lz77_block_from_requests(block_input, &requests, stream);
     *rebuild_s += now_s() - t0;
     let n = rebuilt.map_err(|e| format!("rebuild: {e} (block {label})"))?;
@@ -1719,11 +1725,15 @@ fn bench_soft_decompress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usi
 }
 
 /// `nativesw`: the production engine path (`KaeNative`) — hardware first,
-/// software fallback. Two shapes: `compress_segment` drives the whole
-/// workload as one segment batch through the in-flight ring (default — the
+/// software fallback. Three shapes: `compress_segment` streams the whole
+/// workload through the in-flight ring as one segment pass (default — the
 /// zfile segment insertion shape, the one that hides the chip's request
-/// latency); `KAE_NATIVE_SHAPE=block` keeps the per-block synchronous loop
-/// (the correctness/fallback reference, latency-bound by construction).
+/// latency); `KAE_NATIVE_SHAPE=produce` streams it through
+/// `compress_segment_from` with a memcpy producer (the produce path's own
+/// cost: identical byte movement to the segment shape, but the rebuild
+/// reads its literals from the held input slots); `KAE_NATIVE_SHAPE=block`
+/// keeps the per-block synchronous loop (the correctness/fallback
+/// reference, latency-bound by construction).
 /// Without a ZIP device the cell runs the soft engine end to end and says
 /// so in the note (`mode=soft`) instead of failing.
 fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
@@ -1738,6 +1748,9 @@ fn bench_nativesw_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: u
             return EXIT_OPEN_FAIL;
         }
     };
+    if std::env::var("KAE_NATIVE_SHAPE").as_deref() == Ok("produce") {
+        return bench_nativesw_produce_compress(a, &mut nat, data, block, nblocks);
+    }
     if std::env::var("KAE_NATIVE_SHAPE").as_deref() != Ok("block") {
         return bench_nativesw_segment_compress(a, &mut nat, data, block, nblocks);
     }
@@ -1869,6 +1882,246 @@ fn bench_nativesw_segment_compress(
     EXIT_OK
 }
 
+/// A producer that memcpys `data` through in chunk order — the produce
+/// cell's control: the same byte movement the segment shape's pump-side
+/// `try_submit` copy does, one API level up. Each pass builds a fresh
+/// producer, so the cursor starts at zero per `compress_segment_from`.
+fn memcpy_producer<'d>(
+    data: &'d [u8],
+) -> impl FnMut(&mut [u8]) -> Result<(), crate::KaeError> + 'd {
+    let mut pos = 0usize;
+    move |buf: &mut [u8]| {
+        let end = pos + buf.len();
+        if end > data.len() {
+            return Err(crate::KaeError::Compress(format!(
+                "producer past the data end ({end}/{}B)",
+                data.len()
+            )));
+        }
+        buf.copy_from_slice(&data[pos..end]);
+        pos = end;
+        Ok(())
+    }
+}
+
+/// The produce shape: one `compress_segment_from` call per timed pass, a
+/// memcpy producer feeding the claimed input buffers. This cell isolates
+/// the produce path's own cost — same bytes on the move as the segment
+/// shape, but the rebuild reads its literals from the held slots and a
+/// block's buffers stay claimed until the block resolves. The workload's
+/// tail does not ride this shape (whole blocks only), and the real
+/// zero-copy number needs a producer that lands bytes in the handed
+/// buffer directly (a read syscall) — see `examples/native_produce.rs`.
+fn bench_nativesw_produce_compress(
+    a: &WorkerArgs,
+    nat: &mut crate::KaeNative,
+    data: &[u8],
+    block: usize,
+    nblocks: usize,
+) -> i32 {
+    let in_bytes_one = (nblocks as u64) * (block as u64);
+
+    let mut packed: Vec<u8> = Vec::with_capacity(in_bytes_one as usize / 2);
+    let mut produce = memcpy_producer(data);
+    let lens = match nat.compress_segment_from(nblocks, block, &mut packed, &mut produce) {
+        Ok(l) => l,
+        Err(e) => {
+            println!(
+                "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=warmup err={}",
+                block,
+                flat(&e.to_string())
+            );
+            return EXIT_COMPRESS_FAIL;
+        }
+    };
+    if !a.sample_out.is_empty() {
+        if let Err(e) = write_sample(&a.sample_out, block, &lens, &packed, nblocks) {
+            eprintln!("worker: write sample: {e}");
+            return EXIT_USAGE;
+        }
+    }
+    let out_bytes_warm = packed.len() as u64;
+
+    let mut seg_err: Option<String> = None;
+    let st = timed_loop(
+        1,
+        |_| {
+            if seg_err.is_some() {
+                return 0;
+            }
+            let mut produce = memcpy_producer(data);
+            match nat.compress_segment_from(nblocks, block, &mut packed, &mut produce) {
+                Ok(l) => l.iter().sum::<usize>(),
+                Err(e) => {
+                    seg_err = Some(e.to_string());
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = seg_err {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=timed_loop err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVESW,
+        op: "compress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: in_bytes_one * st.passes,
+        out_bytes: out_bytes_warm * st.passes,
+        ratio_pct: out_bytes_warm as f64 / in_bytes_one as f64 * 100.0,
+        note: &nativesw_note(nat, block.min(uacce::MAX_LZ77_REQ), "produce"),
+    });
+    EXIT_OK
+}
+
+/// `nativesw` pool (--workers >1, segment shape): the zfile WorkerPool
+/// scaling shape — one `KaeNative` handle (one engine queue) per thread,
+/// opened round-robin over the zip devices (`KaeNative::open_on`), the
+/// segment's blocks split into contiguous shares, every thread streaming
+/// its share through its own handle. The packed outputs and lengths
+/// concatenate in thread order (the tail rides the last share), so the
+/// cell keeps the exact `AsyncBatch` byteshape and the sample comes from
+/// the untimed warm-up pass.
+fn bench_nativesw_pool_compress(a: &WorkerArgs, data: &[u8], block: usize, nblocks: usize) -> i32 {
+    let req_size = block.min(uacce::MAX_LZ77_REQ);
+    let workers = a.workers.min(nblocks);
+    let mut handles: Vec<crate::KaeNative> = Vec::with_capacity(workers);
+    for t in 0..workers {
+        match crate::KaeNative::open_on(t, req_size) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                println!(
+                    "RESULT status=OPEN_FAIL impl=nativesw op=compress err={}",
+                    flat(&e.to_string())
+                );
+                return EXIT_OPEN_FAIL;
+            }
+        }
+    }
+    // contiguous shares; the remainder rides the last one (and with it the
+    // segment tail, so lens stays one-entry-per-block + tail-last overall)
+    let share = |t: usize| -> (usize, usize) {
+        let per = nblocks / workers;
+        let lo = t * per * block;
+        let hi = if t + 1 == workers {
+            nblocks * block
+        } else {
+            (t + 1) * per * block
+        };
+        (lo, hi)
+    };
+    // one concurrent pass: every thread streams its share once through
+    // its own handle
+    type Share = Result<(Vec<usize>, Vec<u8>), String>;
+    let run_pass = |handles: &mut [crate::KaeNative]| -> Share {
+        let parts: Vec<Share> = std::thread::scope(|s| {
+            let mut js = Vec::with_capacity(handles.len());
+            for (t, h) in handles.iter_mut().enumerate() {
+                let (lo, hi) = share(t);
+                js.push(s.spawn(move || {
+                    let mut packed = Vec::with_capacity((hi - lo) / 2);
+                    h.compress_segment(&data[lo..hi], block, &mut packed)
+                        .map(|l| (l, packed))
+                        .map_err(|e| e.to_string())
+                }));
+            }
+            js.into_iter()
+                .map(|j| j.join().unwrap_or_else(|_| Err("worker panicked".into())))
+                .collect()
+        });
+        let mut lens = Vec::with_capacity(nblocks + 1);
+        let mut packed_all = Vec::new();
+        let mut first_err: Option<String> = None;
+        for p in parts {
+            match p {
+                Ok((l, packed)) => {
+                    lens.extend_from_slice(&l);
+                    packed_all.extend_from_slice(&packed);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok((lens, packed_all)),
+        }
+    };
+
+    let (lens_warm, packed_warm) = match run_pass(&mut handles) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=warmup err={}",
+                block,
+                flat(&e)
+            );
+            return EXIT_COMPRESS_FAIL;
+        }
+    };
+    if !a.sample_out.is_empty() {
+        if let Err(e) = write_sample(&a.sample_out, block, &lens_warm, &packed_warm, nblocks) {
+            eprintln!("worker: write sample: {e}");
+            return EXIT_USAGE;
+        }
+    }
+    let out_bytes_warm = packed_warm.len() as u64;
+    let in_bytes_one = (nblocks as u64) * (block as u64);
+
+    let mut seg_err: Option<String> = None;
+    let st = timed_loop(
+        1,
+        |_| {
+            if seg_err.is_some() {
+                return 0;
+            }
+            match run_pass(&mut handles) {
+                Ok((_, packed)) => packed.len(),
+                Err(e) => {
+                    seg_err = Some(e);
+                    0
+                }
+            }
+        },
+        a.min_sec,
+        a.passes_min,
+        a.passes_max,
+    );
+    if let Some(e) = seg_err {
+        println!(
+            "RESULT status=COMPRESS_FAIL impl=nativesw op=compress block={} at=timed_pool err={}",
+            block,
+            flat(&e)
+        );
+        return EXIT_COMPRESS_FAIL;
+    }
+    emit_ok(OkResult {
+        impl_name: IMPL_NATIVESW,
+        op: "compress",
+        block,
+        lib: &a.lib,
+        blocks: nblocks,
+        st: &st,
+        in_bytes: in_bytes_one * st.passes,
+        out_bytes: out_bytes_warm * st.passes,
+        ratio_pct: out_bytes_warm as f64 / in_bytes_one as f64 * 100.0,
+        note: &nativesw_pool_note(&handles, req_size, workers),
+    });
+    EXIT_OK
+}
+
 /// `nativesw` decompress: the read path of the production handle — lz4rip
 /// in every mode (the engine has no LZ4 decode). The blocks are compressed
 /// by the same handle first, so on a hardware machine the cell decodes
@@ -1962,12 +2215,58 @@ fn nativesw_note(nat: &crate::KaeNative, req_size: usize, shape: &str) -> String
         nat.hw_requests(),
         nat.sw_requests(),
     );
-    if nat.stuck() {
+    // the engine's open note (depth, doorbell batch, wait policy, timeout)
+    // rides the row: a throughput number is not readable without the shape
+    // it was taken under
+    note.push(',');
+    note.push_str(nat.engine_note());
+    if crate::native::ring_debug_on() {
+        // a debug pass copies full samples and decodes every block — a
+        // number taken under it is not a throughput number
+        note.push_str(",debug_ring=1");
+    }
+    note.push_str(&nativesw_wedge_note(nat.stuck(), nat.last_hw_error()));
+    note
+}
+
+/// The stuck/fallback suffix shared by the single-handle and pool row
+/// notes.
+fn nativesw_wedge_note(stuck: bool, last_hw_error: Option<&str>) -> String {
+    let mut note = String::new();
+    if stuck {
         note.push_str(",stuck=1");
     }
-    if let Some(e) = nat.last_hw_error() {
+    if let Some(e) = last_hw_error {
         note.push_str(&format!(",last_hw_fallback={}", flat(e)));
     }
+    note
+}
+
+/// The pool cell's row note: the per-handle request counts summed, the
+/// mode native/soft/mixed over the handles, and a wedge named if any
+/// handle hit one.
+fn nativesw_pool_note(handles: &[crate::KaeNative], req_size: usize, workers: usize) -> String {
+    let native_count = handles
+        .iter()
+        .filter(|h| h.backend() == Backend::Native)
+        .count();
+    let mode = match native_count {
+        0 => "soft",
+        n if n == handles.len() => "native",
+        _ => "mixed",
+    };
+    let hw: u64 = handles.iter().map(|h| h.hw_requests()).sum();
+    let sw: u64 = handles.iter().map(|h| h.sw_requests()).sum();
+    let mut note = format!(
+        "nativesw,mode={mode},shape=segment,req_size={req_size},workers={workers},hw={hw},sw={sw},decode=lz4rip",
+    );
+    if crate::native::ring_debug_on() {
+        note.push_str(",debug_ring=1");
+    }
+    note.push_str(&nativesw_wedge_note(
+        handles.iter().any(|h| h.stuck()),
+        handles.iter().find_map(|h| h.last_hw_error()),
+    ));
     note
 }
 
